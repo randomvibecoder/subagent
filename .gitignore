@@ -1,0 +1,3 @@
+/target/
+/.subagent-test-state/
+*.log
