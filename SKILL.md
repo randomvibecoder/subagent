@@ -1,87 +1,34 @@
 ---
 name: subagent-cli
-description: Manage persistent background coding agents with the `subagent` JSONL CLI. Use when an agent needs to delegate independent repository work, run multiple coding tasks concurrently, inspect agent status or logs, continue a previous agent, ask an ephemeral readonly question over an agent's context, change a deadline, stop work, or delete stored agent history.
+description: Use the `subagent` CLI to start, monitor, question, continue, stop, and delete persistent background coding agents. Trigger for delegated or parallel coding work and for any request involving `subagent daemon`, `subagent agents`, or `subagent config` commands.
 ---
 
 # Subagent CLI
 
-Use `subagent` to delegate coding work to independent agents that run through a
-per-user daemon. Treat stdout as JSONL, retain every returned agent ID, and use the
-noun-verb command structure exactly as documented below.
+`subagent` runs coding agents in the background. A subagent has its own task, working
+directory, conversation, tools, status, and stable `agt_<ULID>` ID. A per-user daemon
+keeps agents running after the command that spawned them exits and persists their
+history for later inspection or continuation.
 
-## Understand subagents
+All operational commands emit JSONL. Help and version output are plain text.
 
-A **subagent** is a persistent background coding worker created by another agent. It
-has its own:
+## Install
 
-- Stable ID in the form `agt_<ULID>`
-- Working directory
-- Model conversation and persisted context
-- Readonly or write mode
-- Lifecycle status and optional deadline
-- Tool runtime with up to eight live background terminals
-- Event log and complete command-output files
-
-The `subagent` process invoked from a shell is only a client. It sends one request to
-a user-owned daemon through a private Unix socket, prints JSONL, and exits. The daemon
-owns active workers. Finished agents are unloaded from memory but remain on disk and
-can be resumed.
-
-Subagents are useful for independent, self-contained work that can proceed in the
-background or in parallel. They are not the right choice for a quick question about
-an existing agent; use `agents side` for that. They are also not a hard security
-boundary: normal agents execute with the daemon user's host permissions.
-
-## Establish readiness
-
-Confirm that the CLI exists:
+Supported platform: Linux x86-64 (`x86_64`/`amd64`). Install without `sudo`:
 
 ```sh
-command -v subagent
-subagent --version
-```
-
-If `subagent` is missing and installation is authorized, require Linux x86-64 and
-install the latest statically linked release without root privileges:
-
-```sh
-uname -s
-uname -m
 curl -fsSL https://raw.githubusercontent.com/randomvibecoder/subagent/main/install.sh | sh
 ```
 
-Accept `Linux` with architecture `x86_64` or `amd64`. The installer downloads the
-release binary and checksum, verifies SHA-256, installs to
-`$HOME/.local/bin/subagent`, and verifies the installed version. It refuses other
-operating systems and architectures.
-
-Prefer inspecting the installer before execution when trust has not already been
-established:
-
-```sh
-curl -fsSLO https://raw.githubusercontent.com/randomvibecoder/subagent/main/install.sh
-less install.sh
-sh install.sh
-```
-
-Use these optional controls:
+The installer verifies the release checksum, installs to
+`$HOME/.local/bin/subagent`, and prints the installed version. Optional controls:
 
 ```sh
 SUBAGENT_VERSION=v0.1.0 sh install.sh
 SUBAGENT_INSTALL_DIR="$HOME/bin" sh install.sh
 ```
 
-Do not use `sudo`; installation is intentionally per-user. Ensure the chosen install
-directory is on `PATH` before continuing.
-
-Check the daemon before starting it:
-
-```sh
-subagent daemon status
-```
-
-If it is not running, configure an OpenAI-compatible endpoint in the daemon's
-environment and start it:
+## Configure and start
 
 ```sh
 export OPENAI_API_KEY='...'
@@ -90,337 +37,269 @@ export OPENAI_MODEL='your-model'
 subagent daemon start
 ```
 
-Never put API keys in agent messages. `OPENAI_API_KEY` is required to start the
-daemon, is held in daemon memory, and is removed from agent shell environments.
+Keep API keys out of tasks. The daemon requires `OPENAI_API_KEY` and removes it from
+agent shell environments.
 
-## Choose the correct operation
+## Output schemas
 
-Use this decision order:
+Commands below refer to these exact shared schemas.
 
-1. Use `agents spawn` for new, independent work.
-2. Use `agents side` or `agents btw` for one question that should inherit an existing
-   agent's context without changing its transcript.
-3. Use `agents send` to add an instruction to an existing agent or resume it.
-4. Use `agents status` for current state and `agents logs` for detailed progress.
-5. Use `agents stop` when work must end; use `agents delete` only when its persisted
-   history is no longer needed.
+### Agent
 
-For new work, choose the mode deliberately:
-
-- `readonly`: investigation, review, explanation, planning, or diagnosis.
-- `write`: implementation, file edits, fixes, builds, or tests that may change state.
-
-Readonly mode withholds structured mutation tools, but Bash remains available and
-the restriction is advisory. Do not treat readonly mode as a sandbox.
-
-## Handle JSONL
-
-Operational output is one JSON object per line. There is no alternate human/table
-mode. Parse each line independently. Errors are JSON objects written to stderr and
-produce a non-zero exit status.
-
-When shell parsing is needed, use `jq` if available:
-
-```sh
-result=$(subagent agents spawn --dir "$PWD" --message "Inspect this repository")
-id=$(printf '%s\n' "$result" | jq -r '.id')
+```json
+{
+  "type": "agent",
+  "id": "agt_<ULID>",
+  "title": "string",
+  "dir": "/canonical/path",
+  "mode": "readonly|write",
+  "advisory_readonly": true,
+  "model": "string",
+  "status": "working|finished|stopped|failed",
+  "spawned_at": "RFC3339",
+  "run_started_at": "RFC3339",
+  "updated_at": "RFC3339",
+  "finished_at": "RFC3339|null",
+  "stopped_at": "RFC3339|null",
+  "failed_at": "RFC3339|null",
+  "deadline_at": "RFC3339|null",
+  "run_number": 1,
+  "stop_reason": "string|null",
+  "last_error": "string|null"
+}
 ```
 
-Do not guess or reconstruct IDs. Preserve the exact returned `agt_...` value.
+`advisory_readonly` is `true` in readonly mode and `false` in write mode.
+
+### Event
+
+```json
+{
+  "event_id": "evt_<ULID>",
+  "agent_id": "agt_<ULID>",
+  "sequence": 1,
+  "timestamp": "RFC3339",
+  "type": "lifecycle|user_message|assistant_message|reasoning|tool_call|tool_result|error",
+  "data": {}
+}
+```
+
+### Error
+
+Errors go to stderr and return a non-zero exit status:
+
+```json
+{"type":"error","code":"string","message":"string"}
+```
+
+Codes include `cli_error`, `not_found`, `max_agents_reached`, `conflict`,
+`invalid_argument`, and `internal_error`.
 
 ## Daemon commands
 
-### Start
+### `subagent daemon start`
 
-```sh
-subagent daemon start
+Start the detached daemon. Output: exactly one daemon object after it is ready.
+
+```json
+{"type":"daemon","status":"running","pid":1234,"socket":"/path/subagent.sock","working_agents":0,"max_agents":0,"model":"string","base_url":"string"}
 ```
 
-Start the detached per-user daemon. Fail if another daemon already owns the socket.
-Return one daemon JSON object after readiness.
+### `subagent daemon status`
 
-### Status
+Output: exactly the same running daemon object as `daemon start`.
 
-```sh
-subagent daemon status
+### `subagent daemon stop`
+
+Stop the daemon and all working agents. Output: exactly one object:
+
+```json
+{"type":"daemon","status":"stopping","working_agents":2}
 ```
-
-Report daemon status, PID, socket path, active-agent count, capacity, model, and API
-base URL.
-
-### Stop
-
-```sh
-subagent daemon stop
-```
-
-Request an orderly daemon shutdown. This stops working agents and their terminal
-process groups. Do not stop the daemon merely because one agent should stop; use
-`agents stop ID` instead.
 
 ## Agent commands
 
-### Spawn a new agent
+### `subagent agents spawn`
 
 ```sh
-subagent agents spawn [OPTIONS] --dir DIR \
-  (--message TEXT | --message-file PATH)
+subagent agents spawn --dir DIR \
+  (--message TEXT | --message-file PATH) \
+  [--title TITLE] [--mode readonly|write] [--wall-time HOURS]
 ```
 
-Options:
+- `--message-file -` reads stdin.
+- `--mode` defaults to `readonly`.
+- `--wall-time` must satisfy `0 < HOURS <= 100`.
 
-- `--dir DIR`: required existing working directory; stored canonically.
-- `--message TEXT`: inline task.
-- `--message-file PATH`: read a UTF-8 task from a file; use `-` for stdin.
-- `--title TITLE`: stable display title; defaults to the first non-empty task line.
-- `--mode readonly|write`: defaults to `readonly`.
-- `--wall-time HOURS`: optional deadline, where `0 < HOURS <= 100`.
+Output: exactly one Agent object with `status:"working"` and `run_number:1`.
 
-Use message files for long or quote-heavy tasks:
+Use this for a new independent task. The new agent does not inherit the caller's
+conversation, so make the task self-contained. Use write mode only when changes are
+intended.
+
+### `subagent agents list`
 
 ```sh
-subagent agents spawn \
-  --dir /home/user/project \
-  --mode write \
-  --title "Repair authentication" \
-  --message-file /tmp/auth-task.md
+subagent agents list \
+  [--status working|finished|stopped|failed]... \
+  [--dir DIR] \
+  [--spawned-after RFC3339] [--spawned-before RFC3339] \
+  [--finished-after RFC3339] [--finished-before RFC3339] \
+  [--sort spawned_at|updated_at|finished_at] \
+  [--order asc|desc] [--limit N] [--offset N]
 ```
 
-Spawn returns one agent object containing `id`, `title`, `dir`, `mode`, `model`,
-`status`, timestamps, deadline, run number, stop reason, and last error. New agents
-start in `working` status.
+Defaults: `--sort spawned_at --order desc --limit 100 --offset 0`.
 
-Write self-contained tasks. State the objective, important constraints, expected
-verification, and completion condition. Do not assume the subagent sees the calling
-agent's conversation.
+Output: zero or more Agent objects, one per line. No match emits no lines.
 
-### List agents
+### `subagent agents status ID`
+
+Output: exactly one Agent object for `ID`.
+
+### `subagent agents logs ID`
 
 ```sh
-subagent agents list [OPTIONS]
+subagent agents logs ID [--type TYPE]... [--after EVENT_ID] [--limit N] [--follow]
 ```
 
-Options:
+Default limit: newest 100 events. `--type` is repeatable. `--after` uses an event ID
+as a cursor.
 
-- `--status working|finished|stopped|failed`: repeatable.
-- `--dir DIR`: filter by canonical working directory.
-- `--spawned-after RFC3339`
-- `--spawned-before RFC3339`
-- `--finished-after RFC3339`
-- `--finished-before RFC3339`
-- `--sort spawned_at|updated_at|finished_at`: default `spawned_at`.
-- `--order asc|desc`: default `desc`.
-- `--limit N`: default `100`.
-- `--offset N`: default `0`.
+Output without `--follow`: zero or more Event objects, one per line.
 
-Each matching agent is emitted as one JSONL line. No match produces no output.
+Output with `--follow`: historical matching Event objects followed by new Event
+objects as they are appended; the stream remains open until disconnected.
 
-Examples:
+### `subagent agents context ID`
 
 ```sh
-subagent agents list --status working
-subagent agents list --dir "$PWD" --sort updated_at --order desc --limit 20
-subagent agents list --status failed --status stopped
+subagent agents context ID [--include TYPE]... [--max-tokens N]
 ```
 
-### Read status
+Defaults: include `user_message` and `assistant_message`; maximum approximately
+12,000 tokens.
+
+Output first line:
+
+```json
+{"type":"context_meta","agent_id":"agt_<ULID>","estimated_tokens":123,"max_tokens":12000,"truncated":false,"included_types":["user_message","assistant_message"]}
+```
+
+Output remaining lines: zero or more Event objects selected for context.
+
+### `subagent agents send ID`
 
 ```sh
-subagent agents status ID
+subagent agents send ID \
+  (--message TEXT | --message-file PATH) [--wall-time HOURS]
 ```
 
-Return the current metadata for exactly one agent. Interpret statuses as follows:
+If the agent is working, queue the message for its next safe boundary. Otherwise,
+resume it as a new run using its persisted context. Output: exactly one updated Agent
+object. A resumed agent has `status:"working"` and an incremented `run_number`.
 
-- `working`: the daemon currently owns an active run.
-- `finished`: the model completed normally without another queued message.
-- `stopped`: the user, deadline, daemon shutdown, or daemon interruption stopped it.
-- `failed`: an API, tool, storage, or other fatal error ended it.
+### `subagent agents side ID`
 
-### Read or follow logs
+Alias: `subagent agents btw ID`.
 
 ```sh
-subagent agents logs ID [OPTIONS]
+subagent agents side ID \
+  (--message TEXT | --message-file PATH) [--wall-time HOURS]
 ```
 
-Options:
+Ask one question using a snapshot of the parent's context and workspace. The side
+agent can read, search, run non-mutating Bash, poll terminals, read command output,
+and view images. It never receives `write`, `edit`, or `apply_patch`. Nothing from
+the side run is added to the parent transcript.
 
-- `--type TYPE`: repeatable event filter.
-- `--after EVENT_ID`: emit only events after the supplied cursor.
-- `--limit N`: newest historical events; default `100`.
-- `--follow`: keep the connection open and stream new events.
+Output: exactly one side-answer object:
 
-Event types include `lifecycle`, `user_message`, `assistant_message`, `reasoning`,
-`tool_call`, `tool_result`, and `error`. Every event includes `event_id`, `agent_id`,
-`sequence`, `timestamp`, `type`, and `data`.
-
-Use `--follow` only when a blocking stream is appropriate. For periodic automation,
-prefer `status` or cursor-based `logs --after EVENT_ID`.
-
-### Read bounded context
-
-```sh
-subagent agents context ID [OPTIONS]
+```json
+{
+  "type": "side_answer",
+  "side_id": "side_<ULID>",
+  "agent_id": "agt_<ULID>",
+  "answer": "string",
+  "model": "string",
+  "mode": "readonly",
+  "parent_mode": "readonly|write",
+  "ephemeral": true,
+  "inherited_context_messages": 12,
+  "tool_calls": 3,
+  "usage": null
+}
 ```
 
-Options:
+`usage` is either `null` or the usage object returned by the API.
 
-- `--include TYPE`: repeatable; defaults to `user_message` and
-  `assistant_message`.
-- `--max-tokens N`: approximate output budget; default `12000`.
+### `subagent agents time ID HOURS`
 
-The first line is `context_meta`; remaining lines are selected events. Use this for
-model-sized handoff context, not for complete diagnostics. Use `logs` when tool and
-lifecycle detail matters.
+Require a working agent and `0 < HOURS <= 100`. Reset its deadline to `HOURS` from
+now. Output: exactly one updated Agent object with the new `deadline_at`.
 
-### Send or resume
+### `subagent agents stop ID`
 
-```sh
-subagent agents send ID [OPTIONS] \
-  (--message TEXT | --message-file PATH)
+Require a working agent. Stop it and its terminal process groups. Output: exactly one
+updated Agent object with `status:"stopped"`, `stop_reason:"user_request"`, and a
+non-null `stopped_at`.
+
+### `subagent agents delete ID`
+
+Require a non-working agent. Permanently delete its metadata, context, events, and
+outputs. Output: exactly one object:
+
+```json
+{"type":"agent_deleted","id":"agt_<ULID>"}
 ```
-
-Optional `--wall-time HOURS` resets a working deadline from now or sets the resumed
-run's deadline.
-
-If the agent is `working`, queue the message for its next safe model boundary. If it
-is `finished`, `stopped`, or `failed`, start a new run with the persisted context and
-increment `run_number`.
-
-Use `send` when the instruction should become part of the parent agent's durable
-conversation. Do not use it for an ephemeral question; use `side`.
-
-### Ask a side question
-
-```sh
-subagent agents side ID [OPTIONS] \
-  (--message TEXT | --message-file PATH)
-subagent agents btw ID [OPTIONS] \
-  (--message TEXT | --message-file PATH)
-```
-
-`btw` is an alias for `side`. Optional `--wall-time HOURS` bounds the side run.
-
-A side agent:
-
-- Inherits a valid snapshot of the parent agent's full model context and workspace.
-- Runs independently, including while the parent is working.
-- Has the single goal of answering the question.
-- Can read, glob, grep, run non-mutating Bash, poll terminals, read command output,
-  and view images.
-- Is always readonly, even when the parent is write-enabled.
-- Never receives `write`, `edit`, or `apply_patch`.
-- Does not persist its question, reasoning, tool calls, answer, or temporary outputs.
-- Does not alter the parent's transcript.
-
-Use side questions for facts, explanations, locations, rationale, or status that may
-require inspecting the workspace. Bash restrictions remain instruction-based.
-
-The response is one `side_answer` object containing `side_id`, parent `agent_id`,
-`answer`, `model`, readonly `mode`, `parent_mode`, inherited-message count, tool-call
-count, and optional usage.
-
-### Change a deadline
-
-```sh
-subagent agents time ID HOURS
-```
-
-Require a working agent and `0 < HOURS <= 100`. Reset the deadline to `HOURS` from
-now. This command cannot clear a deadline.
-
-### Stop an agent
-
-```sh
-subagent agents stop ID
-```
-
-Require a working agent. Signal the worker, terminate all of its terminal process
-groups, persist `stopped` status, and return updated metadata.
-
-### Delete an agent
-
-```sh
-subagent agents delete ID
-```
-
-Permanently remove metadata, context, events, and stored command outputs. Refuse to
-delete a working agent. Stop it first if deletion is truly intended. Treat deletion
-as destructive and do not infer permission from a request to stop or hide work.
 
 ## Configuration commands
 
-### List
+Supported keys: `base-url`, `model`, `max-agents`, `context-token-budget`, and
+`tool-output-preview-bytes`.
 
-```sh
-subagent config list
+### `subagent config list`
+
+Output: exactly one object:
+
+```json
+{"type":"config","base-url":"string","model":"string","max-agents":0,"context-token-budget":64000,"tool-output-preview-bytes":16384}
 ```
 
-Return all non-secret settings.
+### `subagent config get KEY`
 
-### Get
+Output: exactly one object. `value` is a string or non-negative integer depending on
+the key.
 
-```sh
-subagent config get KEY
+```json
+{"type":"config_value","key":"model","value":"string"}
 ```
 
-### Set
+### `subagent config set KEY VALUE`
 
-```sh
-subagent config set KEY VALUE
+Persist a non-secret setting. Output: exactly one object:
+
+```json
+{"type":"config_value","key":"max-agents","value":8,"note":"restart daemon for this value to take effect"}
 ```
 
-Supported keys:
+Restart the daemon after setting a value. `max-agents:0` means unlimited; a positive
+value rejects new work when that many agents are working. API keys cannot be stored
+with `config`.
 
-- `base-url`
-- `model`
-- `max-agents`
-- `context-token-budget`
-- `tool-output-preview-bytes`
+## Use the right command
 
-Stored configuration changes take effect after restarting the daemon. Never store
-`OPENAI_API_KEY` through `config`; it is intentionally environment-only.
+- New independent task: `agents spawn`.
+- Question about an existing agent: `agents side`.
+- New durable instruction or continuation: `agents send`.
+- Quick state check: `agents status`.
+- Detailed or streaming progress: `agents logs`.
+- End active work: `agents stop`.
+- Remove stored history: `agents delete` only with explicit authorization.
 
-Environment overrides:
+Normal agents run directly with the daemon user's host permissions. Readonly mode
+withholds structured mutation tools but Bash remains advisory. `subagent` does not
+create worktrees or prevent concurrent agents from editing the same files.
 
-- `OPENAI_API_KEY`
-- `OPENAI_BASE_URL`
-- `OPENAI_MODEL`
-- `SUBAGENT_MAX_AGENTS`
-
-`max-agents = 0` means unlimited. A positive limit is a hard rejection threshold
-for simultaneously working agents; there is no queue.
-
-## Work effectively
-
-For a delegated implementation:
-
-1. Spawn with a precise title, canonical project directory, write mode, and explicit
-   verification requirements.
-2. Save the returned ID.
-3. Continue other independent work.
-4. Check `status` and inspect filtered logs when needed.
-5. Use `send` for corrections or additional durable requirements.
-6. Inspect the final status and relevant assistant/tool events before relying on the
-   result.
-
-For parallel work, spawn independent agents only when their directories or intended
-changes will not collide. `subagent` does not create worktrees or merge concurrent
-edits.
-
-For a question about an existing agent, use `side` first. Use `send` only if the
-answer or instruction should influence the parent's continuing work.
-
-## Respect safety boundaries
-
-- Assume normal agents are unsandboxed and can access the daemon user's files,
-  processes, credentials, and network.
-- Use `--mode write` only when mutation is intended.
-- Treat readonly and side-agent Bash restrictions as advisory.
-- Scope `--dir` to the intended project.
-- Do not place secrets in prompts, titles, logs, or message files.
-- Do not delete agent history without explicit authorization.
-- Stop runaway work and terminal processes promptly.
-- Remember that stopping the daemon stops all working agents.
-
-Use `subagent <group> <command> --help` whenever installed behavior and this skill
-differ. The installed CLI is authoritative.
+If installed behavior differs from this skill, use
+`subagent <group> <command> --help` as the authority.
