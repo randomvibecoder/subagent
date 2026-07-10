@@ -3,7 +3,7 @@ set -eu
 
 REPOSITORY="randomvibecoder/subagent"
 ASSET="subagent-linux-x86_64"
-VERSION=${SUBAGENT_VERSION:-latest}
+BASE_URL="https://github.com/$REPOSITORY/releases/latest/download"
 INSTALL_DIR=${SUBAGENT_INSTALL_DIR:-"${HOME:?HOME is not set}/.local/bin"}
 
 fail() {
@@ -40,22 +40,6 @@ sha256() {
 case "$(uname -m)" in
     x86_64 | amd64) ;;
     *) fail "unsupported architecture: $(uname -m); this release supports x86_64 Linux" ;;
-esac
-
-case "$VERSION" in
-    latest)
-        BASE_URL="https://github.com/$REPOSITORY/releases/latest/download"
-        ;;
-    v[0-9]*.[0-9]*.[0-9]*)
-        BASE_URL="https://github.com/$REPOSITORY/releases/download/$VERSION"
-        ;;
-    [0-9]*.[0-9]*.[0-9]*)
-        VERSION="v$VERSION"
-        BASE_URL="https://github.com/$REPOSITORY/releases/download/$VERSION"
-        ;;
-    *)
-        fail "invalid SUBAGENT_VERSION: $VERSION (expected latest, vX.Y.Z, or X.Y.Z)"
-        ;;
 esac
 
 TMP_DIR=$(mktemp -d "${TMPDIR:-/tmp}/subagent-install.XXXXXX") || fail "cannot create temporary directory"

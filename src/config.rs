@@ -82,9 +82,9 @@ impl Paths {
 }
 
 impl FileConfig {
-    pub fn load(paths: &Paths) -> Result<Self> {
+    pub fn load_persisted(paths: &Paths) -> Result<Self> {
         let path = paths.config_file();
-        let mut cfg = if path.exists() {
+        let cfg = if path.exists() {
             toml::from_str(
                 &fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?,
             )
@@ -92,6 +92,11 @@ impl FileConfig {
         } else {
             Self::default()
         };
+        Ok(cfg)
+    }
+
+    pub fn load(paths: &Paths) -> Result<Self> {
+        let mut cfg = Self::load_persisted(paths)?;
         if let Ok(v) = env::var("OPENAI_BASE_URL") {
             cfg.base_url = v;
         }

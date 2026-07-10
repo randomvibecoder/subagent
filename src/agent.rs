@@ -501,7 +501,7 @@ async fn run_worker(
 fn system_message(meta: &AgentMetadata) -> Value {
     let mode = match meta.mode {
         AgentMode::Readonly => {
-            "You are in advisory readonly mode. Do not modify files or system state. Bash is available only for non-mutating inspection commands."
+            "You are in advisory readonly mode. You must not modify files or system state. Bash is provided only for non-mutating inspection with commands such as rg, grep, find, cat, and sed without -i; never run a mutating command."
         }
         AgentMode::Write => {
             "You may inspect and modify the workspace. Complete the task, verify the result, and stop only when finished."

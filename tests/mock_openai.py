@@ -64,11 +64,24 @@ class Handler(BaseHTTPRequestHandler):
         }
         has_tool_result = any(message.get("role") == "tool" for message in messages)
         tool_results = [message for message in messages if message.get("role") == "tool"]
+        system_text = "\n".join(
+            message.get("content", "")
+            for message in messages
+            if message.get("role") == "system"
+            and isinstance(message.get("content"), str)
+        )
 
         if latest_user == "DELAY" and not has_tool_result:
             time.sleep(10)
 
-        if "SIDE_TOOL_QUESTION" in latest_user and not {
+        if "READONLY_PROMPT" in latest_user:
+            correct = (
+                "must not modify files or system state" in system_text
+                and "sed without -i" in system_text
+                and not {"write", "edit", "apply_patch"}.intersection(tool_names)
+            )
+            deltas = [{"content": "readonly prompt correct" if correct else "readonly prompt incorrect"}]
+        elif "SIDE_TOOL_QUESTION" in latest_user and not {
             "read",
             "glob",
             "grep",

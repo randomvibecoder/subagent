@@ -37,11 +37,11 @@ less install.sh
 sh install.sh
 ```
 
-Pin a version or choose another user-owned destination with environment variables:
+To use another user-owned destination:
 
 ```sh
-SUBAGENT_VERSION=v0.1.0 sh install.sh
-SUBAGENT_INSTALL_DIR="$HOME/bin" sh install.sh
+curl -fsSL https://raw.githubusercontent.com/randomvibecoder/subagent/main/install.sh |
+  SUBAGENT_INSTALL_DIR="$HOME/bin" sh
 ```
 
 Alternatively, clone the repository and install its included binary:

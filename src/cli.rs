@@ -2,6 +2,7 @@ use crate::{
     config::{FileConfig, Paths, RuntimeConfig, ensure_private_dir},
     daemon,
     ipc::{AgentMode, ListFilter, Request, error_json},
+    store::canonical_dir,
 };
 use anyhow::{Context, Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
@@ -299,7 +300,7 @@ async fn run_inner() -> Result<()> {
         TopCommand::Agents(command) => {
             let req = match command {
                 AgentsCommand::Spawn(a) => Request::AgentSpawn {
-                    dir: a.dir,
+                    dir: canonical_dir(&a.dir)?,
                     message: read_message(a.message, a.message_file).await?,
                     title: a.title,
                     mode: a.mode.into(),
@@ -312,7 +313,7 @@ async fn run_inner() -> Result<()> {
                             .into_iter()
                             .map(|status| status.as_str().to_string())
                             .collect(),
-                        dir: a.dir,
+                        dir: a.dir.as_deref().map(canonical_dir).transpose()?,
                         spawned_after: a.spawned_after,
                         spawned_before: a.spawned_before,
                         finished_after: a.finished_after,
@@ -357,7 +358,11 @@ async fn run_inner() -> Result<()> {
 
 fn config_command(command: ConfigCommand) -> Result<()> {
     let paths = Paths::discover()?;
-    let mut cfg = FileConfig::load(&paths)?;
+    let mut cfg = if matches!(&command, ConfigCommand::Set { .. }) {
+        FileConfig::load_persisted(&paths)?
+    } else {
+        FileConfig::load(&paths)?
+    };
     match command {
         ConfigCommand::List => println!(
             "{}",

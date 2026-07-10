@@ -3,6 +3,7 @@ set -euo pipefail
 
 BIN=${SUBAGENT_BIN:-./target/release/subagent}
 ROOT=/tmp/subagent-e2e
+rm -rf "$ROOT"
 export HOME="$ROOT/home"
 export XDG_CONFIG_HOME="$ROOT/config"
 export XDG_STATE_HOME="$ROOT/state"
@@ -12,6 +13,7 @@ export OPENAI_BASE_URL=http://127.0.0.1:18080/v1
 export OPENAI_MODEL=test-model
 
 mkdir -p "$HOME" "$XDG_CONFIG_HOME" "$XDG_STATE_HOME" "$XDG_RUNTIME_DIR" "$ROOT/project"
+BIN=$(realpath "$BIN")
 python3 tests/mock_openai.py &
 MOCK_PID=$!
 sleep 0.2
@@ -42,7 +44,20 @@ wait_status() {
 }
 
 $BIN config set max-agents 1 >/dev/null
+python3 -c 'import pathlib,sys; body=pathlib.Path(sys.argv[1]).read_text(); assert "test-model" not in body and "127.0.0.1:18080" not in body' "$XDG_CONFIG_HOME/subagent/config.toml"
 $BIN daemon start | python3 -c 'import json,sys; assert json.load(sys.stdin)["status"] == "running"'
+
+mkdir -p "$ROOT/caller/project"
+RELATIVE=$(cd "$ROOT/caller" && "$BIN" agents spawn --dir project --message FINAL_ONLY)
+RELATIVE_ID=$(printf '%s\n' "$RELATIVE" | json_field id)
+printf '%s\n' "$RELATIVE" | python3 -c 'import json,os,sys; row=json.load(sys.stdin); assert row["dir"] == os.path.realpath(sys.argv[1])' "$ROOT/caller/project"
+wait_status "$RELATIVE_ID" finished
+(cd "$ROOT/caller" && "$BIN" agents list --dir project) | python3 -c 'import json,sys; rows=[json.loads(line) for line in sys.stdin]; assert len(rows) == 1'
+
+READONLY=$($BIN agents spawn --dir "$ROOT/project" --mode readonly --message READONLY_PROMPT)
+READONLY_ID=$(printf '%s\n' "$READONLY" | json_field id)
+wait_status "$READONLY_ID" finished
+$BIN agents logs "$READONLY_ID" --type assistant_message | python3 -c 'import json,sys; rows=[json.loads(x) for x in sys.stdin]; assert rows[-1]["data"]["content"] == "readonly prompt correct"'
 
 printf '%s\n' WRITE_EDIT_PATCH >"$ROOT/task.md"
 SPAWN=$($BIN agents spawn --dir "$ROOT/project" --mode write --title tool-test --message-file "$ROOT/task.md")
@@ -52,6 +67,18 @@ wait_status "$ID" finished
 
 $BIN agents logs "$ID" --type tool_result --limit 100 | python3 -c 'import json,sys; rows=[json.loads(x) for x in sys.stdin]; assert len(rows) >= 6'
 $BIN agents logs "$ID" --type reasoning --limit 100 | python3 -c 'import json,sys; rows=[json.loads(x) for x in sys.stdin]; assert rows and rows[-1]["data"]["content"] == "mock reasoning"'
+CURSOR=$($BIN agents logs "$ID" --limit 100 | sed -n '1p' | python3 -c 'import json,sys; print(json.load(sys.stdin)["event_id"])')
+$BIN agents logs "$ID" --after "$CURSOR" --limit 100 | python3 -c 'import json,sys; cursor=sys.argv[1]; rows=[json.loads(x) for x in sys.stdin]; assert all(row["event_id"] != cursor for row in rows)' "$CURSOR"
+if $BIN agents logs "$ID" --after evt_missing 2>"$ROOT/cursor-error.jsonl"; then
+  echo "logs unexpectedly accepted an unknown cursor" >&2
+  exit 1
+fi
+python3 -c 'import json,sys; assert json.load(open(sys.argv[1]))["code"] == "not_found"' "$ROOT/cursor-error.jsonl"
+if timeout 2 $BIN agents logs "$ID" --after evt_missing --follow 2>"$ROOT/follow-cursor-error.jsonl"; then
+  echo "follow unexpectedly accepted an unknown cursor" >&2
+  exit 1
+fi
+python3 -c 'import json,sys; assert json.load(open(sys.argv[1]))["code"] == "not_found"' "$ROOT/follow-cursor-error.jsonl"
 $BIN agents context "$ID" | python3 -c 'import json,sys; rows=[json.loads(x) for x in sys.stdin]; assert rows[0]["type"] == "context_meta"; assert all(x["type"] in ("context_meta","user_message","assistant_message") for x in rows)'
 
 printf '%s\n' FINAL_ONLY >"$ROOT/followup.md"
