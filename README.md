@@ -16,12 +16,40 @@ to parse around.
 
 ## Install
 
-The repository includes a static Linux x86-64 binary:
+Supported platform: **Linux x86-64** (`x86_64`/`amd64`). The release binary is
+statically linked, so the same artifact runs across distributions without a system
+runtime dependency.
+
+Install the latest release without root privileges:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/randomvibecoder/subagent/main/install.sh | sh
+```
+
+The installer downloads the release binary and checksum, verifies SHA-256, installs
+to `$HOME/.local/bin/subagent`, and runs `subagent --version`.
+
+To inspect the installer before running it:
+
+```sh
+curl -fsSLO https://raw.githubusercontent.com/randomvibecoder/subagent/main/install.sh
+less install.sh
+sh install.sh
+```
+
+Pin a version or choose another user-owned destination with environment variables:
+
+```sh
+SUBAGENT_VERSION=v0.1.0 sh install.sh
+SUBAGENT_INSTALL_DIR="$HOME/bin" sh install.sh
+```
+
+Alternatively, clone the repository and install its included binary:
 
 ```sh
 git clone https://github.com/randomvibecoder/subagent.git
 cd subagent
-install -Dm755 dist/subagent "$HOME/.local/bin/subagent"
+install -Dm755 dist/subagent-linux-x86_64 "$HOME/.local/bin/subagent"
 ```
 
 Ensure `$HOME/.local/bin` is on `PATH`. To build from source instead, use a current
@@ -32,7 +60,7 @@ cargo build --release --locked
 install -Dm755 target/release/subagent "$HOME/.local/bin/subagent"
 ```
 
-No root privileges or system service installation are required.
+No root privileges, package manager, or system service installation are required.
 
 ## Quick start
 

@@ -41,6 +41,39 @@ command -v subagent
 subagent --version
 ```
 
+If `subagent` is missing and installation is authorized, require Linux x86-64 and
+install the latest statically linked release without root privileges:
+
+```sh
+uname -s
+uname -m
+curl -fsSL https://raw.githubusercontent.com/randomvibecoder/subagent/main/install.sh | sh
+```
+
+Accept `Linux` with architecture `x86_64` or `amd64`. The installer downloads the
+release binary and checksum, verifies SHA-256, installs to
+`$HOME/.local/bin/subagent`, and verifies the installed version. It refuses other
+operating systems and architectures.
+
+Prefer inspecting the installer before execution when trust has not already been
+established:
+
+```sh
+curl -fsSLO https://raw.githubusercontent.com/randomvibecoder/subagent/main/install.sh
+less install.sh
+sh install.sh
+```
+
+Use these optional controls:
+
+```sh
+SUBAGENT_VERSION=v0.1.0 sh install.sh
+SUBAGENT_INSTALL_DIR="$HOME/bin" sh install.sh
+```
+
+Do not use `sudo`; installation is intentionally per-user. Ensure the chosen install
+directory is on `PATH` before continuing.
+
 Check the daemon before starting it:
 
 ```sh
