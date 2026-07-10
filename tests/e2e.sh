@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-BIN=${SUBAGENT_BIN:-/workspace/target/release/subagent}
+BIN=${SUBAGENT_BIN:-./target/release/subagent}
 ROOT=/tmp/subagent-e2e
 export HOME="$ROOT/home"
 export XDG_CONFIG_HOME="$ROOT/config"
@@ -125,4 +125,4 @@ $BIN agents status "$INTERRUPTED_ID" | python3 -c 'import json,sys; row=json.loa
 
 $BIN daemon stop | python3 -c 'import json,sys; assert json.load(sys.stdin)["status"] == "stopping"'
 
-echo '{"type":"test_result","status":"passed","suite":"docker-e2e"}'
+echo '{"type":"test_result","status":"passed","suite":"e2e"}'

@@ -1,3 +1,5 @@
 /target/
 /.subagent-test-state/
 *.log
+__pycache__/
+*.py[cod]

@@ -6,8 +6,21 @@ color, or interactive presentation mode.
 
 ## Setup
 
-Use the prebuilt static binary at `dist/subagent`, or build it with
-`Dockerfile.release`. Configure an OpenAI-compatible chat-completions endpoint:
+Install the included Linux binary directly:
+
+```sh
+install -Dm755 dist/subagent "$HOME/.local/bin/subagent"
+```
+
+Or build and install it from source with a current stable Rust toolchain:
+
+```sh
+cargo build --release --locked
+install -Dm755 target/release/subagent "$HOME/.local/bin/subagent"
+```
+
+Ensure `$HOME/.local/bin` is on `PATH`, then configure an OpenAI-compatible
+chat-completions endpoint and start the per-user daemon:
 
 ```sh
 export OPENAI_API_KEY='...'
@@ -66,10 +79,15 @@ user that has access only to the projects and resources agents should reach.
 
 ## Verification
 
-All model-driven tests run inside Docker using a mock OpenAI-compatible streaming
-server. Build and run the test image with:
+Run the unit tests directly with Cargo:
 
 ```sh
-docker build -f Dockerfile.test -t subagent-test .
-docker run --rm subagent-test
+cargo test --locked
+```
+
+The end-to-end suite uses a local mock OpenAI-compatible streaming server:
+
+```sh
+cargo build --release --locked
+SUBAGENT_BIN="$PWD/target/release/subagent" tests/e2e.sh
 ```
