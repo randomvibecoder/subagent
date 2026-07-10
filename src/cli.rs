@@ -80,6 +80,11 @@ enum AgentsCommand {
     Context(ContextArgs),
     #[command(about = "Send input at the next safe boundary, or resume a non-working agent.")]
     Send(SendArgs),
+    #[command(
+        visible_alias = "btw",
+        about = "Answer a question with a readonly side agent over a snapshot of the parent context."
+    )]
+    Side(SideArgs),
     #[command(about = "Set a working agent deadline to HOURS from now (0 < HOURS <= 100).")]
     Time { id: String, hours: f64 },
     #[command(about = "Stop a working agent and all its terminal process groups.")]
@@ -241,6 +246,25 @@ struct SendArgs {
     wall_time: Option<f64>,
 }
 
+#[derive(Args)]
+#[command(
+    group(clap::ArgGroup::new("input").required(true).multiple(false).args(["message", "message_file"])),
+    after_help="The side agent inherits a snapshot of the parent's full model context and workspace. It can read, search, run non-mutating Bash, poll terminals, read output, and view images, but never receives write, edit, or patch tools. It runs independently and does not append its question, tool calls, or answer to the parent transcript. Output: {type:\"side_answer\",side_id,agent_id,answer,model,mode,parent_mode,ephemeral,inherited_context_messages,tool_calls}."
+)]
+struct SideArgs {
+    /// Parent agent ID.
+    id: String,
+    /// Inline side question. Conflicts with --message-file.
+    #[arg(long)]
+    message: Option<String>,
+    /// Read UTF-8 input from PATH; use - for stdin.
+    #[arg(long, value_name = "PATH")]
+    message_file: Option<String>,
+    /// Optional side-agent deadline in hours; must be >0 and <=100.
+    #[arg(long, value_name = "HOURS")]
+    wall_time: Option<f64>,
+}
+
 pub async fn run() -> Result<()> {
     if let Err(e) = run_inner().await {
         eprintln!(
@@ -313,6 +337,11 @@ async fn run_inner() -> Result<()> {
                     max_tokens: a.max_tokens,
                 },
                 AgentsCommand::Send(a) => Request::AgentSend {
+                    id: a.id,
+                    message: read_message(a.message, a.message_file).await?,
+                    wall_time_hours: a.wall_time,
+                },
+                AgentsCommand::Side(a) => Request::AgentSide {
                     id: a.id,
                     message: read_message(a.message, a.message_file).await?,
                     wall_time_hours: a.wall_time,

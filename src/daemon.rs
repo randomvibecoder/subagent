@@ -185,6 +185,11 @@ async fn dispatch(
             message,
             wall_time_hours,
         )?)?],
+        Request::AgentSide {
+            id,
+            message,
+            wall_time_hours,
+        } => vec![manager.side(&id, message, wall_time_hours).await?],
         Request::AgentTime { id, hours } => {
             vec![serde_json::to_value(manager.update_time(&id, hours)?)?]
         }

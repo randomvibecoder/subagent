@@ -1,5 +1,5 @@
 use crate::{
-    config::RuntimeConfig,
+    config::{RuntimeConfig, ensure_private_dir},
     ipc::AgentMode,
     model::{OpenAiClient, assistant_message},
     store::{
@@ -246,11 +246,148 @@ impl AgentManager {
         Ok(meta)
     }
 
+    pub async fn side(
+        &self,
+        id: &str,
+        message: String,
+        wall_time_hours: Option<f64>,
+    ) -> Result<Value> {
+        validate_message(&message)?;
+        let meta = self.store.load_metadata(id)?;
+        let mut context = self.store.load_context(id)?;
+        make_side_snapshot_valid(&mut context);
+        compact_context(&mut context, self.cfg.file.context_token_budget);
+        let inherited_context_messages = context.messages.len();
+        context.messages.push(json!({
+            "role":"system",
+            "content":"You are an ephemeral, strictly non-modifying side agent branching from a parent coding-agent conversation. Your only goal is to answer the new side question using the inherited context. If the answer is not already established, inspect files, search with glob or grep, run non-mutating Bash commands such as rg or grep, poll terminals, read stored output, or view images. Do not create, edit, delete, rename, or otherwise modify files, repositories, processes, configuration, or external state. Work independently: your messages and tool activity will not be added to the parent's transcript. Return a focused answer as soon as the question is resolved."
+        }));
+        context
+            .messages
+            .push(json!({"role":"user","content":message}));
+        let deadline = deadline_from_hours(wall_time_hours)?;
+        let side_id = format!("side_{}", ulid::Ulid::new());
+        ensure_private_dir(&self.store.outputs_dir(&side_id))?;
+        let terminals = TerminalManager::default();
+        let result = run_side(
+            self.cfg.clone(),
+            self.store.clone(),
+            &meta,
+            &side_id,
+            context,
+            inherited_context_messages,
+            deadline,
+            terminals.clone(),
+        )
+        .await;
+        terminals.terminate_all().await;
+        let _ = std::fs::remove_dir_all(self.store.agent_dir(&side_id));
+        result
+    }
+
     pub async fn stop_all(&self, reason: &str) {
         let ids: Vec<_> = self.active.lock().unwrap().keys().cloned().collect();
         for id in ids {
             let _ = self.stop(&id, reason).await;
         }
+    }
+}
+
+async fn run_side(
+    cfg: Arc<RuntimeConfig>,
+    store: Store,
+    meta: &AgentMetadata,
+    side_id: &str,
+    mut context: ContextSnapshot,
+    inherited_context_messages: usize,
+    deadline: Option<chrono::DateTime<Utc>>,
+    terminals: TerminalManager,
+) -> Result<Value> {
+    let client = OpenAiClient::new(
+        cfg.api_key.clone(),
+        cfg.file.base_url.clone(),
+        meta.model.clone(),
+    )?;
+    let runtime = ToolRuntime {
+        agent_id: side_id.to_string(),
+        cwd: meta.dir.clone().into(),
+        mode: AgentMode::Readonly,
+        store,
+        terminals,
+        preview_bytes: cfg.file.tool_output_preview_bytes,
+    };
+    let defs = tool_definitions(AgentMode::Readonly);
+    let mut tool_calls = 0usize;
+    loop {
+        if deadline.is_some_and(|value| Utc::now() >= value) {
+            bail!("side agent wall time exceeded")
+        }
+        compact_context(&mut context, cfg.file.context_token_budget);
+        let turn = if let Some(deadline) = deadline {
+            let remaining = (deadline - Utc::now())
+                .to_std()
+                .unwrap_or(std::time::Duration::ZERO);
+            tokio::time::timeout(remaining, client.complete(&context.messages, &defs))
+                .await
+                .context("side agent wall time exceeded")??
+        } else {
+            client.complete(&context.messages, &defs).await?
+        };
+        context.messages.push(assistant_message(&turn));
+        if turn.tool_calls.is_empty() {
+            return Ok(json!({
+                "type":"side_answer",
+                "side_id":side_id,
+                "agent_id":meta.id,
+                "answer":turn.content,
+                "model":meta.model,
+                "mode":AgentMode::Readonly,
+                "parent_mode":meta.mode,
+                "ephemeral":true,
+                "inherited_context_messages":inherited_context_messages,
+                "tool_calls":tool_calls,
+                "usage":turn.usage,
+            }));
+        }
+        tool_calls += turn.tool_calls.len();
+        let mut image_messages = Vec::new();
+        for call in turn.tool_calls {
+            let result = runtime.execute(&call).await;
+            context.messages.push(json!({
+                "role":"tool",
+                "tool_call_id":call.id,
+                "content":serde_json::to_string(&result.content)?,
+            }));
+            if let Some(image) = result.image_message {
+                image_messages.push(image);
+            }
+        }
+        context.messages.extend(image_messages);
+    }
+}
+
+fn make_side_snapshot_valid(context: &mut ContextSnapshot) {
+    let Some(index) = context.messages.iter().rposition(|message| {
+        message
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .is_some_and(|calls| !calls.is_empty())
+    }) else {
+        return;
+    };
+    let expected: Vec<_> = context.messages[index]["tool_calls"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|call| call.get("id").and_then(Value::as_str))
+        .collect();
+    let present: Vec<_> = context.messages[index + 1..]
+        .iter()
+        .filter(|message| message.get("role").and_then(Value::as_str) == Some("tool"))
+        .filter_map(|message| message.get("tool_call_id").and_then(Value::as_str))
+        .collect();
+    if expected.iter().any(|id| !present.contains(id)) {
+        context.messages.truncate(index);
     }
 }
 
@@ -544,5 +681,39 @@ mod tests {
         assert!(deadline_from_hours(Some(100.0)).unwrap().is_some());
         assert!(deadline_from_hours(Some(0.0)).is_err());
         assert!(deadline_from_hours(Some(100.1)).is_err());
+    }
+
+    #[test]
+    fn side_snapshot_drops_an_incomplete_tool_turn() {
+        let mut context = ContextSnapshot {
+            messages: vec![
+                json!({"role":"system","content":"system"}),
+                json!({"role":"user","content":"task"}),
+                json!({"role":"assistant","content":null,"tool_calls":[
+                    {"id":"call_1","type":"function","function":{"name":"read","arguments":"{}"}},
+                    {"id":"call_2","type":"function","function":{"name":"grep","arguments":"{}"}}
+                ]}),
+                json!({"role":"tool","tool_call_id":"call_1","content":"done"}),
+            ],
+            compacted_at: None,
+        };
+        make_side_snapshot_valid(&mut context);
+        assert_eq!(context.messages.len(), 2);
+    }
+
+    #[test]
+    fn side_snapshot_keeps_a_complete_tool_turn() {
+        let mut context = ContextSnapshot {
+            messages: vec![
+                json!({"role":"system","content":"system"}),
+                json!({"role":"assistant","content":null,"tool_calls":[
+                    {"id":"call_1","type":"function","function":{"name":"read","arguments":"{}"}}
+                ]}),
+                json!({"role":"tool","tool_call_id":"call_1","content":"done"}),
+            ],
+            compacted_at: None,
+        };
+        make_side_snapshot_valid(&mut context);
+        assert_eq!(context.messages.len(), 3);
     }
 }

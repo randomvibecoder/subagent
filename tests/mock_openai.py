@@ -50,13 +50,72 @@ class Handler(BaseHTTPRequestHandler):
             for message in messages
             if message.get("role") == "user" and isinstance(message.get("content"), str)
         )
+        latest_user = next(
+            (
+                message.get("content", "")
+                for message in reversed(messages)
+                if message.get("role") == "user"
+                and isinstance(message.get("content"), str)
+            ),
+            "",
+        )
+        tool_names = {
+            tool.get("function", {}).get("name") for tool in request.get("tools", [])
+        }
         has_tool_result = any(message.get("role") == "tool" for message in messages)
         tool_results = [message for message in messages if message.get("role") == "tool"]
 
-        if "DELAY" in user_text and not has_tool_result:
+        if latest_user == "DELAY" and not has_tool_result:
             time.sleep(10)
 
-        if "SECRET_ENV" in user_text and not tool_results:
+        if "SIDE_TOOL_QUESTION" in latest_user and not {
+            "read",
+            "glob",
+            "grep",
+            "exec_command",
+            "view_image",
+        }.issubset(tool_names):
+            deltas = [{"content": "missing inherited tools"}]
+        elif "SIDE_TOOL_QUESTION" in latest_user and {
+            "write",
+            "edit",
+            "apply_patch",
+        }.intersection(tool_names):
+            deltas = [{"content": "unsafe mutation tools exposed"}]
+        elif "SIDE_TOOL_QUESTION" in latest_user and not tool_results:
+            deltas = fragment_calls(
+                [
+                    function_call(0, "read", {"path": "side.txt"}),
+                    function_call(1, "glob", {"pattern": "*.txt"}),
+                    function_call(
+                        2, "grep", {"pattern": "side-file-content", "path": "."}
+                    ),
+                    function_call(
+                        3,
+                        "exec_command",
+                        {
+                            "command": "grep -n side-file-content side.txt",
+                            "yield_time_ms": 250,
+                        },
+                    ),
+                    function_call(4, "view_image", {"path": "pixel.png"}),
+                ]
+            )
+        elif "SIDE_TOOL_QUESTION" in latest_user:
+            deltas = [{"content": "side inherited context and tools"}]
+        elif "SIDE_CONTEXT_ONLY" in latest_user:
+            deltas = [
+                {
+                    "content": (
+                        "context inherited"
+                        if "SIDE_PARENT_MARKER" in user_text
+                        else "context missing"
+                    )
+                }
+            ]
+        elif "SIDE_WHILE_WORKING" in latest_user:
+            deltas = [{"content": "parent still running"}]
+        elif "SECRET_ENV" in user_text and not tool_results:
             deltas = fragment_calls(
                 [
                     function_call(

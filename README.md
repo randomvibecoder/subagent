@@ -25,7 +25,7 @@ Configuration changes take effect after restarting the daemon.
 ```text
 subagent daemon start|status|stop
 subagent agents spawn --dir PATH (--message TEXT | --message-file PATH)
-subagent agents list|status|logs|context|send|time|stop|delete
+subagent agents list|status|logs|context|send|side|btw|time|stop|delete
 subagent config list|get|set
 ```
 
@@ -34,6 +34,15 @@ Agent identifiers are unique `agt_<ULID>` values. A spawn can use `--mode readon
 (the default) or `--mode write`, and `--wall-time HOURS` accepts values up to 100.
 `SUBAGENT_MAX_AGENTS` or `config set max-agents N` controls concurrent working
 agents; zero means unlimited.
+
+Use `agents side` (alias `agents btw`) for a focused branch that inherits a snapshot
+of the parent's full model context and workspace. Its only goal is to answer the
+question. It can run while its parent is working and may read files, search with
+glob or grep, execute non-mutating Bash commands, poll terminals, read stored output,
+and view images. Side agents are always readonly even when the parent is in write
+mode: they never receive `write`, `edit`, or `apply_patch`, and are instructed not to
+change files or state through Bash. Their question, tool calls, answer, and temporary
+command-output storage are not added to the parent transcript.
 
 ## Model tools
 

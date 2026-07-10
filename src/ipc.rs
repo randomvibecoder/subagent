@@ -35,6 +35,11 @@ pub enum Request {
         message: String,
         wall_time_hours: Option<f64>,
     },
+    AgentSide {
+        id: String,
+        message: String,
+        wall_time_hours: Option<f64>,
+    },
     AgentTime {
         id: String,
         hours: f64,

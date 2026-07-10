@@ -59,8 +59,24 @@ $BIN agents send "$ID" --message-file "$ROOT/followup.md" >/dev/null
 wait_status "$ID" finished
 $BIN agents status "$ID" | python3 -c 'import json,sys; assert json.load(sys.stdin)["run_number"] == 2'
 
+printf '%s\n' side-file-content >"$ROOT/project/side.txt"
+python3 -c 'import base64,sys; open(sys.argv[1],"wb").write(base64.b64decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="))' "$ROOT/project/pixel.png"
+SIDE_PARENT=$($BIN agents spawn --dir "$ROOT/project" --mode write --message SIDE_PARENT_MARKER)
+SIDE_PARENT_ID=$(printf '%s\n' "$SIDE_PARENT" | json_field id)
+wait_status "$SIDE_PARENT_ID" finished
+CONTEXT_BEFORE=$(sha256sum "$XDG_STATE_HOME/subagent/agents/$SIDE_PARENT_ID/context.json" | cut -d' ' -f1)
+EVENTS_BEFORE=$(sha256sum "$XDG_STATE_HOME/subagent/agents/$SIDE_PARENT_ID/events.jsonl" | cut -d' ' -f1)
+SIDE=$($BIN agents side "$SIDE_PARENT_ID" --message SIDE_TOOL_QUESTION)
+SIDE_ID=$(printf '%s\n' "$SIDE" | json_field side_id)
+printf '%s\n' "$SIDE" | python3 -c 'import json,sys; row=json.load(sys.stdin); assert row["type"] == "side_answer"; assert row["answer"] == "side inherited context and tools"; assert row["tool_calls"] == 5; assert row["inherited_context_messages"] >= 3; assert row["ephemeral"] is True; assert row["mode"] == "readonly"; assert row["parent_mode"] == "write"'
+[[ ! -e "$XDG_STATE_HOME/subagent/agents/$SIDE_ID" ]]
+$BIN agents btw "$SIDE_PARENT_ID" --message SIDE_CONTEXT_ONLY | python3 -c 'import json,sys; row=json.load(sys.stdin); assert row["answer"] == "context inherited" and row["tool_calls"] == 0'
+[[ "$CONTEXT_BEFORE" == "$(sha256sum "$XDG_STATE_HOME/subagent/agents/$SIDE_PARENT_ID/context.json" | cut -d' ' -f1)" ]]
+[[ "$EVENTS_BEFORE" == "$(sha256sum "$XDG_STATE_HOME/subagent/agents/$SIDE_PARENT_ID/events.jsonl" | cut -d' ' -f1)" ]]
+
 DELAY=$($BIN agents spawn --dir "$ROOT/project" --mode readonly --message DELAY)
 DELAY_ID=$(printf '%s\n' "$DELAY" | json_field id)
+$BIN agents side "$DELAY_ID" --message SIDE_WHILE_WORKING | python3 -c 'import json,sys; row=json.load(sys.stdin); assert row["answer"] == "parent still running" and row["mode"] == "readonly" and row["parent_mode"] == "readonly"'
 $BIN agents time "$DELAY_ID" 1 | python3 -c 'import json,sys; assert json.load(sys.stdin)["deadline_at"] is not None'
 if $BIN agents spawn --dir "$ROOT/project" --message SECOND_AGENT 2>"$ROOT/capacity-error.jsonl"; then
   echo "spawn unexpectedly passed max-agents" >&2
