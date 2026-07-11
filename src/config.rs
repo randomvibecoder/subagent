@@ -2,8 +2,8 @@ use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::{env, fs, path::PathBuf};
 
-pub const DEFAULT_BASE_URL: &str = "https://nano-gpt.com/api/v1";
-pub const DEFAULT_MODEL: &str = "xiaomi/mimo-v2.5:thinking";
+pub const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
+pub const DEFAULT_MODEL: &str = "gpt-5.4-mini";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
