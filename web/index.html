@@ -1,0 +1,358 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Subagent</title>
+    <link rel="stylesheet" href="/assets/app.css" />
+  </head>
+  <body>
+    <header class="app-header">
+      <button id="home-link" class="brand" type="button">subagent</button
+      ><span id="connection" class="connection">connecting</span>
+    </header>
+    <main>
+      <div id="dashboard-page" class="page">
+        <section class="hero">
+          <div>
+            <span class="eyebrow">Background workers</span>
+            <h1>Agent dashboard</h1>
+            <p>Delegate work, follow progress, and return when it is ready.</p>
+          </div>
+          <div class="hero-actions">
+            <button id="refresh" type="button">Refresh agents</button
+            ><button
+              id="open-spawn"
+              class="icon-button"
+              type="button"
+              aria-label="Spawn agent"
+              data-tooltip="Spawn agent"
+            >
+              +
+            </button>
+          </div>
+        </section>
+        <dialog id="spawn-dialog" class="spawn-dialog">
+          <div class="dialog-heading">
+            <div>
+              <span class="eyebrow">New background worker</span>
+              <h2>Spawn agent</h2>
+              <p>Start independent work in a project directory.</p>
+            </div>
+            <button
+              id="close-spawn"
+              class="icon-button"
+              type="button"
+              aria-label="Close"
+            >
+              ×
+            </button>
+          </div>
+          <form id="spawn-form" class="spawn-form">
+            <label
+              ><span>Name</span
+              ><input
+                name="name"
+                minlength="4"
+                maxlength="40"
+                placeholder="Checkout redesign"
+                required
+            /></label>
+            <label class="wide"
+              ><span>Working directory</span
+              ><input name="dir" placeholder="/home/user/project" required
+            /></label>
+            <label
+              ><span>Mode</span
+              ><select name="mode">
+                <option value="write">Write</option>
+                <option value="readonly">Readonly</option>
+              </select></label
+            >
+            <label
+              ><span>Time limit</span
+              ><input
+                name="wall_time_minutes"
+                type="number"
+                min="1"
+                max="6000"
+                placeholder="No limit"
+            /></label>
+            <label class="task"
+              ><span>Task</span
+              ><textarea
+                name="message"
+                placeholder="Describe the outcome, constraints, and checks to run."
+                required
+              ></textarea>
+            </label>
+            <div class="form-footer">
+              <button id="cancel-spawn" type="button">Cancel</button
+              ><button class="primary" type="submit">Spawn agent</button>
+            </div>
+          </form>
+        </dialog>
+        <section class="panel">
+          <div class="section-heading">
+            <div>
+              <h2>Agents</h2>
+              <p id="agent-count">Loading…</p>
+            </div>
+          </div>
+          <div id="agents" class="agent-list"></div>
+        </section>
+      </div>
+
+      <div id="agent-page" class="page agent-page hidden">
+        <section class="agent-heading">
+          <nav class="breadcrumbs">
+            <button id="back-dashboard" class="text-button" type="button">
+              Agents</button
+            ><span>/</span><span id="crumb-name">Agent</span>
+          </nav>
+          <div class="title-line">
+            <h1 id="agent-name"></h1>
+            <span id="agent-status" class="status"></span>
+          </div>
+          <button id="copy-id" class="copy-id" type="button"></button>
+          <div id="agent-meta" class="agent-meta"></div>
+        </section>
+
+        <nav id="agent-tabs" class="agent-tabs" aria-label="Agent sections">
+          <button data-tab="main" type="button">Main</button>
+          <button data-tab="side" type="button">
+            Side <span id="side-working-badge" class="tab-badge hidden">0</span>
+          </button>
+          <button data-tab="controls" type="button">Controls</button>
+        </nav>
+
+        <section id="main-tab" class="tab-page">
+          <div class="chat-shell">
+            <div id="main-scroll" class="timeline-scroll">
+              <div id="main-history-state" class="history-state">
+                Loading recent activity…
+              </div>
+              <div id="timeline" class="timeline"></div>
+            </div>
+            <button
+              id="main-new-events"
+              class="new-events hidden"
+              type="button"
+            >
+              New events
+            </button>
+            <div id="pending-messages" class="pending-strip hidden"></div>
+            <form id="send-form" class="chat-composer">
+              <textarea
+                name="message"
+                rows="2"
+                placeholder="Message this agent"
+                required
+              ></textarea
+              ><button class="primary" type="submit">Send</button>
+            </form>
+          </div>
+        </section>
+
+        <section id="side-tab" class="tab-page hidden">
+          <div class="side-toolbar">
+            <div>
+              <h2>Side runs</h2>
+              <p>
+                Durable one-shot questions that never alter the parent
+                transcript.
+              </p>
+            </div>
+            <button
+              id="open-side"
+              class="icon-button"
+              type="button"
+              aria-label="New Side request"
+              data-tooltip="New Side request"
+            >
+              +
+            </button>
+          </div>
+          <div id="side-list" class="side-index"></div>
+        </section>
+
+        <section id="controls-tab" class="tab-page hidden">
+          <div class="controls-grid">
+            <section class="panel">
+              <div class="section-heading">
+                <div>
+                  <h2>Identity</h2>
+                  <p>Change the tracking name shown in agent lists.</p>
+                </div>
+              </div>
+              <form id="rename-form" class="control-form">
+                <label
+                  ><span>Display name</span
+                  ><input
+                    name="name"
+                    minlength="4"
+                    maxlength="40"
+                    required /></label
+                ><button type="submit">Rename agent</button>
+              </form>
+            </section>
+            <section class="panel">
+              <div class="section-heading">
+                <div>
+                  <h2>Deadline</h2>
+                  <p>Replace the active run deadline from now.</p>
+                </div>
+              </div>
+              <form id="time-form" class="control-form">
+                <label
+                  ><span>Minutes</span
+                  ><input
+                    name="minutes"
+                    type="number"
+                    min="1"
+                    max="6000"
+                    required /></label
+                ><button type="submit">Set deadline</button>
+              </form>
+            </section>
+            <section class="panel danger-zone">
+              <div class="section-heading">
+                <div>
+                  <h2>Lifecycle</h2>
+                  <p>Stop work or permanently remove daemon history.</p>
+                </div>
+              </div>
+              <div class="control-actions">
+                <button id="stop" type="button">Stop agent</button
+                ><button id="delete" class="danger" type="button">
+                  Delete agent
+                </button>
+              </div>
+            </section>
+          </div>
+        </section>
+      </div>
+
+      <div id="side-page" class="page side-page hidden">
+        <section class="agent-heading">
+          <nav class="breadcrumbs">
+            <button id="side-back-agents" class="text-button" type="button">
+              Agents
+            </button>
+            <span>/</span>
+            <button id="side-back-parent" class="text-button" type="button">
+              Parent
+            </button>
+            <span>/</span><span>Side</span>
+          </nav>
+          <div class="title-line">
+            <h1 id="side-page-title"></h1>
+            <span id="side-page-status" class="status"></span>
+          </div>
+          <button id="copy-side-id" class="copy-id" type="button"></button>
+          <div id="side-page-meta" class="agent-meta"></div>
+        </section>
+
+        <nav id="side-tabs" class="agent-tabs" aria-label="Side sections">
+          <button data-tab="main" type="button">Main</button>
+          <button data-tab="controls" type="button">Controls</button>
+        </nav>
+
+        <section id="side-main-tab" class="side-tab-page">
+          <div class="chat-shell side-chat-shell">
+            <div id="side-scroll" class="timeline-scroll">
+              <div id="side-history-state" class="history-state">
+                Loading recent activity…
+              </div>
+              <div id="side-timeline" class="timeline"></div>
+            </div>
+            <button
+              id="side-new-events"
+              class="new-events hidden"
+              type="button"
+            >
+              New events
+            </button>
+            <div class="side-one-shot-composer">
+              <textarea
+                rows="2"
+                disabled
+                placeholder="Side runs are one-shot. Start a new Side for another question."
+              ></textarea>
+              <button id="new-side-from-page" class="primary" type="button">
+                New Side
+              </button>
+            </div>
+          </div>
+        </section>
+
+        <section id="side-controls-tab" class="side-tab-page hidden">
+          <div class="controls-grid">
+            <section class="panel danger-zone">
+              <div class="section-heading">
+                <div>
+                  <h2>Lifecycle</h2>
+                  <p>
+                    Stop this run or permanently remove its saved conversation
+                    and tool outputs.
+                  </p>
+                </div>
+              </div>
+              <div class="control-actions">
+                <button id="stop-side" type="button">Stop Side</button
+                ><button id="delete-side" class="danger" type="button">
+                  Delete Side
+                </button>
+              </div>
+            </section>
+          </div>
+        </section>
+      </div>
+    </main>
+
+    <dialog id="side-dialog" class="spawn-dialog side-dialog">
+      <div class="dialog-heading">
+        <div>
+          <span class="eyebrow">Readonly branch</span>
+          <h2>New Side request</h2>
+          <p>Its complete trace will be saved separately.</p>
+        </div>
+        <button
+          id="close-side"
+          class="icon-button"
+          type="button"
+          aria-label="Close"
+        >
+          ×
+        </button>
+      </div>
+      <form id="side-form" class="side-form">
+        <label
+          ><span>Question</span
+          ><textarea
+            name="message"
+            placeholder="What should the Side agent find out?"
+            required
+          ></textarea></label
+        ><label
+          ><span>Time limit in minutes</span
+          ><input
+            name="wall_time_minutes"
+            type="number"
+            min="1"
+            max="6000"
+            value="2"
+            required
+        /></label>
+        <div class="form-footer">
+          <button id="cancel-side" type="button">Cancel</button
+          ><button class="primary" type="submit">Start Side run</button>
+        </div>
+      </form>
+    </dialog>
+
+    <div id="notice" role="status" aria-live="polite"></div>
+    <script src="/assets/ui-core.js"></script>
+    <script src="/assets/app.js"></script>
+  </body>
+</html>

@@ -53,7 +53,9 @@ impl ToolRuntime {
             .await
         {
             Ok(v) => v,
-            Err(e) => ToolResult::plain(json!({"ok":false,"error":format!("{e:#}")})),
+            Err(e) => {
+                ToolResult::plain(json!({"ok":false,"code":"tool_error","error":format!("{e:#}")}))
+            }
         }
     }
 
@@ -395,6 +397,7 @@ struct TerminalSession {
 }
 
 impl TerminalManager {
+    #[allow(clippy::too_many_arguments)]
     pub async fn exec(
         &self,
         command: String,
@@ -493,11 +496,11 @@ impl TerminalManager {
             .get(id)
             .cloned()
             .with_context(|| format!("terminal not found: {id}"))?;
-        if !input.is_empty() {
-            if let Some(stdin) = session.stdin.lock().await.as_mut() {
-                stdin.write_all(input.as_bytes()).await?;
-                stdin.flush().await?;
-            }
+        if !input.is_empty()
+            && let Some(stdin) = session.stdin.lock().await.as_mut()
+        {
+            stdin.write_all(input.as_bytes()).await?;
+            stdin.flush().await?;
         }
         tokio::time::sleep(Duration::from_millis(yield_ms)).await;
         let mut cursor = session.cursor.lock().unwrap();

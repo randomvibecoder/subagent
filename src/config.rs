@@ -79,6 +79,9 @@ impl Paths {
     pub fn agents_dir(&self) -> PathBuf {
         self.state_dir.join("agents")
     }
+    pub fn sides_dir(&self) -> PathBuf {
+        self.state_dir.join("sides")
+    }
 }
 
 impl FileConfig {
@@ -108,6 +111,7 @@ impl FileConfig {
                 .parse()
                 .context("SUBAGENT_MAX_AGENTS must be a non-negative integer")?;
         }
+        cfg.validate()?;
         Ok(cfg)
     }
 
@@ -130,8 +134,18 @@ impl FileConfig {
 
     pub fn set(&mut self, key: &str, value: &str) -> Result<()> {
         match key {
-            "base-url" => self.base_url = value.to_string(),
-            "model" => self.model = value.to_string(),
+            "base-url" => {
+                if value.trim().is_empty() {
+                    bail!("base-url must not be empty")
+                }
+                self.base_url = value.to_string()
+            }
+            "model" => {
+                if value.trim().is_empty() {
+                    bail!("model must not be empty")
+                }
+                self.model = value.to_string()
+            }
             "max-agents" => {
                 self.max_agents = value
                     .parse()
@@ -140,14 +154,36 @@ impl FileConfig {
             "context-token-budget" => {
                 self.context_token_budget = value
                     .parse()
-                    .context("context-token-budget must be an integer")?
+                    .context("context-token-budget must be a positive integer")?;
+                if self.context_token_budget == 0 {
+                    bail!("context-token-budget must be a positive integer")
+                }
             }
             "tool-output-preview-bytes" => {
                 self.tool_output_preview_bytes = value
                     .parse()
-                    .context("tool-output-preview-bytes must be an integer")?
+                    .context("tool-output-preview-bytes must be a positive integer")?;
+                if self.tool_output_preview_bytes == 0 {
+                    bail!("tool-output-preview-bytes must be a positive integer")
+                }
             }
             _ => bail!("unknown config key: {key}"),
+        }
+        Ok(())
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.base_url.trim().is_empty() {
+            bail!("base-url must not be empty")
+        }
+        if self.model.trim().is_empty() {
+            bail!("model must not be empty")
+        }
+        if self.context_token_budget == 0 {
+            bail!("context-token-budget must be a positive integer")
+        }
+        if self.tool_output_preview_bytes == 0 {
+            bail!("tool-output-preview-bytes must be a positive integer")
         }
         Ok(())
     }
@@ -201,4 +237,19 @@ pub fn write_private_atomic(path: &std::path::Path, body: &[u8]) -> Result<()> {
     file.sync_all()?;
     fs::rename(&tmp, path)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strict_config_rejects_empty_and_zero_values() {
+        let mut config = FileConfig::default();
+        assert!(config.set("base-url", "").is_err());
+        assert!(config.set("model", " ").is_err());
+        assert!(config.set("context-token-budget", "0").is_err());
+        assert!(config.set("tool-output-preview-bytes", "0").is_err());
+        assert!(config.set("max-agents", "0").is_ok());
+    }
 }

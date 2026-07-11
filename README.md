@@ -12,7 +12,7 @@ to parse around.
 - Concurrent work across independent project directories
 - OpenAI-compatible chat-completions API
 - Full coding tools, including Bash and eight background terminals per agent
-- Ephemeral, readonly `side` questions over an agent's existing context
+- Durable, readonly Side runs with saved answers and tool traces
 
 ## Install
 
@@ -80,30 +80,36 @@ Spawn a write-enabled agent:
 subagent agents spawn \
   --dir "$HOME/projects/my-app" \
   --mode write \
-  --title "Fix authentication" \
+  --name "Fix authentication" \
   --message "Find and fix the login regression, then run the relevant tests."
 ```
 
 The response contains the new ID:
 
 ```json
-{"type":"agent","id":"agt_01...","status":"working","title":"Fix authentication"}
+{"type":"agent","id":"agt_01...","status":"working"}
 ```
 
 Use that ID to inspect or continue the work:
 
 ```sh
 subagent agents status agt_01...
-subagent agents logs agt_01... --follow
 subagent agents send agt_01... --message "Also check token refresh behavior."
+subagent agents logs agt_01... --follow
+```
+
+`send` returns immediately after the daemon durably stores the message:
+
+```json
+{"type":"message_sent","message_id":"msg_01...","agent_id":"agt_01...","status":"queued","sent_at":"2026-07-10T12:00:00Z"}
 ```
 
 ## Why a daemon?
 
 The CLI is a thin JSONL client. A manually started, user-owned daemon holds active
-workers and listens on a private Unix socket. Agent metadata, context, events, and
-complete command output are persisted on disk, so finished agents leave memory and
-can be resumed later.
+workers and listens on a private Unix socket. Agent metadata, durable messages,
+context, events, and complete command output are persisted on disk, so finished agents
+leave memory and can be resumed later.
 
 ```text
 calling agent -> subagent CLI -> Unix socket -> daemon -> model + tools
@@ -125,14 +131,17 @@ orderly shutdown.
 | `agents spawn` | Create and immediately start a persistent agent |
 | `agents list` | Filter, sort, and paginate stored agents |
 | `agents status ID` | Read one agent's current metadata |
-| `agents logs ID` | Read or follow lifecycle, model, and tool events |
-| `agents context ID` | Emit bounded model-sized conversation context |
-| `agents send ID` | Queue input for a working agent or resume a finished one |
-| `agents side ID` | Answer a question using inherited context and readonly tools |
+| `agents rename ID NAME` | Change the unique display name shown by `agents list` |
+| `agents logs ID` | Read the last 20 transcript Events by default, or select/follow other types |
+| `agents context ID` | Dump the complete current raw model context as debugging JSONL |
+| `agents send ID` | Durably queue input and immediately return a message receipt |
+| `agents side ID` | Alias that starts a durable readonly Side run |
 | `agents btw ID` | Alias for `agents side` |
-| `agents time ID HOURS` | Reset a working agent's deadline from now |
+| `sides create|list|status|logs|stop|delete` | Manage durable one-shot Side runs |
+| `agents time ID MINUTES` | Reset a working agent's deadline from now |
 | `agents stop ID` | Stop an agent and all of its terminal process groups |
 | `agents delete ID` | Permanently delete a non-working agent history |
+| `messages list|status|cancel` | Inspect or cancel durable Agent messages |
 | `config list|get|set` | Manage non-secret daemon configuration |
 
 Run any command with `--help` for its exact flags and JSON output schema.
@@ -142,14 +151,16 @@ Run any command with `--help` for its exact flags and JSON output schema.
 Inline and file input are mutually exclusive:
 
 ```sh
-subagent agents spawn --dir /path/to/project --message "Build the feature"
-subagent agents spawn --dir /path/to/project --message-file task.md
+subagent agents spawn --name "Feature build" --dir /path/to/project --message "Build the feature"
+subagent agents spawn --name "Repository review" --dir /path/to/project --message-file task.md
 printf '%s\n' "Review this repository" | \
-  subagent agents spawn --dir /path/to/project --message-file -
+  subagent agents spawn --name "Repository review" --dir /path/to/project --message-file -
 ```
 
-Agents start in `readonly` mode unless `--mode write` is supplied. Optional
-`--wall-time HOURS` values must be greater than zero and no more than 100.
+Names are mandatory, case-sensitive, unique across stored agents, and 4–40 Unicode
+characters. IDs remain authoritative for every command. Agents start in `readonly`
+mode unless `--mode write` is supplied. Optional `--wall-time-minutes MINUTES` values
+are integers from 1 through 6000.
 
 ### List filters
 
@@ -167,25 +178,89 @@ subagent agents list \
 
 Agent states are `working`, `finished`, `stopped`, and `failed`.
 
-## Side questions
+Every list item includes the display `name`, `spawned_at`, `last_message_at`, and
+`updated_at`, so list output
+distinguishes creation, latest accepted user instruction, and latest worker activity.
 
-`side` (alias `btw`) answers a focused question without interrupting the parent or
-adding anything to its transcript:
+## Optional Web UI
+
+Start the daemon with a localhost-only dashboard when a human wants to monitor it:
 
 ```sh
-subagent agents side agt_01... \
+subagent daemon start --web-ui-port 7341
+```
+
+The daemon response includes a fresh tokenized `web_ui_url`. Open that exact URL in a
+browser. The embedded dark-only UI binds only `127.0.0.1`, uses `#000000` for the
+background, `#ffffff` for primary text, and light gray for secondary metadata. It
+supports the human-facing equivalents of spawn, rename, list/status, filtered live
+logs, send, message inspection/cancellation, side questions, time, stop, and confirmed
+delete. The dashboard opens each agent on a dedicated routed page. Tool activity is
+rendered as readable collapsed accordions instead of raw JSON; `apply_patch` calls use
+a one-pane Git-style diff with red deletions and green additions. Agent pages have
+Main, Side, and Controls tabs. Main opens at the newest event and loads history while
+scrolling upward, using the full remaining viewport without a conversation card.
+Side is a history index; every Side run opens on its own full-screen page with the
+same Main/Controls layout and saved tool trace. The UI
+intentionally omits config, daemon administration, and raw context.
+
+### Logs and context
+
+Normal logs omit tool payloads and return the newest 20 system, user, and assistant
+Events in chronological JSONL order:
+
+```sh
+subagent agents logs agt_01...
+```
+
+Select exact Event types with repeatable `--type`, or use `--all`:
+
+```sh
+subagent agents logs agt_01... --type tool_call --type tool_result --limit 100
+subagent agents logs agt_01... --all --follow
+```
+
+`agents context` is a raw debugging escape hatch, not normal transcript output. Never
+print it unfiltered into model-visible terminal output; redirect it or use a narrow
+`jq` selector:
+
+```sh
+subagent agents context agt_01... > /tmp/agent-context.jsonl
+```
+
+### Durable messages
+
+Messages are FIFO and survive daemon failure. Poll or cancel them using stable IDs:
+
+```sh
+subagent messages list agt_01... --status pending
+subagent messages status agt_01... msg_01...
+subagent messages cancel agt_01... msg_01...
+```
+
+After restart, interrupted Agents with pending messages resume automatically as
+capacity becomes available.
+
+## Side questions
+
+Side runs answer focused questions without interrupting the parent or adding anything
+to its transcript:
+
+```sh
+subagent sides create agt_01... \
   --message "Which module validates refresh tokens, and why?"
 ```
 
-The side agent receives a valid snapshot of the parent's model context and working
-directory. Its only goal is to answer the question. It may read files, search with
+Creation returns a side_<ULID> immediately. The Side receives a valid snapshot of the
+parent's model context and working directory. It may read files, search with
 `glob` or `grep`, run non-mutating Bash such as `rg`, poll its own terminals, inspect
 stored output, and view images.
 
-Side agents are always readonly, even when the parent is in write mode. They never
+Side runs are always readonly, even when the parent is in write mode. They never
 receive `write`, `edit`, or `apply_patch`. Their question, reasoning, tool calls,
-answer, and temporary command outputs are not persisted. Bash restrictions are
-instruction-based, not a security boundary.
+answer, and command outputs persist until sides delete or parent deletion. At most two
+may work per parent. Bash restrictions remain instruction-based, not a security
+boundary.
 
 ## Model tools
 
@@ -250,6 +325,7 @@ Defaults follow the XDG base-directory convention:
     └── agt_<ULID>/
         ├── metadata.json
         ├── context.json
+        ├── messages.json
         ├── events.jsonl
         └── outputs/
 ```
@@ -277,12 +353,18 @@ cargo check --locked
 cargo test --locked
 ```
 
+The schema contract test requires the Python `jsonschema` package.
+
 The end-to-end suite starts a local mock OpenAI-compatible streaming server:
 
 ```sh
 cargo build --release --locked
 SUBAGENT_BIN="$PWD/target/release/subagent" tests/e2e.sh
 ```
+
+See [`SKILL.md`](SKILL.md) for the agent-facing workflow,
+[`references/protocol.md`](references/protocol.md) for exact behavior, and
+[`references/cli.schema.json`](references/cli.schema.json) for JSONL schemas.
 
 ## License
 

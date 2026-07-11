@@ -1,4 +1,5 @@
-use anyhow::{Context, Result, bail};
+use crate::ipc::coded_error;
+use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -81,11 +82,23 @@ impl OpenAiClient {
             .json(body)
             .send()
             .await
-            .context("OpenAI request failed")?;
+            .map_err(|error| {
+                coded_error(
+                    "api_error",
+                    format!("OpenAI request failed: {error}"),
+                    json!({}),
+                    true,
+                )
+            })?;
         let status = response.status();
         if !status.is_success() {
             let text = response.text().await.unwrap_or_default();
-            bail!("OpenAI API returned {status}: {}", truncate(&text, 2000));
+            return Err(coded_error(
+                "api_error",
+                format!("OpenAI API returned {status}: {}", truncate(&text, 2000)),
+                json!({"http_status":status.as_u16()}),
+                status.is_server_error() || status.as_u16() == 429,
+            ));
         }
 
         let content_type = response
@@ -121,7 +134,7 @@ impl OpenAiClient {
                     continue;
                 }
                 let value: Value = serde_json::from_str(data).context("decode OpenAI SSE event")?;
-                if value.get("usage").is_some_and(|v| !v.is_null()) {
+                if value.get("usage").is_some_and(Value::is_object) {
                     usage = value.get("usage").cloned();
                 }
                 let Some(delta) = value.pointer("/choices/0/delta") else {
@@ -207,7 +220,7 @@ fn parse_non_streaming(v: &Value) -> Result<ModelTurn> {
         content,
         reasoning,
         tool_calls,
-        usage: v.get("usage").cloned(),
+        usage: v.get("usage").filter(|usage| usage.is_object()).cloned(),
     })
 }
 

@@ -73,6 +73,8 @@ class Handler(BaseHTTPRequestHandler):
 
         if latest_user == "DELAY" and not has_tool_result:
             time.sleep(10)
+        if latest_user == "SIDE_DELAY" and not has_tool_result:
+            time.sleep(10)
 
         if "READONLY_PROMPT" in latest_user:
             correct = (
@@ -128,6 +130,8 @@ class Handler(BaseHTTPRequestHandler):
             ]
         elif "SIDE_WHILE_WORKING" in latest_user:
             deltas = [{"content": "parent still running"}]
+        elif "SIDE_DELAY" in latest_user:
+            deltas = [{"content": "side delay complete"}]
         elif "SECRET_ENV" in user_text and not tool_results:
             deltas = fragment_calls(
                 [

@@ -6,6 +6,7 @@ mod ipc;
 mod model;
 mod store;
 mod tools;
+mod web;
 
 use anyhow::Result;
 

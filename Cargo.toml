@@ -7,6 +7,8 @@ description = "Agent-first CLI and daemon for managing background coding agents"
 
 [dependencies]
 anyhow = "1.0"
+async-stream = "0.3"
+axum = "0.8"
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5", features = ["derive"] }
