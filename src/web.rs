@@ -746,8 +746,11 @@ mod tests {
     fn event(event_type: &str, data: serde_json::Value) -> EventRecord {
         EventRecord {
             event_id: "evt_test".into(),
+            local_ref: "e_1".into(),
             agent_id: "agt_test".into(),
+            agent_ref: "a_1".into(),
             side_id: None,
+            side_ref: None,
             sequence: 1,
             timestamp: Utc::now(),
             event_type: event_type.into(),

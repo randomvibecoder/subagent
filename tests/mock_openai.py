@@ -264,6 +264,7 @@ class Handler(BaseHTTPRequestHandler):
 
         self.send_response(200)
         self.send_header("content-type", "text/event-stream")
+        self.send_header("x-request-id", "mock-request-id")
         self.end_headers()
         try:
             for delta in deltas:

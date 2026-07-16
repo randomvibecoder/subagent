@@ -39,7 +39,7 @@ jobs:
             --title "subagent $GITHUB_REF_NAME" --generate-notes
       - name: Verify latest installer
         env:
-          EXPECTED_VERSION: "subagent 0.1.3"
+          EXPECTED_VERSION: "subagent 0.1.4"
         run: |
           install_root=$(mktemp -d)
           for attempt in 1 2 3 4 5; do

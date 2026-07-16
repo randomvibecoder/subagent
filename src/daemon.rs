@@ -1,7 +1,7 @@
 use crate::{
     agent::AgentManager,
     config::{RuntimeConfig, ensure_private_dir},
-    ipc::{Request, coded_error, error_json_for},
+    ipc::{PROTOCOL_VERSION, Request, coded_error, error_json_for},
     store::{AgentStatus, EventRecord, InboxFilter, Store, canonical_filter_dir},
 };
 use anyhow::{Context, Result};
@@ -48,6 +48,8 @@ pub async fn serve(cfg: RuntimeConfig, web_ui_port: Option<u16>) -> Result<()> {
             "recovered {recovered} interrupted agents and {recovered_sides} side runs as stopped"
         );
     }
+    let mut stall_tick = tokio::time::interval(std::time::Duration::from_secs(5));
+    stall_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             accepted=listener.accept()=>{
@@ -55,6 +57,7 @@ pub async fn serve(cfg: RuntimeConfig, web_ui_port: Option<u16>) -> Result<()> {
                 tokio::spawn(async move{if let Err(e)=handle_connection(stream,manager,store,cfg,tx,web_ui_url,web_auth).await{eprintln!("ipc error: {e:#}");}});
             }
             _=shutdown_rx.changed()=>{if *shutdown_rx.borrow(){break}}
+            _=stall_tick.tick()=>{if let Err(error)=manager.check_stalls(){eprintln!("stall watchdog error: {error:#}");}}
         }
     }
     manager.stop_all("daemon_shutdown").await;
@@ -135,9 +138,10 @@ async fn dispatch(
     web_ui_url: &Option<String>,
     web_auth: &Option<String>,
 ) -> Result<Output> {
+    let req = resolve_local_references(req, store)?;
     let lines = match req {
         Request::DaemonStatus => vec![
-            json!({"type":"daemon","status":"running","pid":std::process::id(),"socket":cfg.paths.socket(),"working_agents":manager.working_count(),"max_agents":cfg.file.max_agents,"model":cfg.file.model,"base_url":cfg.file.base_url,"web_ui_url":web_ui_url,"web_auth":web_auth}),
+            json!({"type":"daemon","status":"running","version":env!("CARGO_PKG_VERSION"),"protocol_version":PROTOCOL_VERSION,"pid":std::process::id(),"socket":cfg.paths.socket(),"working_agents":manager.working_count(),"max_agents":cfg.file.max_agents,"model":cfg.file.model,"base_url":cfg.file.base_url,"web_ui_url":web_ui_url,"web_auth":web_auth}),
         ],
         Request::DaemonStop => {
             shutdown.send(true).ok();
@@ -145,6 +149,17 @@ async fn dispatch(
                 json!({"type":"daemon","status":"stopping","working_agents":manager.working_count()}),
             ]
         }
+        Request::ConfigActive => crate::config::CONFIG_KEYS
+            .iter()
+            .map(|key| {
+                Ok(json!({
+                    "type":"active_config_value",
+                    "key":key,
+                    "active_value":cfg.file.get(key)?,
+                    "active_source":cfg.sources.get(*key),
+                }))
+            })
+            .collect::<Result<Vec<_>>>()?,
         Request::AgentSpawn {
             dir,
             message,
@@ -173,13 +188,25 @@ async fn dispatch(
             if let Some(dir) = filter.dir.take() {
                 filter.dir = Some(canonical_filter_dir(&dir)?);
             }
-            manager
-                .list_items(&filter)?
-                .into_iter()
-                .map(serde_json::to_value)
-                .collect::<Result<_, _>>()?
+            let mut values = if filter.verbose {
+                manager.list_verbose_values(&filter)?
+            } else {
+                manager
+                    .list_items(&filter)?
+                    .into_iter()
+                    .map(serde_json::to_value)
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            values.push(json!({"type":"list_summary","resource":"agents","count":values.len()}));
+            values
         }
         Request::AgentStatus { id } => vec![agent_value(store.load_metadata(&id)?)?],
+        Request::AgentWait {
+            id,
+            timeout_seconds,
+        } => vec![agent_value(
+            wait_for_agent(store, &id, timeout_seconds).await?,
+        )?],
         Request::AgentRename { id, name } => vec![manager.rename(&id, name)?],
         Request::AgentLogs {
             id,
@@ -257,11 +284,14 @@ async fn dispatch(
             if limit == 0 {
                 limit = 100;
             }
-            manager
+            let mut values = manager
                 .list_sides(&agent_id, &statuses, limit, offset)?
                 .into_iter()
                 .map(serde_json::to_value)
-                .collect::<Result<_, _>>()?
+                .collect::<Result<Vec<_>, _>>()?;
+            let agent_ref = store.load_metadata(&agent_id)?.local_ref;
+            values.push(json!({"type":"list_summary","resource":"sides","agent_id":agent_id,"agent_ref":agent_ref,"count":values.len()}));
+            values
         }
         Request::SideStatus { id } => vec![serde_json::to_value(store.load_side_metadata(&id)?)?],
         Request::SideLogs {
@@ -294,8 +324,11 @@ async fn dispatch(
             manager.stop_side(&id, "user_request").await?,
         )?],
         Request::SideDelete { id } => {
+            let side = store.load_side_metadata(&id)?;
             store.delete_side(&id)?;
-            vec![json!({"type":"side_deleted","id":id})]
+            vec![
+                json!({"type":"side_deleted","id":id,"ref":side.local_ref,"agent_id":side.agent_id,"agent_ref":side.agent_ref}),
+            ]
         }
         Request::AgentTime { id, minutes } => {
             vec![agent_value(manager.update_time(&id, minutes)?)?]
@@ -304,17 +337,22 @@ async fn dispatch(
             vec![agent_value(manager.stop(&id, "user_request").await?)?]
         }
         Request::AgentDelete { id } => vec![manager.delete_agent(&id).await?],
-        Request::MessageList { agent_id, statuses } => store
-            .read_messages(&agent_id)?
-            .into_iter()
-            .filter(|message| {
-                statuses.is_empty()
-                    || statuses
-                        .iter()
-                        .any(|status| status == message.status.as_str())
-            })
-            .map(serde_json::to_value)
-            .collect::<Result<_, _>>()?,
+        Request::MessageList { agent_id, statuses } => {
+            let mut values = store
+                .read_messages(&agent_id)?
+                .into_iter()
+                .filter(|message| {
+                    statuses.is_empty()
+                        || statuses
+                            .iter()
+                            .any(|status| status == message.status.as_str())
+                })
+                .map(serde_json::to_value)
+                .collect::<Result<Vec<_>, _>>()?;
+            let agent_ref = store.load_metadata(&agent_id)?.local_ref;
+            values.push(json!({"type":"list_summary","resource":"messages","agent_id":agent_id,"agent_ref":agent_ref,"count":values.len()}));
+            values
+        }
         Request::MessageStatus {
             agent_id,
             message_id,
@@ -333,6 +371,181 @@ async fn dispatch(
         }
     };
     Ok(Output::Lines(lines))
+}
+
+fn resolve_local_references(req: Request, store: &Store) -> Result<Request> {
+    Ok(match req {
+        Request::AgentStatus { id } => Request::AgentStatus {
+            id: store.resolve_agent_id(&id)?,
+        },
+        Request::AgentWait {
+            id,
+            timeout_seconds,
+        } => Request::AgentWait {
+            id: store.resolve_agent_id(&id)?,
+            timeout_seconds,
+        },
+        Request::AgentRename { id, name } => Request::AgentRename {
+            id: store.resolve_agent_id(&id)?,
+            name,
+        },
+        Request::AgentContext { id } => Request::AgentContext {
+            id: store.resolve_agent_id(&id)?,
+        },
+        Request::AgentSend {
+            id,
+            message,
+            wall_time_minutes,
+        } => Request::AgentSend {
+            id: store.resolve_agent_id(&id)?,
+            message,
+            wall_time_minutes,
+        },
+        Request::AgentSide {
+            id,
+            message,
+            model,
+            wall_time_minutes,
+        } => Request::AgentSide {
+            id: store.resolve_agent_id(&id)?,
+            message,
+            model,
+            wall_time_minutes,
+        },
+        Request::AgentTime { id, minutes } => Request::AgentTime {
+            id: store.resolve_agent_id(&id)?,
+            minutes,
+        },
+        Request::AgentStop { id } => Request::AgentStop {
+            id: store.resolve_agent_id(&id)?,
+        },
+        Request::AgentDelete { id } => Request::AgentDelete {
+            id: store.resolve_agent_id(&id)?,
+        },
+        Request::AgentLogs {
+            id,
+            types,
+            all,
+            after,
+            limit,
+            follow,
+        } => {
+            let id = store.resolve_agent_id(&id)?;
+            let after = after
+                .map(|cursor| store.resolve_event_id(&id, false, &cursor))
+                .transpose()?;
+            Request::AgentLogs {
+                id,
+                types,
+                all,
+                after,
+                limit,
+                follow,
+            }
+        }
+        Request::SideList {
+            agent_id,
+            statuses,
+            limit,
+            offset,
+        } => Request::SideList {
+            agent_id: store.resolve_agent_id(&agent_id)?,
+            statuses,
+            limit,
+            offset,
+        },
+        Request::SideStatus { id } => Request::SideStatus {
+            id: store.resolve_side_id(&id)?,
+        },
+        Request::SideStop { id } => Request::SideStop {
+            id: store.resolve_side_id(&id)?,
+        },
+        Request::SideDelete { id } => Request::SideDelete {
+            id: store.resolve_side_id(&id)?,
+        },
+        Request::SideLogs {
+            id,
+            types,
+            all,
+            after,
+            limit,
+            follow,
+        } => {
+            let id = store.resolve_side_id(&id)?;
+            let after = after
+                .map(|cursor| store.resolve_event_id(&id, true, &cursor))
+                .transpose()?;
+            Request::SideLogs {
+                id,
+                types,
+                all,
+                after,
+                limit,
+                follow,
+            }
+        }
+        Request::MessageList { agent_id, statuses } => Request::MessageList {
+            agent_id: store.resolve_agent_id(&agent_id)?,
+            statuses,
+        },
+        Request::MessageStatus {
+            agent_id,
+            message_id,
+        } => {
+            let agent_id = store.resolve_agent_id(&agent_id)?;
+            let message_id = store.resolve_message_id(&agent_id, &message_id)?;
+            Request::MessageStatus {
+                agent_id,
+                message_id,
+            }
+        }
+        Request::MessageCancel {
+            agent_id,
+            message_id,
+        } => {
+            let agent_id = store.resolve_agent_id(&agent_id)?;
+            let message_id = store.resolve_message_id(&agent_id, &message_id)?;
+            Request::MessageCancel {
+                agent_id,
+                message_id,
+            }
+        }
+        Request::Inbox {
+            limit,
+            offset,
+            minimum_priority,
+            agent_id,
+        } => Request::Inbox {
+            limit,
+            offset,
+            minimum_priority,
+            agent_id: agent_id.map(|id| store.resolve_agent_id(&id)).transpose()?,
+        },
+        other => other,
+    })
+}
+
+async fn wait_for_agent(
+    store: &Store,
+    id: &str,
+    timeout_seconds: Option<u64>,
+) -> Result<crate::store::AgentMetadata> {
+    let started = tokio::time::Instant::now();
+    loop {
+        let meta = store.load_metadata(id)?;
+        if meta.status != AgentStatus::Working {
+            return Ok(meta);
+        }
+        if timeout_seconds.is_some_and(|seconds| started.elapsed().as_secs() >= seconds) {
+            return Err(coded_error(
+                "timeout",
+                format!("agent wait timed out: {id}"),
+                json!({"agent_id":id,"timeout_seconds":timeout_seconds,"status":"working"}),
+                true,
+            ));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
 }
 
 fn agent_value(meta: crate::store::AgentMetadata) -> Result<Value> {

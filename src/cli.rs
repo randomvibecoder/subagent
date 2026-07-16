@@ -1,7 +1,9 @@
 use crate::{
-    config::{FileConfig, Paths, RuntimeConfig, ensure_private_dir},
+    config::{
+        CONFIG_KEYS, FileConfig, Paths, RuntimeConfig, ensure_private_dir, local_config_values,
+    },
     daemon,
-    ipc::{AgentMode, ListFilter, Request, coded_error, error_json_for},
+    ipc::{AgentMode, ListFilter, PROTOCOL_VERSION, Request, coded_error, error_json_for},
     store::{canonical_dir, canonical_filter_dir},
 };
 use anyhow::{Context, Result, bail};
@@ -81,26 +83,47 @@ enum DaemonCommand {
 #[derive(Subcommand)]
 enum ConfigCommand {
     List,
-    Get { key: String },
-    Set { key: String, value: String },
+    Get {
+        /// Configuration key; run `config set --help` for the complete key contract.
+        key: String,
+    },
+    #[command(
+        after_help = "Keys:\n  base-url STRING (nonempty; OPENAI_BASE_URL overrides)\n  model STRING (nonempty; OPENAI_MODEL overrides)\n  max-agents INTEGER (0 means unlimited; SUBAGENT_MAX_AGENTS overrides)\n  context-token-budget INTEGER (>0)\n  tool-output-preview-bytes INTEGER (>0)\n  stall-notification-seconds INTEGER (0..=86400; 0 disables; SUBAGENT_STALL_NOTIFICATION_SECONDS overrides)\n\nAll changes are persisted atomically. Restart a running daemon when restart_required is true."
+    )]
+    Set {
+        #[arg(value_name = "KEY")]
+        key: String,
+        #[arg(value_name = "VALUE")]
+        value: String,
+    },
 }
 
 #[derive(Subcommand)]
 enum MessagesCommand {
     #[command(about = "List durable messages for an agent.")]
     List {
+        /// Agent a_N ref, agt_<ULID>, or exact name.
+        #[arg(value_name = "AGENT_ID", value_parser = parse_agent_id)]
         agent_id: String,
         #[arg(long = "status", value_parser = ["pending", "delivered", "cancelled"])]
         statuses: Vec<String>,
     },
     #[command(about = "Get one durable message.")]
     Status {
+        /// Agent a_N ref, agt_<ULID>, or exact name.
+        #[arg(value_name = "AGENT_ID", value_parser = parse_agent_id)]
         agent_id: String,
+        /// Message m_N ref or msg_<ULID>.
+        #[arg(value_name = "MESSAGE_ID", value_parser = parse_message_id)]
         message_id: String,
     },
     #[command(about = "Cancel one pending message.")]
     Cancel {
+        /// Agent a_N ref, agt_<ULID>, or exact name.
+        #[arg(value_name = "AGENT_ID", value_parser = parse_agent_id)]
         agent_id: String,
+        /// Message m_N ref or msg_<ULID>.
+        #[arg(value_name = "MESSAGE_ID", value_parser = parse_message_id)]
         message_id: String,
     },
 }
@@ -111,6 +134,8 @@ enum SidesCommand {
     Create(SideArgs),
     #[command(about = "List persisted Side runs for one parent Agent.")]
     List {
+        /// Parent Agent a_N ref, agt_<ULID>, or exact name.
+        #[arg(value_name = "AGENT_ID", value_parser = parse_agent_id)]
         agent_id: String,
         #[arg(long = "status")]
         statuses: Vec<StatusArg>,
@@ -120,13 +145,23 @@ enum SidesCommand {
         offset: usize,
     },
     #[command(about = "Get complete Side metadata.")]
-    Status { id: String },
+    Status {
+        /// Durable Side-run s_N ref or side_<ULID>.
+        #[arg(value_name = "SIDE_ID", value_parser = parse_side_id)]
+        id: String,
+    },
     #[command(about = "Read Side Event JSONL.")]
-    Logs(LogsArgs),
+    Logs(SideLogsArgs),
     #[command(about = "Stop a working Side run.")]
-    Stop { id: String },
+    Stop {
+        #[arg(value_name = "SIDE_ID", value_parser = parse_side_id)]
+        id: String,
+    },
     #[command(about = "Delete a terminal Side history.")]
-    Delete { id: String },
+    Delete {
+        #[arg(value_name = "SIDE_ID", value_parser = parse_side_id)]
+        id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -136,16 +171,27 @@ enum AgentsCommand {
     #[command(about = "List agents, newest first. Each JSONL line is one compact list item.")]
     List(ListArgs),
     #[command(about = "Get one agent metadata object.")]
-    Status { id: String },
+    Status {
+        #[arg(value_name = "AGENT_ID", value_parser = parse_agent_id)]
+        id: String,
+    },
+    #[command(about = "Wait until one Agent reaches a terminal state and emit its final metadata.")]
+    Wait {
+        #[arg(value_name = "AGENT_ID", value_parser = parse_agent_id)]
+        id: String,
+        /// Optional bounded wait; timeout is a retryable daemon error.
+        #[arg(long, value_name = "SECONDS", value_parser = parse_wait_timeout)]
+        timeout_seconds: Option<u64>,
+    },
     #[command(about = "Rename an agent tracking label.")]
     Rename {
-        /// Stable Agent ID.
+        /// Agent a_N ref, agt_<ULID>, or exact name.
         id: String,
         /// New unique display name (4 through 40 characters).
         name: String,
     },
     #[command(about = "Read transcript Event JSONL. Default: last 20 message events.")]
-    Logs(LogsArgs),
+    Logs(AgentLogsArgs),
     #[command(about = "Dump the complete current raw model context as JSONL for debugging.")]
     Context(ContextArgs),
     #[command(about = "Send input at the next safe boundary, or resume a non-working agent.")]
@@ -157,14 +203,21 @@ enum AgentsCommand {
     Side(SideArgs),
     #[command(about = "Set a working agent deadline to MINUTES from now (1..=6000).")]
     Time {
+        #[arg(value_name = "AGENT_ID", value_parser = parse_agent_id)]
         id: String,
         #[arg(value_parser = parse_minutes)]
         minutes: u64,
     },
     #[command(about = "Stop a working agent and all its terminal process groups.")]
-    Stop { id: String },
+    Stop {
+        #[arg(value_name = "AGENT_ID", value_parser = parse_agent_id)]
+        id: String,
+    },
     #[command(about = "Permanently delete a non-working agent history.")]
-    Delete { id: String },
+    Delete {
+        #[arg(value_name = "AGENT_ID", value_parser = parse_agent_id)]
+        id: String,
+    },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -234,7 +287,7 @@ struct SpawnArgs {
 
 #[derive(Args)]
 #[command(
-    after_help = "Each JSONL line is {type,id,name,status,dir,mode,spawned_at,last_message_at,updated_at,run_number,working_sides}. No line is emitted when no agents match."
+    after_help = "Compact items are {type,id,ref,name,status,dir,mode,model,spawned_at,last_message_at,updated_at,current_phase,last_event_at,run_number,working_sides}. --verbose emits full telemetry. A final list_summary is always emitted."
 )]
 struct ListArgs {
     /// Filter by status; repeat for working, finished, stopped, or failed.
@@ -267,14 +320,18 @@ struct ListArgs {
     /// Number of matching objects to skip.
     #[arg(long, default_value_t = 0)]
     offset: usize,
+    /// Emit complete lifecycle, deadline, error, and activity diagnostics.
+    #[arg(long)]
+    verbose: bool,
 }
 
 #[derive(Args)]
 #[command(
-    after_help = "Event JSONL schema: {event_id,agent_id,sequence,timestamp,type,data}. Types: system_message,user_message,assistant_message,reasoning,tool_call,tool_result,lifecycle,error."
+    after_help = "Event JSONL schema: {event_id,ref,agent_id,agent_ref,sequence,timestamp,type,data}. Types: system_message,user_message,assistant_message,reasoning,tool_call,tool_result,lifecycle,error."
 )]
-struct LogsArgs {
-    /// Agent ID.
+struct AgentLogsArgs {
+    /// Agent a_N ref, agt_<ULID>, or exact name.
+    #[arg(value_name = "AGENT_ID", value_parser = parse_agent_id)]
     id: String,
     /// Exact Event type to include; repeatable. Empty selects system/user/assistant messages.
     #[arg(long = "type", value_name = "EVENT_TYPE", value_parser = ["system_message", "user_message", "assistant_message", "reasoning", "tool_call", "tool_result", "lifecycle", "error"])]
@@ -282,8 +339,33 @@ struct LogsArgs {
     /// Include every Event type. Conflicts with --type.
     #[arg(long, conflicts_with = "types")]
     all: bool,
-    /// Emit only events after this event ID.
+    /// Emit only events after this e_N ref or evt_<ULID>.
+    #[arg(long, value_name = "EVENT_ID", value_parser = parse_event_id)]
+    after: Option<String>,
+    /// Maximum matching historical Events; select newest N and emit chronologically.
+    #[arg(long, default_value_t = 20, value_parser = parse_log_limit)]
+    limit: usize,
+    /// Keep the connection open and stream newly appended events.
     #[arg(long)]
+    follow: bool,
+}
+
+#[derive(Args)]
+#[command(
+    after_help = "Event JSONL schema: {event_id,ref,agent_id,agent_ref,side_id,side_ref,sequence,timestamp,type,data}. Types: user_message,assistant_message,reasoning,tool_call,tool_result,lifecycle,error."
+)]
+struct SideLogsArgs {
+    /// Durable Side-run s_N ref or side_<ULID>.
+    #[arg(value_name = "SIDE_ID", value_parser = parse_side_id)]
+    id: String,
+    /// Exact Event type to include; repeatable. Empty selects user/assistant messages.
+    #[arg(long = "type", value_name = "EVENT_TYPE", value_parser = ["system_message", "user_message", "assistant_message", "reasoning", "tool_call", "tool_result", "lifecycle", "error"])]
+    types: Vec<String>,
+    /// Include every Event type. Conflicts with --type.
+    #[arg(long, conflicts_with = "types")]
+    all: bool,
+    /// Emit only events after this e_N ref or evt_<ULID>.
+    #[arg(long, value_name = "EVENT_ID", value_parser = parse_event_id)]
     after: Option<String>,
     /// Maximum matching historical Events; select newest N and emit chronologically.
     #[arg(long, default_value_t = 20, value_parser = parse_log_limit)]
@@ -297,7 +379,8 @@ struct LogsArgs {
     after_help = "First line is context_meta; remaining lines are raw model message objects. Redirect to a file or filter narrowly with jq."
 )]
 struct ContextArgs {
-    /// Agent ID.
+    /// Agent a_N ref, agt_<ULID>, or exact name.
+    #[arg(value_name = "AGENT_ID", value_parser = parse_agent_id)]
     id: String,
 }
 
@@ -307,7 +390,8 @@ struct ContextArgs {
     after_help="Durably store the message and return one message_sent receipt immediately. Delivery continues in the daemon."
 )]
 struct SendArgs {
-    /// Agent ID.
+    /// Agent a_N ref, agt_<ULID>, or exact name.
+    #[arg(value_name = "AGENT_ID", value_parser = parse_agent_id)]
     id: String,
     /// Inline user message. Conflicts with --message-file.
     #[arg(long)]
@@ -327,6 +411,7 @@ struct SendArgs {
 )]
 struct SideArgs {
     /// Parent agent ID.
+    #[arg(value_name = "AGENT_ID", value_parser = parse_agent_id)]
     id: String,
     /// Inline side question. Conflicts with --message-file.
     #[arg(long)]
@@ -391,9 +476,9 @@ async fn run_inner() -> Result<()> {
             daemon::serve(RuntimeConfig::load()?, web_ui_port).await
         }
         TopCommand::Daemon(DaemonCommand::Start { web_ui_port }) => start_daemon(web_ui_port).await,
-        TopCommand::Daemon(DaemonCommand::Status) => request(Request::DaemonStatus).await,
-        TopCommand::Daemon(DaemonCommand::Stop) => request(Request::DaemonStop).await,
-        TopCommand::Config(command) => config_command(command),
+        TopCommand::Daemon(DaemonCommand::Status) => request_unchecked(Request::DaemonStatus).await,
+        TopCommand::Daemon(DaemonCommand::Stop) => request_unchecked(Request::DaemonStop).await,
+        TopCommand::Config(command) => config_command(command).await,
         TopCommand::Inbox(args) => {
             request(Request::Inbox {
                 limit: args.limit,
@@ -487,9 +572,17 @@ async fn run_inner() -> Result<()> {
                         order: a.order,
                         limit: a.limit,
                         offset: a.offset,
+                        verbose: a.verbose,
                     },
                 },
                 AgentsCommand::Status { id } => Request::AgentStatus { id },
+                AgentsCommand::Wait {
+                    id,
+                    timeout_seconds,
+                } => Request::AgentWait {
+                    id,
+                    timeout_seconds,
+                },
                 AgentsCommand::Rename { id, name } => Request::AgentRename { id, name },
                 AgentsCommand::Logs(a) => Request::AgentLogs {
                     id: a.id,
@@ -520,42 +613,57 @@ async fn run_inner() -> Result<()> {
     }
 }
 
-fn config_command(command: ConfigCommand) -> Result<()> {
+async fn config_command(command: ConfigCommand) -> Result<()> {
     let paths = Paths::discover()?;
-    let mut cfg = if matches!(&command, ConfigCommand::Set { .. }) {
-        FileConfig::load_persisted(&paths)?
-    } else {
-        FileConfig::load(&paths)?
+    let requested_key = match &command {
+        ConfigCommand::Get { key } | ConfigCommand::Set { key, .. } => Some(key.clone()),
+        ConfigCommand::List => None,
     };
-    match command {
-        ConfigCommand::List => println!(
-            "{}",
-            serde_json::to_string(
-                &json!({"type":"config","base-url":cfg.base_url,"model":cfg.model,"max-agents":cfg.max_agents,"context-token-budget":cfg.context_token_budget,"tool-output-preview-bytes":cfg.tool_output_preview_bytes})
-            )?
-        ),
-        ConfigCommand::Get { key } => println!(
-            "{}",
-            serde_json::to_string(
-                &json!({"type":"config_value","key":key,"value":cfg.get(&key)?})
-            )?
-        ),
-        ConfigCommand::Set { key, value } => {
-            cfg.set(&key, &value).map_err(|error| {
-                coded_error(
-                    "invalid_argument",
-                    format!("{error:#}"),
-                    json!({"key":key}),
-                    false,
-                )
-            })?;
-            cfg.save(&paths)?;
-            println!(
-                "{}",
-                serde_json::to_string(
-                    &json!({"type":"config_value","key":key,"value":cfg.get(&key)?,"note":"restart daemon for this value to take effect"})
-                )?
-            );
+    if let Some(key) = &requested_key
+        && !CONFIG_KEYS.contains(&key.as_str())
+    {
+        return Err(coded_error(
+            "invalid_argument",
+            format!("unknown config key: {key}"),
+            json!({"key":key,"valid_keys":CONFIG_KEYS}),
+            false,
+        ));
+    }
+    if let ConfigCommand::Set { key, value } = command {
+        let mut cfg = FileConfig::load_persisted(&paths)?;
+        cfg.set(&key, &value).map_err(|error| {
+            coded_error(
+                "invalid_argument",
+                format!("{error:#}"),
+                json!({"key":key}),
+                false,
+            )
+        })?;
+        cfg.save(&paths)?;
+    }
+
+    let mut values = local_config_values(&paths)?;
+    if let Ok(active) = exchange(Request::ConfigActive).await {
+        for value in &mut values {
+            let key = value.get("key").and_then(Value::as_str);
+            if let Some(active) = active
+                .iter()
+                .find(|item| item.get("key").and_then(Value::as_str) == key)
+            {
+                value["active_value"] = active.get("active_value").cloned().unwrap_or(Value::Null);
+                value["active_source"] =
+                    active.get("active_source").cloned().unwrap_or(Value::Null);
+                value["restart_required"] =
+                    Value::Bool(value["local_effective_value"] != value["active_value"]);
+            }
+        }
+    }
+    for value in values {
+        if requested_key
+            .as_deref()
+            .is_none_or(|key| value.get("key").and_then(Value::as_str) == Some(key))
+        {
+            println!("{}", serde_json::to_string(&value)?);
         }
     }
     Ok(())
@@ -603,7 +711,7 @@ async fn start_daemon(web_ui_port: Option<u16>) -> Result<()> {
     let child = cmd.spawn().context("start daemon")?;
     for _ in 0..100 {
         if UnixStream::connect(&socket).await.is_ok() {
-            return request(Request::DaemonStatus).await;
+            return request_unchecked(Request::DaemonStatus).await;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
@@ -632,6 +740,54 @@ fn rotate_daemon_log(paths: &Paths) -> Result<()> {
 }
 
 async fn request(req: Request) -> Result<()> {
+    ensure_protocol_compatible().await?;
+    request_unchecked(req).await
+}
+
+async fn ensure_protocol_compatible() -> Result<()> {
+    let values = exchange(Request::DaemonStatus).await?;
+    let daemon = values.first().context("daemon status returned no object")?;
+    let actual = daemon.get("protocol_version").and_then(Value::as_u64);
+    if actual != Some(u64::from(PROTOCOL_VERSION)) {
+        return Err(coded_error(
+            "protocol_mismatch",
+            "the CLI and running daemon are incompatible; restart the daemon with 'subagent daemon stop' followed by 'subagent daemon start'",
+            json!({"cli_version":env!("CARGO_PKG_VERSION"),"cli_protocol_version":PROTOCOL_VERSION,"daemon_version":daemon.get("version"),"daemon_protocol_version":actual}),
+            false,
+        ));
+    }
+    Ok(())
+}
+
+async fn request_unchecked(req: Request) -> Result<()> {
+    let mut lines = send_request(req).await?;
+    let mut failed = false;
+    while let Some(line) = lines.next_line().await? {
+        let value: Value = serde_json::from_str(&line)?;
+        let line = serde_json::to_string(&value)?;
+        if value.get("type").and_then(Value::as_str) == Some("error") {
+            eprintln!("{line}");
+            failed = true;
+        } else {
+            println!("{line}");
+        }
+    }
+    if failed {
+        std::process::exit(4)
+    }
+    Ok(())
+}
+
+async fn exchange(req: Request) -> Result<Vec<Value>> {
+    let mut lines = send_request(req).await?;
+    let mut values = Vec::new();
+    while let Some(line) = lines.next_line().await? {
+        values.push(serde_json::from_str(&line)?);
+    }
+    Ok(values)
+}
+
+async fn send_request(req: Request) -> Result<tokio::io::Lines<BufReader<UnixStream>>> {
     let paths = Paths::discover()?;
     let mut stream = UnixStream::connect(paths.socket()).await.map_err(|_| {
         coded_error(
@@ -645,21 +801,7 @@ async fn request(req: Request) -> Result<()> {
     body.push(b'\n');
     stream.write_all(&body).await?;
     stream.shutdown().await?;
-    let mut lines = BufReader::new(stream).lines();
-    let mut failed = false;
-    while let Some(line) = lines.next_line().await? {
-        let value: Value = serde_json::from_str(&line)?;
-        if value.get("type").and_then(Value::as_str) == Some("error") {
-            eprintln!("{line}");
-            failed = true
-        } else {
-            println!("{line}")
-        }
-    }
-    if failed {
-        std::process::exit(4)
-    }
-    Ok(())
+    Ok(BufReader::new(stream).lines())
 }
 
 async fn read_message(inline: Option<String>, file: Option<String>) -> Result<String> {
@@ -719,6 +861,77 @@ fn parse_minutes(value: &str) -> std::result::Result<u64, String> {
         return Err("minutes must be an integer from 1 through 6000".into());
     }
     Ok(minutes)
+}
+
+fn parse_wait_timeout(value: &str) -> std::result::Result<u64, String> {
+    let seconds = value
+        .parse::<u64>()
+        .map_err(|_| "timeout must be an integer from 1 through 86400".to_string())?;
+    if !(1..=86_400).contains(&seconds) {
+        return Err("timeout must be an integer from 1 through 86400".into());
+    }
+    Ok(seconds)
+}
+
+fn parse_typed_id(value: &str, prefix: &str, label: &str) -> std::result::Result<String, String> {
+    let Some(suffix) = value.strip_prefix(prefix) else {
+        let received = value.split_once('_').map_or(value, |(head, _)| head);
+        return Err(format!(
+            "expected {label} beginning with {prefix}, but received {received}_..."
+        ));
+    };
+    if suffix.parse::<ulid::Ulid>().is_err() {
+        return Err(format!(
+            "expected {label} as {prefix}<26-character ULID>, but received {value}"
+        ));
+    }
+    Ok(value.to_string())
+}
+
+fn parse_agent_id(value: &str) -> std::result::Result<String, String> {
+    if value.starts_with("agt_") {
+        parse_typed_id(value, "agt_", "AGENT_ID")
+    } else if valid_local_ref(value, "a_")
+        || (!value.trim().is_empty()
+            && !["a_", "s_", "m_", "e_", "side_", "msg_", "evt_"]
+                .iter()
+                .any(|prefix| value.starts_with(prefix)))
+    {
+        Ok(value.to_string())
+    } else {
+        Err(format!(
+            "expected AGENT_ID, a local a_<number> reference, or an exact agent name; received {value}"
+        ))
+    }
+}
+fn parse_side_id(value: &str) -> std::result::Result<String, String> {
+    if valid_local_ref(value, "s_") {
+        Ok(value.to_string())
+    } else {
+        parse_typed_id(value, "side_", "SIDE_ID")
+    }
+}
+fn parse_message_id(value: &str) -> std::result::Result<String, String> {
+    if valid_local_ref(value, "m_") {
+        Ok(value.to_string())
+    } else {
+        parse_typed_id(value, "msg_", "MESSAGE_ID")
+    }
+}
+fn parse_event_id(value: &str) -> std::result::Result<String, String> {
+    if valid_local_ref(value, "e_") {
+        Ok(value.to_string())
+    } else {
+        parse_typed_id(value, "evt_", "EVENT_ID")
+    }
+}
+
+fn valid_local_ref(value: &str, prefix: &str) -> bool {
+    value.strip_prefix(prefix).is_some_and(|suffix| {
+        !suffix.is_empty()
+            && suffix.bytes().all(|byte| byte.is_ascii_digit())
+            && suffix.parse::<u64>().is_ok_and(|number| number > 0)
+    })
 }
 
 fn parse_port(value: &str) -> std::result::Result<u16, String> {

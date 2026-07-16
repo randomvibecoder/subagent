@@ -35,11 +35,79 @@ impl AgentStatus {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentPhase {
+    #[default]
+    Starting,
+    ProcessingMessages,
+    RequestingModel,
+    RetryingModel,
+    ExecutingTool,
+    WaitingTerminal,
+    Finished,
+    Stopped,
+    Failed,
+}
+
+impl AgentPhase {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Starting => "starting",
+            Self::ProcessingMessages => "processing_messages",
+            Self::RequestingModel => "requesting_model",
+            Self::RetryingModel => "retrying_model",
+            Self::ExecutingTool => "executing_tool",
+            Self::WaitingTerminal => "waiting_terminal",
+            Self::Finished => "finished",
+            Self::Stopped => "stopped",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ActivityTelemetry {
+    #[serde(default)]
+    pub current_phase: AgentPhase,
+    #[serde(default)]
+    pub phase_started_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub request_started_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub last_provider_activity_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub provider_request_id: Option<String>,
+    #[serde(default)]
+    pub retry_count: u32,
+    #[serde(default)]
+    pub last_event_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub last_model_event_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub last_tool_event_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub last_state_change_at: Option<DateTime<Utc>>,
+}
+
+impl ActivityTelemetry {
+    pub fn new(now: DateTime<Utc>) -> Self {
+        Self {
+            current_phase: AgentPhase::Starting,
+            phase_started_at: Some(now),
+            last_state_change_at: Some(now),
+            ..Self::default()
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentMetadata {
     #[serde(rename = "type")]
     pub kind: String,
     pub id: String,
+    #[serde(rename = "ref", default)]
+    pub local_ref: String,
     pub name: String,
     pub dir: String,
     pub mode: AgentMode,
@@ -48,6 +116,10 @@ pub struct AgentMetadata {
     pub status: AgentStatus,
     pub spawned_at: DateTime<Utc>,
     pub last_message_at: DateTime<Utc>,
+    #[serde(default)]
+    pub last_message_sent_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub last_message_delivered_at: Option<DateTime<Utc>>,
     pub run_started_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub finished_at: Option<DateTime<Utc>>,
@@ -57,6 +129,8 @@ pub struct AgentMetadata {
     pub run_number: u64,
     pub stop_reason: Option<String>,
     pub last_error: Option<String>,
+    #[serde(flatten)]
+    pub activity: ActivityTelemetry,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -64,13 +138,18 @@ pub struct AgentListItem {
     #[serde(rename = "type")]
     pub kind: &'static str,
     pub id: String,
+    #[serde(rename = "ref")]
+    pub local_ref: String,
     pub name: String,
     pub status: AgentStatus,
     pub dir: String,
     pub mode: AgentMode,
+    pub model: String,
     pub spawned_at: DateTime<Utc>,
     pub last_message_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    pub current_phase: AgentPhase,
+    pub last_event_at: Option<DateTime<Utc>>,
     pub run_number: u64,
     pub working_sides: usize,
 }
@@ -80,13 +159,17 @@ impl AgentListItem {
         Self {
             kind: "agent_list_item",
             id: meta.id,
+            local_ref: meta.local_ref,
             name: meta.name,
             status: meta.status,
             dir: meta.dir,
             mode: meta.mode,
+            model: meta.model,
             spawned_at: meta.spawned_at,
             last_message_at: meta.last_message_at,
             updated_at: meta.updated_at,
+            current_phase: meta.activity.current_phase,
+            last_event_at: meta.activity.last_event_at,
             run_number: meta.run_number,
             working_sides,
         }
@@ -98,7 +181,11 @@ pub struct SideMetadata {
     #[serde(rename = "type")]
     pub kind: String,
     pub id: String,
+    #[serde(rename = "ref", default)]
+    pub local_ref: String,
     pub agent_id: String,
+    #[serde(default)]
+    pub agent_ref: String,
     pub status: AgentStatus,
     pub question: String,
     pub answer: Option<String>,
@@ -116,6 +203,8 @@ pub struct SideMetadata {
     pub tool_calls: usize,
     pub stop_reason: Option<String>,
     pub last_error: Option<String>,
+    #[serde(flatten)]
+    pub activity: ActivityTelemetry,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -123,7 +212,10 @@ pub struct SideListItem {
     #[serde(rename = "type")]
     pub kind: &'static str,
     pub id: String,
+    #[serde(rename = "ref")]
+    pub local_ref: String,
     pub agent_id: String,
+    pub agent_ref: String,
     pub status: AgentStatus,
     pub question_preview: String,
     pub created_at: DateTime<Utc>,
@@ -136,7 +228,9 @@ impl From<SideMetadata> for SideListItem {
         Self {
             kind: "side_list_item",
             id: meta.id,
+            local_ref: meta.local_ref,
             agent_id: meta.agent_id,
+            agent_ref: meta.agent_ref,
             status: meta.status,
             question_preview: meta.question.chars().take(200).collect(),
             created_at: meta.created_at,
@@ -146,7 +240,7 @@ impl From<SideMetadata> for SideListItem {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum MessageStatus {
     Pending,
@@ -169,7 +263,11 @@ pub struct MessageRecord {
     #[serde(rename = "type")]
     pub kind: String,
     pub id: String,
+    #[serde(rename = "ref", default)]
+    pub local_ref: String,
     pub agent_id: String,
+    #[serde(default)]
+    pub agent_ref: String,
     pub content: String,
     pub status: MessageStatus,
     pub sent_at: DateTime<Utc>,
@@ -180,9 +278,15 @@ pub struct MessageRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventRecord {
     pub event_id: String,
+    #[serde(rename = "ref", default)]
+    pub local_ref: String,
     pub agent_id: String,
+    #[serde(default)]
+    pub agent_ref: String,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub side_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub side_ref: Option<String>,
     pub sequence: u64,
     pub timestamp: DateTime<Utc>,
     #[serde(rename = "type")]
@@ -197,13 +301,26 @@ pub struct NotificationRecord {
     pub id: String,
     pub sequence: u64,
     pub agent_id: String,
+    #[serde(default)]
+    pub agent_ref: String,
     pub agent_name: String,
     pub side_id: Option<String>,
+    #[serde(default)]
+    pub side_ref: Option<String>,
     pub timestamp: DateTime<Utc>,
     pub event_type: String,
     pub priority: u8,
     pub status: AgentStatus,
     pub summary: String,
+}
+
+fn apply_event_activity(activity: &mut ActivityTelemetry, event_type: &str, at: DateTime<Utc>) {
+    activity.last_event_at = Some(at);
+    match event_type {
+        "reasoning" | "assistant_message" | "tool_call" => activity.last_model_event_at = Some(at),
+        "tool_result" => activity.last_tool_event_at = Some(at),
+        _ => {}
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -235,12 +352,210 @@ impl Store {
         ensure_private_dir(&paths.state_dir)?;
         ensure_private_dir(&paths.agents_dir())?;
         ensure_private_dir(&paths.sides_dir())?;
-        Ok(Self {
+        let store = Self {
             state_root: paths.state_dir.clone(),
             agents_root: paths.agents_dir(),
             sides_root: paths.sides_dir(),
             write_lock: Arc::new(Mutex::new(())),
-        })
+        };
+        store.migrate_activity_metadata()?;
+        store.migrate_local_references()?;
+        Ok(store)
+    }
+
+    fn ref_sequence_path(&self, kind: &str) -> PathBuf {
+        self.state_root.join(format!("{kind}-ref-sequence"))
+    }
+
+    fn next_local_ref_locked(&self, kind: &str, prefix: &str) -> Result<String> {
+        let path = self.ref_sequence_path(kind);
+        let current = if path.exists() {
+            fs::read_to_string(&path)?.trim().parse::<u64>()?
+        } else {
+            0
+        };
+        let next = current
+            .checked_add(1)
+            .context("local reference sequence exhausted")?;
+        write_private_atomic(&path, next.to_string().as_bytes())?;
+        Ok(format!("{prefix}_{next}"))
+    }
+
+    pub fn allocate_agent_ref(&self) -> Result<String> {
+        let _guard = self.write_lock.lock().unwrap();
+        self.next_local_ref_locked("agent", "a")
+    }
+
+    pub fn allocate_side_ref(&self) -> Result<String> {
+        let _guard = self.write_lock.lock().unwrap();
+        self.next_local_ref_locked("side", "s")
+    }
+
+    fn migrate_local_references(&self) -> Result<()> {
+        let _guard = self.write_lock.lock().unwrap();
+        let mut agents = fs::read_dir(&self.agents_root)?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path().join("metadata.json"))
+            .filter(|path| path.exists())
+            .collect::<Vec<_>>();
+        agents.sort();
+        for path in agents {
+            let mut meta: AgentMetadata = serde_json::from_slice(&fs::read(&path)?)?;
+            if meta.local_ref.is_empty() {
+                meta.local_ref = self.next_local_ref_locked("agent", "a")?;
+                self.save_metadata(&meta)?;
+            }
+            let mut messages = self.read_messages(&meta.id)?;
+            let mut changed = false;
+            for message in &mut messages {
+                if message.local_ref.is_empty() {
+                    message.local_ref = self.next_local_ref_locked("message", "m")?;
+                    changed = true;
+                }
+                if message.agent_ref.is_empty() {
+                    message.agent_ref = meta.local_ref.clone();
+                    changed = true;
+                }
+            }
+            if changed {
+                self.save_messages(&meta.id, &messages)?;
+            }
+            self.migrate_event_file(&self.events_path(&meta.id), &meta.local_ref, None)?;
+        }
+        let mut sides = fs::read_dir(&self.sides_root)?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path().join("metadata.json"))
+            .filter(|path| path.exists())
+            .collect::<Vec<_>>();
+        sides.sort();
+        for path in sides {
+            let mut meta: SideMetadata = serde_json::from_slice(&fs::read(&path)?)?;
+            let agent = self.load_metadata(&meta.agent_id)?;
+            let mut changed = false;
+            if meta.local_ref.is_empty() {
+                meta.local_ref = self.next_local_ref_locked("side", "s")?;
+                changed = true;
+            }
+            if meta.agent_ref.is_empty() {
+                meta.agent_ref = agent.local_ref.clone();
+                changed = true;
+            }
+            if changed {
+                self.save_side_metadata(&meta)?;
+            }
+            self.migrate_event_file(
+                &self.side_dir(&meta.id).join("events.jsonl"),
+                &meta.agent_ref,
+                Some(&meta.local_ref),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn migrate_event_file(
+        &self,
+        path: &Path,
+        agent_ref: &str,
+        side_ref: Option<&str>,
+    ) -> Result<()> {
+        if !path.exists() {
+            return Ok(());
+        }
+        let mut events = Vec::new();
+        let mut changed = false;
+        for line in BufReader::new(fs::File::open(path)?).lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let mut event: EventRecord = serde_json::from_str(&line)?;
+            if event.local_ref.is_empty() {
+                event.local_ref = self.next_local_ref_locked("event", "e")?;
+                changed = true;
+            }
+            if event.agent_ref.is_empty() {
+                event.agent_ref = agent_ref.to_string();
+                changed = true;
+            }
+            if event.side_ref.is_none() && side_ref.is_some() {
+                event.side_ref = side_ref.map(str::to_string);
+                changed = true;
+            }
+            events.push(event);
+        }
+        if changed {
+            let mut body = Vec::new();
+            for event in events {
+                serde_json::to_writer(&mut body, &event)?;
+                body.push(b'\n');
+            }
+            write_private_atomic(path, &body)?;
+        }
+        Ok(())
+    }
+
+    fn migrate_activity_metadata(&self) -> Result<()> {
+        for entry in fs::read_dir(&self.agents_root)? {
+            let path = entry?.path().join("metadata.json");
+            if !path.exists() {
+                continue;
+            }
+            let mut meta: AgentMetadata = serde_json::from_slice(&fs::read(&path)?)?;
+            let needs_migration = meta.last_message_sent_at.is_none()
+                || meta.last_message_delivered_at.is_none()
+                || meta.activity.phase_started_at.is_none()
+                || meta.activity.last_event_at.is_none();
+            if !needs_migration {
+                continue;
+            }
+            meta.last_message_sent_at
+                .get_or_insert(meta.last_message_at);
+            let messages = fs::read(self.messages_path(&meta.id))
+                .ok()
+                .and_then(|body| serde_json::from_slice::<Vec<MessageRecord>>(&body).ok())
+                .unwrap_or_default();
+            meta.last_message_delivered_at = Some(
+                messages
+                    .iter()
+                    .filter_map(|message| message.delivered_at)
+                    .max()
+                    .unwrap_or(meta.spawned_at),
+            );
+            migrate_event_activity(&self.events_path(&meta.id), &mut meta.activity)?;
+            migrate_terminal_activity(
+                &meta.status,
+                meta.spawned_at,
+                meta.finished_at,
+                meta.stopped_at,
+                meta.failed_at,
+                &mut meta.activity,
+            );
+            self.save_metadata(&meta)?;
+        }
+        for entry in fs::read_dir(&self.sides_root)? {
+            let path = entry?.path().join("metadata.json");
+            if !path.exists() {
+                continue;
+            }
+            let mut meta: SideMetadata = serde_json::from_slice(&fs::read(&path)?)?;
+            if meta.activity.phase_started_at.is_some() && meta.activity.last_event_at.is_some() {
+                continue;
+            }
+            migrate_event_activity(
+                &self.side_dir(&meta.id).join("events.jsonl"),
+                &mut meta.activity,
+            )?;
+            migrate_terminal_activity(
+                &meta.status,
+                meta.created_at,
+                meta.finished_at,
+                meta.stopped_at,
+                meta.failed_at,
+                &mut meta.activity,
+            );
+            self.save_side_metadata(&meta)?;
+        }
+        Ok(())
     }
 
     pub fn agent_dir(&self, id: &str) -> PathBuf {
@@ -312,6 +627,100 @@ impl Store {
         serde_json::from_slice(&body).with_context(|| format!("parse {}", path.display()))
     }
 
+    pub fn resolve_agent_id(&self, identifier: &str) -> Result<String> {
+        if identifier.starts_with("agt_") && self.metadata_path(identifier).exists() {
+            return Ok(identifier.to_string());
+        }
+        let mut matches = Vec::new();
+        for entry in fs::read_dir(&self.agents_root)? {
+            let path = entry?.path().join("metadata.json");
+            let Ok(meta) = fs::read(&path)
+                .ok()
+                .and_then(|body| serde_json::from_slice::<AgentMetadata>(&body).ok())
+                .ok_or(())
+            else {
+                continue;
+            };
+            if meta.local_ref == identifier || meta.name == identifier {
+                matches.push(meta.id);
+            }
+        }
+        match matches.as_slice() {
+            [id] => Ok(id.clone()),
+            [] => Err(coded_error(
+                "agent_not_found",
+                format!("agent not found: {identifier}"),
+                json!({"agent":identifier}),
+                false,
+            )),
+            _ => Err(coded_error(
+                "conflict",
+                format!("agent name is ambiguous: {identifier}"),
+                json!({"agent":identifier,"matches":matches}),
+                false,
+            )),
+        }
+    }
+
+    pub fn resolve_side_id(&self, identifier: &str) -> Result<String> {
+        if identifier.starts_with("side_")
+            && self.side_dir(identifier).join("metadata.json").exists()
+        {
+            return Ok(identifier.to_string());
+        }
+        for entry in fs::read_dir(&self.sides_root)? {
+            let path = entry?.path().join("metadata.json");
+            let Some(meta) = fs::read(&path)
+                .ok()
+                .and_then(|body| serde_json::from_slice::<SideMetadata>(&body).ok())
+            else {
+                continue;
+            };
+            if meta.local_ref == identifier {
+                return Ok(meta.id);
+            }
+        }
+        Err(coded_error(
+            "side_not_found",
+            format!("Side run not found: {identifier}"),
+            json!({"side":identifier}),
+            false,
+        ))
+    }
+
+    pub fn resolve_message_id(&self, agent_id: &str, identifier: &str) -> Result<String> {
+        self.read_messages(agent_id)?
+            .into_iter()
+            .find(|message| message.id == identifier || message.local_ref == identifier)
+            .map(|message| message.id)
+            .ok_or_else(|| {
+                coded_error(
+                    "message_not_found",
+                    format!("message not found: {identifier}"),
+                    json!({"agent_id":agent_id,"message":identifier}),
+                    false,
+                )
+            })
+    }
+
+    pub fn resolve_event_id(&self, owner_id: &str, side: bool, identifier: &str) -> Result<String> {
+        if identifier.starts_with("evt_") {
+            return Ok(identifier.to_string());
+        }
+        self.query_events(owner_id, side, &[], None, None, usize::MAX)?
+            .into_iter()
+            .find(|event| event.local_ref == identifier)
+            .map(|event| event.event_id)
+            .ok_or_else(|| {
+                coded_error(
+                    "event_not_found",
+                    format!("event not found: {identifier}"),
+                    json!({"owner_id":owner_id,"event":identifier}),
+                    false,
+                )
+            })
+    }
+
     pub fn save_metadata(&self, meta: &AgentMetadata) -> Result<()> {
         write_private_atomic(
             &self.metadata_path(&meta.id),
@@ -349,10 +758,13 @@ impl Store {
     pub fn enqueue_message(&self, id: &str, content: String) -> Result<MessageRecord> {
         let _guard = self.write_lock.lock().unwrap();
         let mut messages = self.read_messages(id)?;
+        let agent = self.load_metadata(id)?;
         let message = MessageRecord {
             kind: "message".into(),
             id: format!("msg_{}", ulid::Ulid::new()),
+            local_ref: self.next_local_ref_locked("message", "m")?,
             agent_id: id.into(),
+            agent_ref: agent.local_ref,
             content,
             status: MessageStatus::Pending,
             sent_at: Utc::now(),
@@ -363,6 +775,7 @@ impl Store {
         self.save_messages(id, &messages)?;
         let mut meta = self.load_metadata(id)?;
         meta.last_message_at = message.sent_at;
+        meta.last_message_sent_at = Some(message.sent_at);
         self.save_metadata(&meta)?;
         Ok(message)
     }
@@ -445,6 +858,11 @@ impl Store {
         }
         let result = message.clone();
         self.save_messages(id, &messages)?;
+        if status == MessageStatus::Delivered {
+            let mut meta = self.load_metadata(id)?;
+            meta.last_message_delivered_at = Some(now);
+            self.save_metadata(&meta)?;
+        }
         Ok(result)
     }
 
@@ -471,10 +889,14 @@ impl Store {
         use std::os::unix::fs::OpenOptionsExt;
         let _guard = self.write_lock.lock().unwrap();
         let sequence = self.next_sequence(&self.events_path(id), &self.event_sequence_path(id))?;
+        let agent = self.load_metadata(id)?;
         let event = EventRecord {
             event_id: format!("evt_{}", ulid::Ulid::new()),
+            local_ref: self.next_local_ref_locked("event", "e")?,
             agent_id: id.to_string(),
+            agent_ref: agent.local_ref,
             side_id: None,
+            side_ref: None,
             sequence,
             timestamp: Utc::now(),
             event_type: event_type.to_string(),
@@ -491,8 +913,33 @@ impl Store {
         file.flush()?;
         let mut meta = self.load_metadata(id)?;
         meta.updated_at = event.timestamp;
+        apply_event_activity(&mut meta.activity, event_type, event.timestamp);
         self.save_metadata(&meta)?;
         Ok(event)
+    }
+
+    pub fn update_agent_activity(
+        &self,
+        id: &str,
+        update: impl FnOnce(&mut ActivityTelemetry),
+    ) -> Result<AgentMetadata> {
+        let _guard = self.write_lock.lock().unwrap();
+        let mut meta = self.load_metadata(id)?;
+        update(&mut meta.activity);
+        self.save_metadata(&meta)?;
+        Ok(meta)
+    }
+
+    pub fn update_side_activity(
+        &self,
+        id: &str,
+        update: impl FnOnce(&mut ActivityTelemetry),
+    ) -> Result<SideMetadata> {
+        let _guard = self.write_lock.lock().unwrap();
+        let mut meta = self.load_side_metadata(id)?;
+        update(&mut meta.activity);
+        self.save_side_metadata(&meta)?;
+        Ok(meta)
     }
 
     fn next_sequence(&self, journal: &Path, counter: &Path) -> Result<u64> {
@@ -528,13 +975,20 @@ impl Store {
             bail!("notification priority must be from 1 through 5");
         }
         let _guard = self.write_lock.lock().unwrap();
-        let (agent_id, agent_name, side_id) = if owner_id.starts_with("side_") {
+        let (agent_id, agent_ref, agent_name, side_id, side_ref) = if owner_id.starts_with("side_")
+        {
             let side = self.load_side_metadata(owner_id)?;
             let parent = self.load_metadata(&side.agent_id)?;
-            (side.agent_id, parent.name, Some(owner_id.to_string()))
+            (
+                side.agent_id,
+                parent.local_ref,
+                parent.name,
+                Some(owner_id.to_string()),
+                Some(side.local_ref),
+            )
         } else {
             let agent = self.load_metadata(owner_id)?;
-            (agent.id, agent.name, None)
+            (agent.id, agent.local_ref, agent.name, None, None)
         };
         let path = self.notifications_path();
         let sequence = self.next_sequence(&path, &self.notification_sequence_path())?;
@@ -543,8 +997,10 @@ impl Store {
             id: format!("ntf_{}", ulid::Ulid::new()),
             sequence,
             agent_id,
+            agent_ref,
             agent_name,
             side_id,
+            side_ref,
             timestamp: Utc::now(),
             event_type: event_type.to_string(),
             priority,
@@ -576,7 +1032,18 @@ impl Store {
             if line.trim().is_empty() {
                 continue;
             }
-            let notification: NotificationRecord = serde_json::from_str(&line)?;
+            let mut notification: NotificationRecord = serde_json::from_str(&line)?;
+            if notification.agent_ref.is_empty()
+                && let Ok(agent) = self.load_metadata(&notification.agent_id)
+            {
+                notification.agent_ref = agent.local_ref;
+            }
+            if notification.side_ref.is_none()
+                && let Some(side_id) = notification.side_id.as_deref()
+                && let Ok(side) = self.load_side_metadata(side_id)
+            {
+                notification.side_ref = Some(side.local_ref);
+            }
             if retained.len() == 10_000 {
                 retained.pop_front();
             }
@@ -732,6 +1199,9 @@ impl Store {
                 meta.updated_at = now;
                 meta.stopped_at = Some(now);
                 meta.stop_reason = Some("daemon_interrupted".into());
+                meta.activity.current_phase = AgentPhase::Stopped;
+                meta.activity.phase_started_at = Some(now);
+                meta.activity.last_state_change_at = Some(now);
                 self.save_metadata(&meta)?;
                 self.append_event(
                     &meta.id,
@@ -812,8 +1282,11 @@ impl Store {
         let sequence = self.next_sequence(&path, &self.event_sequence_path(id))?;
         let event = EventRecord {
             event_id: format!("evt_{}", ulid::Ulid::new()),
+            local_ref: self.next_local_ref_locked("event", "e")?,
             agent_id: meta.agent_id.clone(),
+            agent_ref: meta.agent_ref.clone(),
             side_id: Some(id.to_string()),
+            side_ref: Some(meta.local_ref.clone()),
             sequence,
             timestamp: Utc::now(),
             event_type: event_type.to_string(),
@@ -828,6 +1301,7 @@ impl Store {
         file.write_all(b"\n")?;
         file.flush()?;
         meta.updated_at = event.timestamp;
+        apply_event_activity(&mut meta.activity, event_type, event.timestamp);
         self.save_side_metadata(&meta)?;
         Ok(event)
     }
@@ -877,6 +1351,9 @@ impl Store {
                 meta.stopped_at = Some(now);
                 meta.deadline_at = None;
                 meta.stop_reason = Some("daemon_interrupted".into());
+                meta.activity.current_phase = AgentPhase::Stopped;
+                meta.activity.phase_started_at = Some(now);
+                meta.activity.last_state_change_at = Some(now);
                 self.save_side_metadata(&meta)?;
                 self.append_side_event(
                     &id,
@@ -950,6 +1427,42 @@ fn parse_time(v: &Option<String>) -> Result<Option<DateTime<Utc>>> {
                 .map_err(anyhow::Error::from)
         })
         .transpose()
+}
+
+fn migrate_event_activity(path: &Path, activity: &mut ActivityTelemetry) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    for line in BufReader::new(fs::File::open(path)?).lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(event) = serde_json::from_str::<EventRecord>(&line) {
+            apply_event_activity(activity, &event.event_type, event.timestamp);
+        }
+    }
+    Ok(())
+}
+
+fn migrate_terminal_activity(
+    status: &AgentStatus,
+    created_at: DateTime<Utc>,
+    finished_at: Option<DateTime<Utc>>,
+    stopped_at: Option<DateTime<Utc>>,
+    failed_at: Option<DateTime<Utc>>,
+    activity: &mut ActivityTelemetry,
+) {
+    let (phase, changed_at) = match status {
+        AgentStatus::Working => (AgentPhase::Starting, created_at),
+        AgentStatus::Finished => (AgentPhase::Finished, finished_at.unwrap_or(created_at)),
+        AgentStatus::Stopped => (AgentPhase::Stopped, stopped_at.unwrap_or(created_at)),
+        AgentStatus::Failed => (AgentPhase::Failed, failed_at.unwrap_or(created_at)),
+    };
+    activity.current_phase = phase;
+    activity.phase_started_at.get_or_insert(changed_at);
+    activity.last_state_change_at.get_or_insert(changed_at);
+    activity.last_event_at.get_or_insert(created_at);
 }
 
 fn matches_filter(m: &AgentMetadata, f: &ListFilter) -> Result<bool> {
@@ -1070,6 +1583,7 @@ mod name_tests {
         let agent = AgentMetadata {
             kind: "agent".into(),
             id: "agt_01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
+            local_ref: "a_1".into(),
             name: "Parent".into(),
             dir: root.to_string_lossy().into_owned(),
             mode: AgentMode::Write,
@@ -1078,6 +1592,8 @@ mod name_tests {
             status: AgentStatus::Finished,
             spawned_at: now,
             last_message_at: now,
+            last_message_sent_at: Some(now),
+            last_message_delivered_at: Some(now),
             run_started_at: now,
             updated_at: now,
             finished_at: Some(now),
@@ -1087,12 +1603,15 @@ mod name_tests {
             run_number: 1,
             stop_reason: None,
             last_error: None,
+            activity: ActivityTelemetry::new(now),
         };
         store.create(&agent, &ContextSnapshot::default()).unwrap();
         let side = SideMetadata {
             kind: "side".into(),
             id: "side_01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
+            local_ref: "s_1".into(),
             agent_id: agent.id.clone(),
+            agent_ref: agent.local_ref.clone(),
             status: AgentStatus::Working,
             question: "Inspect this".into(),
             answer: None,
@@ -1110,6 +1629,7 @@ mod name_tests {
             tool_calls: 0,
             stop_reason: None,
             last_error: None,
+            activity: ActivityTelemetry::new(now),
         };
         store
             .create_side(&side, &ContextSnapshot::default())
@@ -1200,8 +1720,10 @@ mod name_tests {
                     id: format!("ntf_{sequence:026}"),
                     sequence,
                     agent_id: "agt_01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
+                    agent_ref: "a_1".into(),
                     agent_name: "Agent".into(),
                     side_id: None,
+                    side_ref: None,
                     timestamp: Utc::now(),
                     event_type: "progress".into(),
                     priority: 1,
@@ -1224,6 +1746,32 @@ mod name_tests {
         assert_eq!(inbox.len(), 10_000);
         assert_eq!(inbox.first().unwrap().sequence, 10_001);
         assert_eq!(inbox.last().unwrap().sequence, 2);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn local_references_are_per_type_monotonic_and_persistent() {
+        let root = std::env::temp_dir().join(format!("subagent-ref-store-{}", ulid::Ulid::new()));
+        let paths = Paths {
+            config_dir: root.join("config"),
+            state_dir: root.join("state"),
+            runtime_dir: root.join("run"),
+        };
+        let store = Store::new(&paths).unwrap();
+        assert_eq!(store.allocate_agent_ref().unwrap(), "a_1");
+        assert_eq!(store.allocate_agent_ref().unwrap(), "a_2");
+        assert_eq!(store.allocate_side_ref().unwrap(), "s_1");
+        assert_eq!(store.next_local_ref_locked("message", "m").unwrap(), "m_1");
+        assert_eq!(store.next_local_ref_locked("event", "e").unwrap(), "e_1");
+        drop(store);
+        let reopened = Store::new(&paths).unwrap();
+        assert_eq!(reopened.allocate_agent_ref().unwrap(), "a_3");
+        assert_eq!(reopened.allocate_side_ref().unwrap(), "s_2");
+        assert_eq!(
+            reopened.next_local_ref_locked("message", "m").unwrap(),
+            "m_2"
+        );
+        assert_eq!(reopened.next_local_ref_locked("event", "e").unwrap(), "e_2");
         let _ = fs::remove_dir_all(root);
     }
 }

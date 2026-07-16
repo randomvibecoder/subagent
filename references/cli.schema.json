@@ -4,6 +4,8 @@
   "oneOf": [
     {"$ref": "#/$defs/Agent"},
     {"$ref": "#/$defs/AgentListItem"},
+    {"$ref": "#/$defs/AgentListItemVerbose"},
+    {"$ref": "#/$defs/ListSummary"},
     {"$ref": "#/$defs/AgentRenamed"},
     {"$ref": "#/$defs/Message"},
     {"$ref": "#/$defs/MessageSent"},
@@ -19,7 +21,6 @@
     {"$ref": "#/$defs/ContextMeta"},
     {"$ref": "#/$defs/ModelMessage"},
     {"$ref": "#/$defs/AgentDeleted"},
-    {"$ref": "#/$defs/Config"},
     {"$ref": "#/$defs/ConfigValue"}
   ],
   "$defs": {
@@ -27,11 +28,14 @@
     "NullableTimestamp": {
       "oneOf": [{"$ref": "#/$defs/Timestamp"}, {"type": "null"}]
     },
+    "AgentPhase": {
+      "enum": ["starting", "processing_messages", "requesting_model", "retrying_model", "executing_tool", "waiting_terminal", "finished", "stopped", "failed"]
+    },
     "Notification": {
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "type", "id", "sequence", "agent_id", "agent_name", "side_id",
+        "type", "id", "sequence", "agent_id", "agent_ref", "agent_name", "side_id", "side_ref",
         "timestamp", "event_type", "priority", "status", "summary"
       ],
       "properties": {
@@ -39,10 +43,12 @@
         "id": {"type": "string", "pattern": "^ntf_[0-9A-HJKMNP-TV-Z]{26}$"},
         "sequence": {"type": "integer", "minimum": 1},
         "agent_id": {"type": "string", "pattern": "^agt_[0-9A-HJKMNP-TV-Z]{26}$"},
+        "agent_ref": {"type": "string", "pattern": "^a_[1-9][0-9]*$"},
         "agent_name": {"type": "string", "minLength": 4, "maxLength": 40},
         "side_id": {"type": ["string", "null"], "pattern": "^side_"},
+        "side_ref": {"type": ["string", "null"], "pattern": "^s_[1-9][0-9]*$"},
         "timestamp": {"$ref": "#/$defs/Timestamp"},
-        "event_type": {"enum": ["spawned", "resumed", "progress", "milestone", "input_required", "blocked", "finished", "stopped", "failed"]},
+        "event_type": {"enum": ["spawned", "resumed", "progress", "milestone", "input_required", "blocked", "possible_stall", "finished", "stopped", "failed"]},
         "priority": {"type": "integer", "minimum": 1, "maximum": 5},
         "status": {"enum": ["working", "finished", "stopped", "failed"]},
         "summary": {"type": "string", "maxLength": 5000}
@@ -52,14 +58,19 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "type", "id", "dir", "mode", "advisory_readonly", "model",
-        "status", "spawned_at", "last_message_at", "run_started_at", "updated_at",
+        "type", "id", "ref", "dir", "mode", "advisory_readonly", "model",
+        "status", "spawned_at", "last_message_at", "last_message_sent_at",
+        "last_message_delivered_at", "run_started_at", "updated_at",
         "finished_at", "stopped_at", "failed_at", "deadline_at", "run_number",
-        "stop_reason", "last_error"
+        "stop_reason", "last_error", "current_phase", "phase_started_at",
+        "request_started_at", "last_provider_activity_at", "provider_request_id",
+        "retry_count", "last_event_at", "last_model_event_at", "last_tool_event_at",
+        "last_state_change_at"
       ],
       "properties": {
         "type": {"const": "agent"},
         "id": {"type": "string", "pattern": "^agt_[0-9A-HJKMNP-TV-Z]{26}$"},
+        "ref": {"type": "string", "pattern": "^a_[1-9][0-9]*$"},
         "dir": {"type": "string"},
         "mode": {"enum": ["readonly", "write"]},
         "advisory_readonly": {"type": "boolean"},
@@ -67,6 +78,8 @@
         "status": {"enum": ["working", "finished", "stopped", "failed"]},
         "spawned_at": {"$ref": "#/$defs/Timestamp"},
         "last_message_at": {"$ref": "#/$defs/Timestamp"},
+        "last_message_sent_at": {"$ref": "#/$defs/NullableTimestamp"},
+        "last_message_delivered_at": {"$ref": "#/$defs/NullableTimestamp"},
         "run_started_at": {"$ref": "#/$defs/Timestamp"},
         "updated_at": {"$ref": "#/$defs/Timestamp"},
         "finished_at": {"$ref": "#/$defs/NullableTimestamp"},
@@ -80,37 +93,81 @@
             {"type": "null"}
           ]
         },
-        "last_error": {"type": ["string", "null"]}
+        "last_error": {"type": ["string", "null"]},
+        "current_phase": {"$ref": "#/$defs/AgentPhase"},
+        "phase_started_at": {"$ref": "#/$defs/NullableTimestamp"},
+        "request_started_at": {"$ref": "#/$defs/NullableTimestamp"},
+        "last_provider_activity_at": {"$ref": "#/$defs/NullableTimestamp"},
+        "provider_request_id": {"type": ["string", "null"]},
+        "retry_count": {"type": "integer", "minimum": 0},
+        "last_event_at": {"$ref": "#/$defs/NullableTimestamp"},
+        "last_model_event_at": {"$ref": "#/$defs/NullableTimestamp"},
+        "last_tool_event_at": {"$ref": "#/$defs/NullableTimestamp"},
+        "last_state_change_at": {"$ref": "#/$defs/NullableTimestamp"}
       }
     },
     "AgentListItem": {
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "type", "id", "name", "status", "dir", "mode", "spawned_at",
-        "last_message_at", "updated_at", "run_number", "working_sides"
+        "type", "id", "ref", "name", "status", "dir", "mode", "spawned_at",
+        "last_message_at", "updated_at", "model", "current_phase",
+        "last_event_at", "run_number", "working_sides"
       ],
       "properties": {
         "type": {"const": "agent_list_item"},
         "id": {"type": "string", "pattern": "^agt_[0-9A-HJKMNP-TV-Z]{26}$"},
+        "ref": {"type": "string", "pattern": "^a_[1-9][0-9]*$"},
         "name": {"type": "string", "minLength": 4, "maxLength": 40},
         "status": {"enum": ["working", "finished", "stopped", "failed"]},
         "dir": {"type": "string"},
         "mode": {"enum": ["readonly", "write"]},
+        "model": {"type": "string", "minLength": 1},
         "spawned_at": {"$ref": "#/$defs/Timestamp"},
         "last_message_at": {"$ref": "#/$defs/Timestamp"},
         "updated_at": {"$ref": "#/$defs/Timestamp"},
+        "current_phase": {"$ref": "#/$defs/AgentPhase"},
+        "last_event_at": {"$ref": "#/$defs/NullableTimestamp"},
         "run_number": {"type": "integer", "minimum": 1},
         "working_sides": {"type": "integer", "minimum": 0, "maximum": 2}
       }
     },
+    "AgentListItemVerbose": {
+      "type": "object",
+      "required": ["type", "id", "ref", "name", "status", "model", "current_phase", "working_sides", "seconds_since_last_event"],
+      "properties": {
+        "type": {"const": "agent_list_item_verbose"},
+        "id": {"type": "string", "pattern": "^agt_"},
+        "ref": {"type": "string", "pattern": "^a_[1-9][0-9]*$"},
+        "name": {"type": "string"},
+        "status": {"enum": ["working", "finished", "stopped", "failed"]},
+        "model": {"type": "string"},
+        "current_phase": {"$ref": "#/$defs/AgentPhase"},
+        "working_sides": {"type": "integer", "minimum": 0},
+        "seconds_since_last_event": {"type": ["integer", "null"], "minimum": 0}
+      },
+      "additionalProperties": true
+    },
+    "ListSummary": {
+      "type": "object",
+      "required": ["type", "resource", "count"],
+      "properties": {
+        "type": {"const": "list_summary"},
+        "resource": {"enum": ["agents", "messages", "sides"]},
+        "agent_id": {"type": "string", "pattern": "^agt_"},
+        "agent_ref": {"type": "string", "pattern": "^a_[1-9][0-9]*$"},
+        "count": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": false
+    },
     "AgentRenamed": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["type", "id", "name", "renamed_at"],
+      "required": ["type", "id", "ref", "name", "renamed_at"],
       "properties": {
         "type": {"const": "agent_renamed"},
         "id": {"type": "string", "pattern": "^agt_"},
+        "ref": {"type": "string", "pattern": "^a_[1-9][0-9]*$"},
         "name": {"type": "string", "minLength": 4, "maxLength": 40},
         "renamed_at": {"$ref": "#/$defs/Timestamp"}
       }
@@ -119,13 +176,15 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "type", "id", "agent_id", "content", "status", "sent_at",
+        "type", "id", "ref", "agent_id", "agent_ref", "content", "status", "sent_at",
         "delivered_at", "cancelled_at"
       ],
       "properties": {
         "type": {"const": "message"},
         "id": {"type": "string", "pattern": "^msg_[0-9A-HJKMNP-TV-Z]{26}$"},
+        "ref": {"type": "string", "pattern": "^m_[1-9][0-9]*$"},
         "agent_id": {"type": "string", "pattern": "^agt_"},
+        "agent_ref": {"type": "string", "pattern": "^a_[1-9][0-9]*$"},
         "content": {"type": "string"},
         "status": {"enum": ["pending", "delivered", "cancelled"]},
         "sent_at": {"$ref": "#/$defs/Timestamp"},
@@ -136,22 +195,31 @@
     "MessageSent": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["type", "message_id", "agent_id", "status", "sent_at"],
+      "required": ["type", "message_id", "message_ref", "agent_id", "agent_ref", "status", "sent_at", "agent_resumed", "run_number", "agent_status", "resume_state"],
       "properties": {
         "type": {"const": "message_sent"},
         "message_id": {"type": "string", "pattern": "^msg_"},
+        "message_ref": {"type": "string", "pattern": "^m_[1-9][0-9]*$"},
         "agent_id": {"type": "string", "pattern": "^agt_"},
+        "agent_ref": {"type": "string", "pattern": "^a_[1-9][0-9]*$"},
         "status": {"const": "queued"},
-        "sent_at": {"$ref": "#/$defs/Timestamp"}
+        "sent_at": {"$ref": "#/$defs/Timestamp"},
+        "agent_resumed": {"type": "boolean"},
+        "run_number": {"type": "integer", "minimum": 1},
+        "agent_status": {"enum": ["working", "finished", "stopped", "failed"]},
+        "resume_state": {"enum": ["not_needed", "started", "waiting_for_capacity"]}
       }
     },
     "EventBase": {
       "type": "object",
-      "required": ["event_id", "agent_id", "sequence", "timestamp", "type", "data"],
+      "required": ["event_id", "ref", "agent_id", "agent_ref", "sequence", "timestamp", "type", "data"],
       "properties": {
         "event_id": {"type": "string", "pattern": "^evt_"},
+        "ref": {"type": "string", "pattern": "^e_[1-9][0-9]*$"},
         "agent_id": {"type": "string", "pattern": "^agt_"},
+        "agent_ref": {"type": "string", "pattern": "^a_[1-9][0-9]*$"},
         "side_id": {"type": "string", "pattern": "^side_"},
+        "side_ref": {"type": "string", "pattern": "^s_[1-9][0-9]*$"},
         "sequence": {"type": "integer", "minimum": 1},
         "timestamp": {"$ref": "#/$defs/Timestamp"}
       }
@@ -638,7 +706,7 @@
             "daemon_unavailable", "daemon_already_running", "agent_not_found",
             "event_not_found", "message_not_found", "side_not_found", "invalid_argument",
             "file_too_large", "capacity_exceeded", "conflict", "timeout",
-            "api_error", "internal_error", "cli_error"
+            "api_error", "protocol_mismatch", "internal_error", "cli_error"
           ]
         },
         "message": {"type": "string"},
@@ -650,12 +718,14 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "type", "status", "pid", "socket", "working_agents",
+        "type", "status", "version", "protocol_version", "pid", "socket", "working_agents",
         "max_agents", "model", "base_url", "web_ui_url", "web_auth"
       ],
       "properties": {
         "type": {"const": "daemon"},
         "status": {"const": "running"},
+        "version": {"type": "string"},
+        "protocol_version": {"type": "integer", "minimum": 1},
         "pid": {"type": "integer", "minimum": 1},
         "socket": {"type": "string"},
         "working_agents": {"type": "integer", "minimum": 0},
@@ -679,11 +749,13 @@
     "SideCreated": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["type", "id", "agent_id", "status", "created_at"],
+      "required": ["type", "id", "ref", "agent_id", "agent_ref", "status", "created_at"],
       "properties": {
         "type": {"const": "side_created"},
         "id": {"type": "string", "pattern": "^side_"},
+        "ref": {"type": "string", "pattern": "^s_[1-9][0-9]*$"},
         "agent_id": {"type": "string", "pattern": "^agt_"},
+        "agent_ref": {"type": "string", "pattern": "^a_[1-9][0-9]*$"},
         "status": {"const": "working"},
         "created_at": {"$ref": "#/$defs/Timestamp"}
       }
@@ -692,15 +764,20 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "type", "id", "agent_id", "status", "question", "answer", "model",
+        "type", "id", "ref", "agent_id", "agent_ref", "status", "question", "answer", "model",
         "mode", "parent_mode", "created_at", "run_started_at", "updated_at",
         "finished_at", "stopped_at", "failed_at", "deadline_at",
-        "inherited_context_messages", "tool_calls", "stop_reason", "last_error"
+        "inherited_context_messages", "tool_calls", "stop_reason", "last_error",
+        "current_phase", "phase_started_at", "request_started_at",
+        "last_provider_activity_at", "provider_request_id", "retry_count",
+        "last_event_at", "last_model_event_at", "last_tool_event_at", "last_state_change_at"
       ],
       "properties": {
         "type": {"const": "side"},
         "id": {"type": "string", "pattern": "^side_"},
+        "ref": {"type": "string", "pattern": "^s_[1-9][0-9]*$"},
         "agent_id": {"type": "string", "pattern": "^agt_"},
+        "agent_ref": {"type": "string", "pattern": "^a_[1-9][0-9]*$"},
         "status": {"enum": ["working", "finished", "stopped", "failed"]},
         "question": {"type": "string"},
         "answer": {"type": ["string", "null"]},
@@ -717,17 +794,29 @@
         "inherited_context_messages": {"type": "integer", "minimum": 0},
         "tool_calls": {"type": "integer", "minimum": 0},
         "stop_reason": {"type": ["string", "null"]},
-        "last_error": {"type": ["string", "null"]}
+        "last_error": {"type": ["string", "null"]},
+        "current_phase": {"$ref": "#/$defs/AgentPhase"},
+        "phase_started_at": {"$ref": "#/$defs/NullableTimestamp"},
+        "request_started_at": {"$ref": "#/$defs/NullableTimestamp"},
+        "last_provider_activity_at": {"$ref": "#/$defs/NullableTimestamp"},
+        "provider_request_id": {"type": ["string", "null"]},
+        "retry_count": {"type": "integer", "minimum": 0},
+        "last_event_at": {"$ref": "#/$defs/NullableTimestamp"},
+        "last_model_event_at": {"$ref": "#/$defs/NullableTimestamp"},
+        "last_tool_event_at": {"$ref": "#/$defs/NullableTimestamp"},
+        "last_state_change_at": {"$ref": "#/$defs/NullableTimestamp"}
       }
     },
     "SideListItem": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["type", "id", "agent_id", "status", "question_preview", "created_at", "updated_at", "tool_calls"],
+      "required": ["type", "id", "ref", "agent_id", "agent_ref", "status", "question_preview", "created_at", "updated_at", "tool_calls"],
       "properties": {
         "type": {"const": "side_list_item"},
         "id": {"type": "string", "pattern": "^side_"},
+        "ref": {"type": "string", "pattern": "^s_[1-9][0-9]*$"},
         "agent_id": {"type": "string", "pattern": "^agt_"},
+        "agent_ref": {"type": "string", "pattern": "^a_[1-9][0-9]*$"},
         "status": {"enum": ["working", "finished", "stopped", "failed"]},
         "question_preview": {"type": "string", "maxLength": 200},
         "created_at": {"$ref": "#/$defs/Timestamp"},
@@ -738,10 +827,13 @@
     "SideDeleted": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["type", "id"],
+      "required": ["type", "id", "ref", "agent_id", "agent_ref"],
       "properties": {
         "type": {"const": "side_deleted"},
         "id": {"type": "string", "pattern": "^side_"}
+        ,"ref": {"type": "string", "pattern": "^s_[1-9][0-9]*$"}
+        ,"agent_id": {"type": "string", "pattern": "^agt_"}
+        ,"agent_ref": {"type": "string", "pattern": "^a_[1-9][0-9]*$"}
       }
     },
     "ContextMeta": {
@@ -769,41 +861,31 @@
     "AgentDeleted": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["type", "id"],
+      "required": ["type", "id", "ref"],
       "properties": {
         "type": {"const": "agent_deleted"},
-        "id": {"type": "string", "pattern": "^agt_"}
-      }
-    },
-    "Config": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "type", "base-url", "model", "max-agents",
-        "context-token-budget", "tool-output-preview-bytes"
-      ],
-      "properties": {
-        "type": {"const": "config"},
-        "base-url": {"type": "string", "minLength": 1},
-        "model": {"type": "string", "minLength": 1},
-        "max-agents": {"type": "integer", "minimum": 0},
-        "context-token-budget": {"type": "integer", "minimum": 1},
-        "tool-output-preview-bytes": {"type": "integer", "minimum": 1}
+        "id": {"type": "string", "pattern": "^agt_"},
+        "ref": {"type": "string", "pattern": "^a_[1-9][0-9]*$"}
       }
     },
     "ConfigValue": {
       "type": "object",
-      "required": ["type", "key", "value"],
+      "required": ["type", "key", "default_value", "persisted_value", "local_effective_value", "local_source", "active_value", "active_source", "restart_required"],
       "properties": {
         "type": {"const": "config_value"},
         "key": {
           "enum": [
             "base-url", "model", "max-agents",
-            "context-token-budget", "tool-output-preview-bytes"
+            "context-token-budget", "tool-output-preview-bytes", "stall-notification-seconds"
           ]
         },
-        "value": {"type": ["string", "integer"]},
-        "note": {"type": "string"}
+        "default_value": {"type": ["string", "integer"]},
+        "persisted_value": {"type": ["string", "integer", "null"]},
+        "local_effective_value": {"type": ["string", "integer"]},
+        "local_source": {"type": "string"},
+        "active_value": {"type": ["string", "integer", "null"]},
+        "active_source": {"type": ["string", "null"]},
+        "restart_required": {"type": ["boolean", "null"]}
       },
       "additionalProperties": false
     }

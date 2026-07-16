@@ -1,7 +1,7 @@
 use crate::{
     config::RuntimeConfig,
     ipc::{AgentMode, coded_error},
-    model::{OpenAiClient, assistant_message},
+    model::{ModelProgress, OpenAiClient, assistant_message},
     store::{
         AgentListItem, AgentMetadata, AgentStatus, ContextSnapshot, MessageRecord, SideListItem,
         SideMetadata, Store, canonical_dir, normalize_agent_name,
@@ -24,6 +24,7 @@ pub struct AgentManager {
     active: Arc<Mutex<HashMap<String, AgentControl>>>,
     active_sides: Arc<Mutex<HashMap<String, SideControl>>>,
     operations: Arc<Mutex<()>>,
+    stall_notified: Arc<Mutex<HashMap<String, chrono::DateTime<Utc>>>>,
 }
 
 #[derive(Clone)]
@@ -49,7 +50,135 @@ impl AgentManager {
             active: Default::default(),
             active_sides: Default::default(),
             operations: Default::default(),
+            stall_notified: Default::default(),
         }
+    }
+
+    pub fn check_stalls(&self) -> Result<()> {
+        let threshold = self.cfg.file.stall_notification_seconds;
+        if threshold == 0 {
+            return Ok(());
+        }
+        let now = Utc::now();
+        let agent_ids = self
+            .active
+            .lock()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        for id in agent_ids {
+            let meta = self.store.load_metadata(&id)?;
+            let mut candidates = vec![
+                meta.activity.last_provider_activity_at,
+                meta.activity.last_model_event_at,
+                meta.activity.last_tool_event_at,
+                meta.last_message_delivered_at,
+                meta.activity.request_started_at,
+            ];
+            if !matches!(
+                meta.activity.current_phase,
+                crate::store::AgentPhase::RequestingModel | crate::store::AgentPhase::RetryingModel
+            ) {
+                candidates.push(meta.activity.phase_started_at);
+            }
+            let baseline = candidates
+                .into_iter()
+                .flatten()
+                .max()
+                .unwrap_or(meta.run_started_at);
+            self.maybe_publish_stall(
+                &id,
+                &meta.activity.current_phase,
+                meta.activity.retry_count,
+                meta.activity.provider_request_id.as_deref(),
+                baseline,
+                now,
+                threshold,
+            )?;
+        }
+        let side_ids = self
+            .active_sides
+            .lock()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        for id in side_ids {
+            let meta = self.store.load_side_metadata(&id)?;
+            let mut candidates = vec![
+                meta.activity.last_provider_activity_at,
+                meta.activity.last_model_event_at,
+                meta.activity.last_tool_event_at,
+                meta.activity.request_started_at,
+            ];
+            if !matches!(
+                meta.activity.current_phase,
+                crate::store::AgentPhase::RequestingModel | crate::store::AgentPhase::RetryingModel
+            ) {
+                candidates.push(meta.activity.phase_started_at);
+            }
+            let baseline = candidates
+                .into_iter()
+                .flatten()
+                .max()
+                .unwrap_or(meta.run_started_at);
+            self.maybe_publish_stall(
+                &id,
+                &meta.activity.current_phase,
+                meta.activity.retry_count,
+                meta.activity.provider_request_id.as_deref(),
+                baseline,
+                now,
+                threshold,
+            )?;
+        }
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn maybe_publish_stall(
+        &self,
+        id: &str,
+        phase: &crate::store::AgentPhase,
+        retry_count: u32,
+        provider_request_id: Option<&str>,
+        baseline: chrono::DateTime<Utc>,
+        now: chrono::DateTime<Utc>,
+        threshold: u64,
+    ) -> Result<()> {
+        if (now - baseline).num_seconds() < threshold as i64 {
+            self.stall_notified.lock().unwrap().remove(id);
+            return Ok(());
+        }
+        if self
+            .stall_notified
+            .lock()
+            .unwrap()
+            .get(id)
+            .is_some_and(|notified| *notified >= baseline)
+        {
+            return Ok(());
+        }
+        let idle = (now - baseline).num_seconds().max(0);
+        let request = provider_request_id
+            .map(|value| format!(", provider request {value}"))
+            .unwrap_or_default();
+        self.store.append_notification(
+            id,
+            "possible_stall",
+            3,
+            AgentStatus::Working,
+            format!(
+                "Possible stall: phase {}, inactive for {idle}s, retry count {retry_count}{request}",
+                phase.as_str()
+            ),
+        )?;
+        self.stall_notified
+            .lock()
+            .unwrap()
+            .insert(id.into(), baseline);
+        Ok(())
     }
 
     pub fn working_count(&self) -> usize {
@@ -82,9 +211,11 @@ impl AgentManager {
         let deadline = deadline_from_minutes(wall_time_minutes)?;
         let now = Utc::now();
         let id = format!("agt_{}", ulid::Ulid::new());
+        let local_ref = self.store.allocate_agent_ref()?;
         let meta = AgentMetadata {
             kind: "agent".into(),
             id: id.clone(),
+            local_ref,
             name,
             dir,
             mode,
@@ -93,6 +224,8 @@ impl AgentManager {
             status: AgentStatus::Working,
             spawned_at: now,
             last_message_at: now,
+            last_message_sent_at: Some(now),
+            last_message_delivered_at: Some(now),
             run_started_at: now,
             updated_at: now,
             finished_at: None,
@@ -102,6 +235,7 @@ impl AgentManager {
             run_number: 1,
             stop_reason: None,
             last_error: None,
+            activity: crate::store::ActivityTelemetry::new(now),
         };
         let context = ContextSnapshot {
             messages: vec![
@@ -139,17 +273,26 @@ impl AgentManager {
             self.update_time(id, minutes)?;
         }
         let message = self.store.enqueue_message(id, message)?;
-        if current.status == AgentStatus::Working {
-            if let Some(control) = self.active.lock().unwrap().get(id).cloned() {
-                let _ = control.messages.send(());
-            }
-        } else if self.has_capacity() {
-            self.resume_pending(id, wall_time_minutes)?;
-        }
-        Ok(message_receipt(&message))
+        let (current_after_send, resume_state, agent_resumed) =
+            if current.status == AgentStatus::Working {
+                if let Some(control) = self.active.lock().unwrap().get(id).cloned() {
+                    let _ = control.messages.send(());
+                }
+                (self.store.load_metadata(id)?, "not_needed", false)
+            } else if self.has_capacity() {
+                (self.resume_pending(id, wall_time_minutes)?, "started", true)
+            } else {
+                (current, "waiting_for_capacity", false)
+            };
+        Ok(message_receipt(
+            &message,
+            &current_after_send,
+            resume_state,
+            agent_resumed,
+        ))
     }
 
-    fn resume_pending(&self, id: &str, wall_time_minutes: Option<u64>) -> Result<()> {
+    fn resume_pending(&self, id: &str, wall_time_minutes: Option<u64>) -> Result<AgentMetadata> {
         self.active.lock().unwrap().remove(id);
         let mut meta = self.store.load_metadata(id)?;
         let now = Utc::now();
@@ -163,6 +306,9 @@ impl AgentManager {
         meta.stop_reason = None;
         meta.last_error = None;
         meta.deadline_at = deadline_from_minutes(wall_time_minutes)?;
+        meta.activity.current_phase = crate::store::AgentPhase::ProcessingMessages;
+        meta.activity.phase_started_at = Some(now);
+        meta.activity.last_state_change_at = Some(now);
         self.store.save_metadata(&meta)?;
         self.store.append_event(
             id,
@@ -178,7 +324,7 @@ impl AgentManager {
         )?;
         let context = self.store.load_context(id)?;
         self.start_worker(meta.clone(), context)?;
-        Ok(())
+        Ok(meta)
     }
 
     fn has_capacity(&self) -> bool {
@@ -239,6 +385,7 @@ impl AgentManager {
         Ok(json!({
             "type":"agent_renamed",
             "id":id,
+            "ref":meta.local_ref,
             "name":name,
             "renamed_at":Utc::now(),
         }))
@@ -251,6 +398,29 @@ impl AgentManager {
             .map(|meta| {
                 let count = self.store.working_side_count(&meta.id)?;
                 Ok(AgentListItem::from_metadata(meta, count))
+            })
+            .collect()
+    }
+
+    pub fn list_verbose_values(&self, filter: &crate::ipc::ListFilter) -> Result<Vec<Value>> {
+        self.store
+            .list(filter)?
+            .into_iter()
+            .map(|meta| {
+                let working_sides = self.store.working_side_count(&meta.id)?;
+                let seconds_since_last_event = meta
+                    .activity
+                    .last_event_at
+                    .map(|at| (Utc::now() - at).num_seconds().max(0));
+                let mut value = serde_json::to_value(meta)?;
+                let object = value.as_object_mut().unwrap();
+                object.insert("type".into(), json!("agent_list_item_verbose"));
+                object.insert("working_sides".into(), json!(working_sides));
+                object.insert(
+                    "seconds_since_last_event".into(),
+                    json!(seconds_since_last_event),
+                );
+                Ok(value)
             })
             .collect()
     }
@@ -426,11 +596,15 @@ impl AgentManager {
             .push(json!({"role":"user","content":message.clone()}));
         let deadline = deadline_from_minutes(wall_time_minutes)?;
         let side_id = format!("side_{}", ulid::Ulid::new());
+        let side_ref = self.store.allocate_side_ref()?;
+        let agent_ref = meta.local_ref.clone();
         let now = Utc::now();
         let side = SideMetadata {
             kind: "side".into(),
             id: side_id.clone(),
+            local_ref: side_ref.clone(),
             agent_id: id.into(),
+            agent_ref: agent_ref.clone(),
             status: AgentStatus::Working,
             question: message.clone(),
             answer: None,
@@ -448,6 +622,7 @@ impl AgentManager {
             tool_calls: 0,
             stop_reason: None,
             last_error: None,
+            activity: crate::store::ActivityTelemetry::new(now),
         };
         self.store.create_side(&side, &context)?;
         self.store.append_side_event(
@@ -491,7 +666,7 @@ impl AgentManager {
             manager.active_sides.lock().unwrap().remove(&run_id);
         });
         Ok(
-            json!({"type":"side_created","id":side_id,"agent_id":id,"status":"working","created_at":now}),
+            json!({"type":"side_created","id":side_id,"ref":side_ref,"agent_id":id,"agent_ref":agent_ref,"status":"working","created_at":now}),
         )
     }
 
@@ -537,7 +712,8 @@ impl AgentManager {
     }
 
     pub async fn delete_agent(&self, id: &str) -> Result<Value> {
-        if self.store.load_metadata(id)?.status == AgentStatus::Working {
+        let meta = self.store.load_metadata(id)?;
+        if meta.status == AgentStatus::Working {
             return Err(coded_error(
                 "conflict",
                 "cannot delete a working agent",
@@ -557,7 +733,7 @@ impl AgentManager {
         }
         self.store.delete_sides_for_agent(id)?;
         self.store.delete(id)?;
-        Ok(json!({"type":"agent_deleted","id":id}))
+        Ok(json!({"type":"agent_deleted","id":id,"ref":meta.local_ref}))
     }
 
     pub async fn stop_all(&self, reason: &str) {
@@ -582,6 +758,11 @@ async fn run_side(
     mut stop: watch::Receiver<bool>,
     terminals: TerminalManager,
 ) -> Result<()> {
+    set_side_phase(
+        &store,
+        &side.id,
+        crate::store::AgentPhase::ProcessingMessages,
+    )?;
     let client = OpenAiClient::new(
         cfg.api_key.clone(),
         cfg.file.base_url.clone(),
@@ -601,7 +782,11 @@ async fn run_side(
             return Ok(());
         }
         compact_context(&mut context, cfg.file.context_token_budget);
-        let completion = client.complete(&context.messages, &defs);
+        begin_side_model_request(&store, &side.id)?;
+        let mut last_activity_write = None;
+        let completion = client.complete_observed(&context.messages, &defs, |progress| {
+            record_side_model_progress(&store, &side.id, progress, &mut last_activity_write)
+        });
         let turn = if let Some(deadline) = side.deadline_at {
             let remaining = (deadline - Utc::now())
                 .to_std()
@@ -619,6 +804,7 @@ async fn run_side(
                 result = completion => result?,
             }
         };
+        complete_side_model_request(&store, &side.id)?;
         if !turn.reasoning.is_empty() {
             store.append_side_event(&side.id, "reasoning", json!({"content":turn.reasoning}))?;
         }
@@ -640,6 +826,9 @@ async fn run_side(
             side.updated_at = now;
             side.finished_at = Some(now);
             side.deadline_at = None;
+            side.activity.current_phase = crate::store::AgentPhase::Finished;
+            side.activity.phase_started_at = Some(now);
+            side.activity.last_state_change_at = Some(now);
             store.save_side_metadata(&side)?;
             store.append_side_event(&side.id, "lifecycle", json!({"status":"finished"}))?;
             store.append_notification(
@@ -656,6 +845,12 @@ async fn run_side(
         }
         let mut image_messages = Vec::new();
         for call in turn.tool_calls {
+            let phase = if call.function.name == "write_stdin" {
+                crate::store::AgentPhase::WaitingTerminal
+            } else {
+                crate::store::AgentPhase::ExecutingTool
+            };
+            set_side_phase(&store, &side.id, phase)?;
             side = store.load_side_metadata(&side.id)?;
             side.tool_calls += 1;
             store.save_side_metadata(&side)?;
@@ -674,6 +869,11 @@ async fn run_side(
             if let Some(image) = result.image_message {
                 image_messages.push(image);
             }
+            set_side_phase(
+                &store,
+                &side.id,
+                crate::store::AgentPhase::ProcessingMessages,
+            )?;
         }
         context.messages.extend(image_messages);
         store.save_side_context(&side.id, &context)?;
@@ -717,6 +917,11 @@ async fn run_worker(
     terminals: TerminalManager,
     operations: Arc<Mutex<()>>,
 ) -> Result<()> {
+    set_agent_phase(
+        &store,
+        &meta.id,
+        crate::store::AgentPhase::ProcessingMessages,
+    )?;
     let client = OpenAiClient::new(
         cfg.api_key.clone(),
         cfg.file.base_url.clone(),
@@ -749,7 +954,11 @@ async fn run_worker(
             return Ok(());
         }
         let request_messages = context.messages.clone();
-        let turn_future = client.complete(&request_messages, &defs);
+        begin_agent_model_request(&store, &meta.id)?;
+        let mut last_activity_write = None;
+        let turn_future = client.complete_observed(&request_messages, &defs, |progress| {
+            record_agent_model_progress(&store, &meta.id, progress, &mut last_activity_write)
+        });
         tokio::pin!(turn_future);
         let turn = loop {
             tokio::select! {
@@ -758,6 +967,7 @@ async fn run_worker(
                 _=tokio::time::sleep(std::time::Duration::from_secs(1))=>{if deadline.lock().unwrap().is_some_and(|d|Utc::now()>=d){terminals.terminate_all().await;mark_stopped(&store,&meta.id,"wall_time")?;return Ok(())}}
             }
         };
+        complete_agent_model_request(&store, &meta.id)?;
         if !turn.reasoning.is_empty() {
             store.append_event(&meta.id, "reasoning", json!({"content":turn.reasoning}))?;
         }
@@ -785,6 +995,12 @@ async fn run_worker(
         }
         let mut image_messages = Vec::new();
         for call in turn.tool_calls {
+            let phase = if call.function.name == "write_stdin" {
+                crate::store::AgentPhase::WaitingTerminal
+            } else {
+                crate::store::AgentPhase::ExecutingTool
+            };
+            set_agent_phase(&store, &meta.id, phase)?;
             store.append_event(&meta.id,"tool_call",json!({"tool_call_id":call.id,"name":call.function.name,"arguments":call.function.arguments}))?;
             let result = runtime.execute(&call).await;
             let content = serde_json::to_string(&result.content)?;
@@ -799,6 +1015,11 @@ async fn run_worker(
             if let Some(image) = result.image_message {
                 image_messages.push(image);
             }
+            set_agent_phase(
+                &store,
+                &meta.id,
+                crate::store::AgentPhase::ProcessingMessages,
+            )?;
             store.save_context(&meta.id, &context)?;
         }
         context.messages.extend(image_messages);
@@ -833,13 +1054,160 @@ fn deliver_pending_messages(
     Ok(pending.len())
 }
 
-fn message_receipt(message: &MessageRecord) -> Value {
+fn set_agent_phase(store: &Store, id: &str, phase: crate::store::AgentPhase) -> Result<()> {
+    let now = Utc::now();
+    store.update_agent_activity(id, |activity| {
+        activity.current_phase = phase;
+        activity.phase_started_at = Some(now);
+    })?;
+    Ok(())
+}
+
+fn set_side_phase(store: &Store, id: &str, phase: crate::store::AgentPhase) -> Result<()> {
+    let now = Utc::now();
+    store.update_side_activity(id, |activity| {
+        activity.current_phase = phase;
+        activity.phase_started_at = Some(now);
+    })?;
+    Ok(())
+}
+
+fn begin_agent_model_request(store: &Store, id: &str) -> Result<()> {
+    let now = Utc::now();
+    store.update_agent_activity(id, |activity| {
+        activity.current_phase = crate::store::AgentPhase::RequestingModel;
+        activity.phase_started_at = Some(now);
+        activity.request_started_at = Some(now);
+        activity.last_provider_activity_at = None;
+        activity.provider_request_id = None;
+        activity.retry_count = 0;
+    })?;
+    Ok(())
+}
+
+fn begin_side_model_request(store: &Store, id: &str) -> Result<()> {
+    let now = Utc::now();
+    store.update_side_activity(id, |activity| {
+        activity.current_phase = crate::store::AgentPhase::RequestingModel;
+        activity.phase_started_at = Some(now);
+        activity.request_started_at = Some(now);
+        activity.last_provider_activity_at = None;
+        activity.provider_request_id = None;
+        activity.retry_count = 0;
+    })?;
+    Ok(())
+}
+
+fn complete_agent_model_request(store: &Store, id: &str) -> Result<()> {
+    let now = Utc::now();
+    store.update_agent_activity(id, |activity| {
+        activity.current_phase = crate::store::AgentPhase::ProcessingMessages;
+        activity.phase_started_at = Some(now);
+        activity.last_model_event_at = Some(now);
+        activity.last_provider_activity_at = Some(now);
+    })?;
+    Ok(())
+}
+
+fn complete_side_model_request(store: &Store, id: &str) -> Result<()> {
+    let now = Utc::now();
+    store.update_side_activity(id, |activity| {
+        activity.current_phase = crate::store::AgentPhase::ProcessingMessages;
+        activity.phase_started_at = Some(now);
+        activity.last_model_event_at = Some(now);
+        activity.last_provider_activity_at = Some(now);
+    })?;
+    Ok(())
+}
+
+fn record_agent_model_progress(
+    store: &Store,
+    id: &str,
+    progress: ModelProgress,
+    last_activity_write: &mut Option<chrono::DateTime<Utc>>,
+) -> Result<()> {
+    record_model_progress(false, store, id, progress, last_activity_write)
+}
+
+fn record_side_model_progress(
+    store: &Store,
+    id: &str,
+    progress: ModelProgress,
+    last_activity_write: &mut Option<chrono::DateTime<Utc>>,
+) -> Result<()> {
+    record_model_progress(true, store, id, progress, last_activity_write)
+}
+
+fn record_model_progress(
+    side: bool,
+    store: &Store,
+    id: &str,
+    progress: ModelProgress,
+    last_activity_write: &mut Option<chrono::DateTime<Utc>>,
+) -> Result<()> {
+    let now = Utc::now();
+    let should_write = match progress {
+        ModelProgress::ProviderActivity => {
+            last_activity_write.is_none_or(|at| (now - at).num_seconds() >= 5)
+        }
+        _ => true,
+    };
+    if !should_write {
+        return Ok(());
+    }
+    let update = |activity: &mut crate::store::ActivityTelemetry| match &progress {
+        ModelProgress::AttemptStarted { retry_count } => {
+            activity.current_phase = crate::store::AgentPhase::RequestingModel;
+            activity.phase_started_at = Some(now);
+            activity.retry_count = *retry_count;
+        }
+        ModelProgress::ResponseStarted {
+            provider_request_id,
+        } => {
+            activity.provider_request_id = provider_request_id.clone();
+            activity.last_provider_activity_at = Some(now);
+        }
+        ModelProgress::ProviderActivity => {
+            activity.last_provider_activity_at = Some(now);
+        }
+        ModelProgress::RetryScheduled { retry_count } => {
+            activity.current_phase = crate::store::AgentPhase::RetryingModel;
+            activity.phase_started_at = Some(now);
+            activity.retry_count = *retry_count;
+        }
+    };
+    if side {
+        store.update_side_activity(id, update)?;
+    } else {
+        store.update_agent_activity(id, update)?;
+    }
+    if matches!(
+        progress,
+        ModelProgress::ProviderActivity | ModelProgress::ResponseStarted { .. }
+    ) {
+        *last_activity_write = Some(now);
+    }
+    Ok(())
+}
+
+fn message_receipt(
+    message: &MessageRecord,
+    meta: &AgentMetadata,
+    resume_state: &str,
+    agent_resumed: bool,
+) -> Value {
     json!({
         "type":"message_sent",
         "message_id":message.id,
+        "message_ref":message.local_ref,
         "agent_id":message.agent_id,
+        "agent_ref":message.agent_ref,
         "status":"queued",
         "sent_at":message.sent_at,
+        "agent_resumed":agent_resumed,
+        "run_number":meta.run_number,
+        "agent_status":meta.status,
+        "resume_state":resume_state,
     })
 }
 
@@ -975,6 +1343,9 @@ fn mark_finished(store: &Store, id: &str, final_message: &str) -> Result<()> {
     m.updated_at = now;
     m.finished_at = Some(now);
     m.deadline_at = None;
+    m.activity.current_phase = crate::store::AgentPhase::Finished;
+    m.activity.phase_started_at = Some(now);
+    m.activity.last_state_change_at = Some(now);
     store.save_metadata(&m)?;
     store.append_event(id, "lifecycle", json!({"status":"finished"}))?;
     store.append_notification(
@@ -998,6 +1369,9 @@ fn mark_stopped(store: &Store, id: &str, reason: &str) -> Result<()> {
     m.stopped_at = Some(now);
     m.stop_reason = Some(reason.into());
     m.deadline_at = None;
+    m.activity.current_phase = crate::store::AgentPhase::Stopped;
+    m.activity.phase_started_at = Some(now);
+    m.activity.last_state_change_at = Some(now);
     store.save_metadata(&m)?;
     store.append_event(id, "lifecycle", json!({"status":"stopped","reason":reason}))?;
     store.append_notification(
@@ -1020,6 +1394,9 @@ fn mark_failed(store: &Store, id: &str, error: String) -> Result<()> {
     m.failed_at = Some(now);
     m.last_error = Some(error.clone());
     m.deadline_at = None;
+    m.activity.current_phase = crate::store::AgentPhase::Failed;
+    m.activity.phase_started_at = Some(now);
+    m.activity.last_state_change_at = Some(now);
     store.save_metadata(&m)?;
     store.append_event(id, "error", json!({"status":"failed","error":error}))?;
     store.append_notification(id, "failed", 4, AgentStatus::Failed, &error)?;
@@ -1037,6 +1414,9 @@ fn mark_side_stopped(store: &Store, id: &str, reason: &str) -> Result<()> {
     meta.stopped_at = Some(now);
     meta.deadline_at = None;
     meta.stop_reason = Some(reason.into());
+    meta.activity.current_phase = crate::store::AgentPhase::Stopped;
+    meta.activity.phase_started_at = Some(now);
+    meta.activity.last_state_change_at = Some(now);
     store.save_side_metadata(&meta)?;
     store.append_side_event(id, "lifecycle", json!({"status":"stopped","reason":reason}))?;
     store.append_notification(
@@ -1060,6 +1440,9 @@ fn mark_side_failed(store: &Store, id: &str, error: String) -> Result<()> {
     meta.failed_at = Some(now);
     meta.deadline_at = None;
     meta.last_error = Some(error.clone());
+    meta.activity.current_phase = crate::store::AgentPhase::Failed;
+    meta.activity.phase_started_at = Some(now);
+    meta.activity.last_state_change_at = Some(now);
     store.save_side_metadata(&meta)?;
     store.append_side_event(id, "error", json!({"status":"failed","error":error}))?;
     store.append_notification(id, "failed", 4, AgentStatus::Failed, &error)?;

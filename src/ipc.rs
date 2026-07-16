@@ -1,11 +1,14 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+pub const PROTOCOL_VERSION: u32 = 1;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
 pub enum Request {
     DaemonStatus,
     DaemonStop,
+    ConfigActive,
     AgentSpawn {
         dir: String,
         message: String,
@@ -19,6 +22,10 @@ pub enum Request {
     },
     AgentStatus {
         id: String,
+    },
+    AgentWait {
+        id: String,
+        timeout_seconds: Option<u64>,
     },
     AgentRename {
         id: String,
@@ -127,6 +134,8 @@ pub struct ListFilter {
     pub order: String,
     pub limit: usize,
     pub offset: usize,
+    #[serde(default)]
+    pub verbose: bool,
 }
 
 #[derive(Debug, Serialize)]

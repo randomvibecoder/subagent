@@ -21,7 +21,8 @@ release binary, SKILL.md, this reference, and cli.schema.json must change togeth
 
 Operational stdout is UTF-8 JSONL. Every line is one compact JSON object followed by
 LF. Strings encode embedded newlines. Commands never emit tables, ANSI escapes,
-progress, or arrays around multiple results. Zero matches means zero stdout lines.
+progress, or arrays around multiple results. Agent, Side, and Message list commands
+always finish with one list_summary line, including count zero.
 Streaming output is flushed after each object.
 
 Help and version are plain text. Local parsing, configuration, startup, and daemon
@@ -61,9 +62,16 @@ output, output_ref, and truncated fields.
 
 ### IDs
 
-Agent IDs are agt_ plus an uppercase canonical ULID. Event, message, side, terminal,
-and output IDs use evt_, msg_, side_, term_, and out_. Commands require complete IDs;
-prefix matching is unsupported.
+Agent IDs are `agt_` plus an uppercase canonical ULID. Event, message, side, terminal,
+and output IDs use `evt_`, `msg_`, `side_`, `term_`, and `out_`. Agents, Sides,
+Messages, and Events also receive installation-local `a_N`, `s_N`, `m_N`, and `e_N`
+references. Each type has its own persistent monotonic counter. References survive
+restart and lifecycle changes and are never reused after deletion; gaps are valid.
+
+Local CLI commands accept a short reference or full ULID. Agent arguments also accept
+an exact name when it resolves uniquely. JSON exposes both forms. Use ULIDs for
+exports, backups, APIs, cross-machine communication, and merged stores; a destination
+import must preserve the ULID and allocate a new local reference.
 
 ### Deadline minutes
 
@@ -98,8 +106,7 @@ message-file is read by the CLI before IPC; message-file - reads stdin.
 
 NAME is mandatory. The daemon trims both ends, then requires 4 through 40 Unicode
 scalar values and rejects control characters. Names are case-sensitive and unique
-across all stored Agents. A name is a display aid only; every command uses the stable
-Agent ID. Deleting an Agent releases its name.
+across all stored Agents. Deleting an Agent releases its name.
 
 ## 3. Core objects and lifecycle
 
@@ -109,6 +116,8 @@ Agent timestamps:
 
 - spawned_at never changes.
 - last_message_at begins at spawned_at and changes when send is durably accepted.
+- last_message_sent_at has the same acceptance meaning; last_message_delivered_at
+  changes only when the worker consumes a Message.
 - updated_at changes for consumed user messages, reasoning/assistant/tool Events,
   deadline changes, and lifecycle/error Events. Queue acceptance alone does not change
   it.
@@ -172,7 +181,9 @@ surface.
 ### daemon status
 
 With a daemon, emits one daemon object. Without one, daemon_unavailable is a normal
-local Error; there is no stopped object.
+local Error; there is no stopped object. The object includes binary version and
+protocol_version. Except status and stop, a CLI first checks protocol compatibility
+and returns protocol_mismatch instead of sending a request to an older daemon.
 
 ### daemon stop
 
@@ -189,7 +200,7 @@ directory fails before IPC.
 
 Mode defaults readonly. Omitted wall time has no deadline. Name is required as
 specified above. Optional `--model` must be nonempty after trimming and overrides the
-daemon default for this Agent. max-agents defaults to 4; zero explicitly selects
+daemon default for this Agent. max-agents defaults to 8; zero explicitly selects
 unlimited capacity. Otherwise spawn rejects at working capacity and does not create an
 Agent. Success saves metadata/context/Events, registers the worker, and returns one
 working Agent without waiting for a model call.
@@ -211,13 +222,24 @@ Null finished_at sorts first ascending and last descending.
 
 Default limit 100 and offset 0. Offset pagination is not snapshot-isolated and can
 skip/duplicate under concurrent updates. Output is one compact agent_list_item per
-line with exactly type, id, name, status, dir, mode, spawned_at, last_message_at,
-updated_at, run_number, and working_sides. working_sides is the persisted count of
-working Side runs for that parent and is always zero through two.
+line followed by list_summary. Compact items include type, id, ref, name, status, dir,
+mode, model, spawned_at, last_message_at, updated_at, current_phase, last_event_at,
+run_number, and working_sides. `--verbose` emits full Agent telemetry plus
+working_sides and seconds_since_last_event.
 
 ### agents status
 
-Emits one full Agent or agent_not_found.
+Emits one full Agent or agent_not_found. Telemetry separates current_phase,
+phase_started_at, request_started_at, last_provider_activity_at, provider_request_id,
+retry_count, last_event_at, last_model_event_at, last_tool_event_at, and
+last_state_change_at. Phases are starting, processing_messages, requesting_model,
+retrying_model, executing_tool, waiting_terminal, finished, stopped, and failed.
+
+### agents wait
+
+`agents wait AGENT [--timeout-seconds 1..86400]` waits for that Agent to become
+terminal and returns its full Agent. A timeout returns retryable `timeout`; it never
+stops the Agent.
 
 ### agents rename
 
@@ -259,19 +281,23 @@ never changes workspace/Git files or escaped processes.
 
 ### config
 
-Keys are base-url, model, max-agents, context-token-budget, and
-tool-output-preview-bytes. base-url/model must be nonempty. The two budgets must be
-positive. max-agents may be zero for unlimited.
+Keys are base-url, model, max-agents, context-token-budget,
+tool-output-preview-bytes, and stall-notification-seconds. base-url/model must be
+nonempty. The two budgets must be positive. max-agents may be zero for unlimited;
+stall-notification-seconds is 0 through 86400 and zero disables diagnostics.
 
 Compiled defaults are base-url https://api.openai.com/v1, model gpt-5.4-mini,
-max-agents 4, context-token-budget 64000, and tool-output-preview-bytes 16384.
+max-agents 8, context-token-budget 64000, tool-output-preview-bytes 16384, and
+stall-notification-seconds 180.
 
 Precedence is compiled defaults, persisted TOML, then OPENAI_BASE_URL, OPENAI_MODEL,
-and SUBAGENT_MAX_AGENTS. list/get load the caller's current environment. set loads
+SUBAGENT_MAX_AGENTS, and SUBAGENT_STALL_NOTIFICATION_SECONDS. list/get emit one
+config_value per key, separating default, persisted, caller-local effective, and
+running-daemon active values and sources. restart_required is null without a daemon
+and otherwise reports a mismatch. set loads
 persisted values, changes one key, and atomically rewrites the complete file; an
 environment override can mask it. Concurrent config set calls are atomic individually
-but not transactionally merged, so last writer wins. Every set output includes the
-stable note string to restart the daemon.
+but not transactionally merged, so last writer wins.
 
 The daemon captures config and API key at startup. Existing Agents keep their stored
 model. Resumed and side runs use the running daemon's API key with the stored model.
@@ -292,7 +318,7 @@ does not delete its existing Notifications.
 ## 5. Notifications
 
 ~~~json
-{"type":"notification","id":"ntf_...","sequence":42,"agent_id":"agt_...","agent_name":"Website","side_id":null,"timestamp":"RFC3339","event_type":"milestone","priority":2,"status":"working","summary":"Homepage complete"}
+{"type":"notification","id":"ntf_...","sequence":42,"agent_id":"agt_...","agent_ref":"a_1","agent_name":"Website","side_id":null,"side_ref":null,"timestamp":"RFC3339","event_type":"milestone","priority":2,"status":"working","summary":"Homepage complete"}
 ~~~
 
 IDs are ntf_ plus ULID and sequence is globally increasing; gaps are permitted after
@@ -305,6 +331,11 @@ priority 3, and failed priority 4. A finish summary is the final assistant conte
 or a generic completion string when empty, truncated to 5,000 scalar values. Recovery
 stop Notifications explain daemon interruption.
 
+The watchdog publishes one priority-3 possible_stall notification when a working
+Agent or Side has no phase-appropriate provider, model, tool, or message progress for
+stall-notification-seconds. It deduplicates until progress advances and never performs
+automatic recovery.
+
 The notify tool publishes progress priority 1, milestone priority 2, input_required
 priority 3, or blocked priority 4. Priority 5 is reserved. Notifications are a
 high-signal coordination feed; model messages, reasoning, tool calls, and tool results
@@ -315,7 +346,7 @@ are not copied into it.
 Messages are stored in each Agent directory. Shape:
 
 ~~~json
-{"type":"message","id":"msg_...","agent_id":"agt_...","content":"text","status":"pending|delivered|cancelled","sent_at":"RFC3339","delivered_at":"RFC3339|null","cancelled_at":"RFC3339|null"}
+{"type":"message","id":"msg_...","ref":"m_1","agent_id":"agt_...","agent_ref":"a_1","content":"text","status":"pending|delivered|cancelled","sent_at":"RFC3339","delivered_at":"RFC3339|null","cancelled_at":"RFC3339|null"}
 ~~~
 
 list emits all or OR-filtered status matches in acceptance order. status emits one.
@@ -337,14 +368,16 @@ For a delivered send Event:
 ~~~
 
 The message_sent receipt is an acceptance snapshot and always says queued; polling may
-already show delivered by the time the client receives it.
+already show delivered by the time the client receives it. It includes message_id,
+message_ref, agent_id, agent_ref, agent_resumed, run_number, agent_status, and
+resume_state (`not_needed`, `started`, or `waiting_for_capacity`).
 
 ## 7. Events, logs, and context
 
 Event shape:
 
 ~~~json
-{"event_id":"evt_...","agent_id":"agt_...","side_id":"side_... (Side Events only)","sequence":1,"timestamp":"RFC3339","type":"system_message|user_message|assistant_message|reasoning|tool_call|tool_result|lifecycle|error","data":{}}
+{"event_id":"evt_...","ref":"e_1","agent_id":"agt_...","agent_ref":"a_1","side_id":"side_... (Side Events only)","side_ref":"s_1 (Side Events only)","sequence":1,"timestamp":"RFC3339","type":"system_message|user_message|assistant_message|reasoning|tool_call|tool_result|lifecycle|error","data":{}}
 ~~~
 
 Data variants:
@@ -383,7 +416,7 @@ incomplete trailing tool turn, compacts to the daemon budget, adds the Side
 system/question messages, durably creates a working Side, and immediately emits:
 
 ~~~json
-{"type":"side_created","id":"side_...","agent_id":"agt_...","status":"working","created_at":"RFC3339"}
+{"type":"side_created","id":"side_...","ref":"s_1","agent_id":"agt_...","agent_ref":"a_1","status":"working","created_at":"RFC3339"}
 ~~~
 
 agents side and agents btw are exact creation aliases. Side is one-shot: it accepts no
@@ -395,7 +428,7 @@ Optional `--model` overrides the parent model for that Side only. Without it, th
 inherits the parent model. The selected value is stored in Side metadata.
 
 `sides list AGENT_ID` supports repeatable OR status filters plus limit/offset and emits
-newest-first side_list_item JSONL. question_preview is the first 200 Unicode scalar
+newest-first side_list_item JSONL followed by list_summary. question_preview is the first 200 Unicode scalar
 values. `sides status SIDE_ID` emits complete Side metadata including full question,
 nullable answer, lifecycle timestamps, inherited_context_messages, tool_calls,
 stop_reason, and last_error.

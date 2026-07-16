@@ -1,9 +1,18 @@
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
-use std::{env, fs, path::PathBuf};
+use serde_json::Value;
+use std::{collections::BTreeMap, env, fs, path::PathBuf};
 
 pub const DEFAULT_BASE_URL: &str = "https://api.openai.com/v1";
 pub const DEFAULT_MODEL: &str = "gpt-5.4-mini";
+pub const CONFIG_KEYS: [&str; 6] = [
+    "base-url",
+    "model",
+    "max-agents",
+    "context-token-budget",
+    "tool-output-preview-bytes",
+    "stall-notification-seconds",
+];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -13,6 +22,7 @@ pub struct FileConfig {
     pub max_agents: usize,
     pub context_token_budget: usize,
     pub tool_output_preview_bytes: usize,
+    pub stall_notification_seconds: u64,
 }
 
 impl Default for FileConfig {
@@ -20,9 +30,10 @@ impl Default for FileConfig {
         Self {
             base_url: DEFAULT_BASE_URL.into(),
             model: DEFAULT_MODEL.into(),
-            max_agents: 4,
+            max_agents: 8,
             context_token_budget: 64_000,
             tool_output_preview_bytes: 16 * 1024,
+            stall_notification_seconds: 180,
         }
     }
 }
@@ -30,6 +41,7 @@ impl Default for FileConfig {
 #[derive(Clone)]
 pub struct RuntimeConfig {
     pub file: FileConfig,
+    pub sources: BTreeMap<String, String>,
     pub api_key: String,
     pub web_password: Option<String>,
     pub paths: Paths,
@@ -99,21 +111,48 @@ impl FileConfig {
         Ok(cfg)
     }
 
-    pub fn load(paths: &Paths) -> Result<Self> {
+    pub fn load_with_sources(paths: &Paths) -> Result<(Self, BTreeMap<String, String>)> {
         let mut cfg = Self::load_persisted(paths)?;
+        let persisted = persisted_key_values(paths)?;
+        let mut sources = CONFIG_KEYS
+            .iter()
+            .map(|key| {
+                (
+                    (*key).to_string(),
+                    if persisted.contains_key(*key) {
+                        "persisted"
+                    } else {
+                        "default"
+                    }
+                    .to_string(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
         if let Ok(v) = env::var("OPENAI_BASE_URL") {
             cfg.base_url = v;
+            sources.insert("base-url".into(), "OPENAI_BASE_URL".into());
         }
         if let Ok(v) = env::var("OPENAI_MODEL") {
             cfg.model = v;
+            sources.insert("model".into(), "OPENAI_MODEL".into());
         }
         if let Ok(v) = env::var("SUBAGENT_MAX_AGENTS") {
             cfg.max_agents = v
                 .parse()
                 .context("SUBAGENT_MAX_AGENTS must be a non-negative integer")?;
+            sources.insert("max-agents".into(), "SUBAGENT_MAX_AGENTS".into());
+        }
+        if let Ok(v) = env::var("SUBAGENT_STALL_NOTIFICATION_SECONDS") {
+            cfg.stall_notification_seconds = v.parse().context(
+                "SUBAGENT_STALL_NOTIFICATION_SECONDS must be an integer from 0 through 86400",
+            )?;
+            sources.insert(
+                "stall-notification-seconds".into(),
+                "SUBAGENT_STALL_NOTIFICATION_SECONDS".into(),
+            );
         }
         cfg.validate()?;
-        Ok(cfg)
+        Ok((cfg, sources))
     }
 
     pub fn save(&self, paths: &Paths) -> Result<()> {
@@ -129,6 +168,7 @@ impl FileConfig {
             "max-agents" => self.max_agents.into(),
             "context-token-budget" => self.context_token_budget.into(),
             "tool-output-preview-bytes" => self.tool_output_preview_bytes.into(),
+            "stall-notification-seconds" => self.stall_notification_seconds.into(),
             _ => bail!("unknown config key: {key}"),
         })
     }
@@ -168,6 +208,14 @@ impl FileConfig {
                     bail!("tool-output-preview-bytes must be a positive integer")
                 }
             }
+            "stall-notification-seconds" => {
+                self.stall_notification_seconds = value.parse().context(
+                    "stall-notification-seconds must be an integer from 0 through 86400",
+                )?;
+                if self.stall_notification_seconds > 86_400 {
+                    bail!("stall-notification-seconds must be from 0 through 86400")
+                }
+            }
             _ => bail!("unknown config key: {key}"),
         }
         Ok(())
@@ -186,6 +234,9 @@ impl FileConfig {
         if self.tool_output_preview_bytes == 0 {
             bail!("tool-output-preview-bytes must be a positive integer")
         }
+        if self.stall_notification_seconds > 86_400 {
+            bail!("stall-notification-seconds must be from 0 through 86400")
+        }
         Ok(())
     }
 }
@@ -193,7 +244,7 @@ impl FileConfig {
 impl RuntimeConfig {
     pub fn load() -> Result<Self> {
         let paths = Paths::discover()?;
-        let file = FileConfig::load(&paths)?;
+        let (file, sources) = FileConfig::load_with_sources(&paths)?;
         let api_key =
             env::var("OPENAI_API_KEY").context("OPENAI_API_KEY is required to start the daemon")?;
         if api_key.trim().is_empty() {
@@ -207,11 +258,53 @@ impl RuntimeConfig {
         };
         Ok(Self {
             file,
+            sources,
             api_key,
             web_password,
             paths,
         })
     }
+}
+
+pub fn persisted_key_values(paths: &Paths) -> Result<BTreeMap<String, Value>> {
+    let path = paths.config_file();
+    if !path.exists() {
+        return Ok(BTreeMap::new());
+    }
+    let value: toml::Value = toml::from_str(&fs::read_to_string(&path)?)?;
+    let Some(table) = value.as_table() else {
+        return Ok(BTreeMap::new());
+    };
+    let mut values = BTreeMap::new();
+    for key in CONFIG_KEYS {
+        let stored = key.replace('-', "_");
+        if let Some(value) = table.get(&stored) {
+            values.insert(key.into(), serde_json::to_value(value)?);
+        }
+    }
+    Ok(values)
+}
+
+pub fn local_config_values(paths: &Paths) -> Result<Vec<Value>> {
+    let defaults = FileConfig::default();
+    let persisted = persisted_key_values(paths)?;
+    let (effective, sources) = FileConfig::load_with_sources(paths)?;
+    CONFIG_KEYS
+        .iter()
+        .map(|key| {
+            Ok(serde_json::json!({
+                "type":"config_value",
+                "key":key,
+                "default_value":defaults.get(key)?,
+                "persisted_value":persisted.get(*key).cloned(),
+                "local_effective_value":effective.get(key)?,
+                "local_source":sources.get(*key),
+                "active_value":Value::Null,
+                "active_source":Value::Null,
+                "restart_required":Value::Null,
+            }))
+        })
+        .collect()
 }
 
 #[cfg(unix)]
@@ -254,11 +347,13 @@ mod tests {
     #[test]
     fn strict_config_rejects_empty_and_zero_values() {
         let mut config = FileConfig::default();
-        assert_eq!(config.max_agents, 4);
+        assert_eq!(config.max_agents, 8);
         assert!(config.set("base-url", "").is_err());
         assert!(config.set("model", " ").is_err());
         assert!(config.set("context-token-budget", "0").is_err());
         assert!(config.set("tool-output-preview-bytes", "0").is_err());
         assert!(config.set("max-agents", "0").is_ok());
+        assert!(config.set("stall-notification-seconds", "0").is_ok());
+        assert!(config.set("stall-notification-seconds", "86401").is_err());
     }
 }

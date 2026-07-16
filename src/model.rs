@@ -32,6 +32,14 @@ pub struct ModelTurn {
     pub usage: Option<Value>,
 }
 
+#[derive(Debug, Clone)]
+pub enum ModelProgress {
+    AttemptStarted { retry_count: u32 },
+    ResponseStarted { provider_request_id: Option<String> },
+    ProviderActivity,
+    RetryScheduled { retry_count: u32 },
+}
+
 #[derive(Clone)]
 pub struct OpenAiClient {
     client: Client,
@@ -53,7 +61,12 @@ impl OpenAiClient {
         })
     }
 
-    pub async fn complete(&self, messages: &[Value], tools: &[Value]) -> Result<ModelTurn> {
+    pub async fn complete_observed(
+        &self,
+        messages: &[Value],
+        tools: &[Value],
+        mut progress: impl FnMut(ModelProgress) -> Result<()>,
+    ) -> Result<ModelTurn> {
         let body = json!({
             "model": self.model,
             "messages": messages,
@@ -63,7 +76,10 @@ impl OpenAiClient {
         });
         let mut last_error = None;
         for attempt in 0..MAX_ATTEMPTS {
-            match self.complete_once(&body).await {
+            progress(ModelProgress::AttemptStarted {
+                retry_count: attempt,
+            })?;
+            match self.complete_once(&body, &mut progress).await {
                 Ok(turn) => return Ok(turn),
                 Err(e) => {
                     let delay = retry_delay(&e, attempt);
@@ -71,14 +87,22 @@ impl OpenAiClient {
                     if attempt + 1 >= MAX_ATTEMPTS || delay.is_none() {
                         break;
                     }
-                    tokio::time::sleep(delay.unwrap()).await;
+                    let delay = delay.unwrap();
+                    progress(ModelProgress::RetryScheduled {
+                        retry_count: attempt + 1,
+                    })?;
+                    tokio::time::sleep(delay).await;
                 }
             }
         }
         Err(last_error.unwrap())
     }
 
-    async fn complete_once(&self, body: &Value) -> Result<ModelTurn> {
+    async fn complete_once(
+        &self,
+        body: &Value,
+        progress: &mut impl FnMut(ModelProgress) -> Result<()>,
+    ) -> Result<ModelTurn> {
         let url = format!("{}/chat/completions", self.base_url);
         let response = self
             .client
@@ -112,6 +136,20 @@ impl OpenAiClient {
             ));
         }
 
+        let provider_request_id = ["x-request-id", "request-id", "openai-request-id"]
+            .into_iter()
+            .find_map(|name| {
+                response
+                    .headers()
+                    .get(name)
+                    .and_then(|value| value.to_str().ok())
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_owned)
+            });
+        progress(ModelProgress::ResponseStarted {
+            provider_request_id,
+        })?;
+
         let content_type = response
             .headers()
             .get(reqwest::header::CONTENT_TYPE)
@@ -119,6 +157,7 @@ impl OpenAiClient {
             .unwrap_or("")
             .to_string();
         if !content_type.contains("text/event-stream") {
+            progress(ModelProgress::ProviderActivity)?;
             let value: Value = response.json().await.context("decode OpenAI response")?;
             return parse_non_streaming(&value);
         }
@@ -149,6 +188,7 @@ impl OpenAiClient {
                     true,
                 )
             })?;
+            progress(ModelProgress::ProviderActivity)?;
             buffer.push_str(&String::from_utf8_lossy(&chunk));
             while let Some(pos) = buffer.find('\n') {
                 let line = buffer[..pos].trim_end_matches('\r').to_string();

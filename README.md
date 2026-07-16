@@ -49,7 +49,7 @@ subagent daemon start
 The defaults are `https://api.openai.com/v1` and `gpt-5.4-mini`. Any compatible
 Chat Completions endpoint can be selected with `OPENAI_BASE_URL` and `OPENAI_MODEL`.
 
-Spawn independent work and keep the returned ID:
+Spawn independent work and keep the returned short reference:
 
 ```sh
 subagent agents spawn \
@@ -60,7 +60,7 @@ subagent agents spawn \
 ```
 
 ```json
-{"type":"agent","id":"agt_01...","status":"working"}
+{"type":"agent","id":"agt_01...","ref":"a_1","status":"working"}
 ```
 
 Coordinate several workers without importing their raw transcripts:
@@ -68,8 +68,8 @@ Coordinate several workers without importing their raw transcripts:
 ```sh
 subagent agents list --status working
 subagent inbox --priority 2
-subagent agents logs agt_01...
-subagent agents send agt_01... --message "Also check token refresh behavior."
+subagent agents logs a_1
+subagent agents send a_1 --message "Also check token refresh behavior."
 ```
 
 `send` durably queues the message and returns immediately. A finished, stopped, or
@@ -90,7 +90,7 @@ calling agent -> subagent CLI -> Unix socket -> daemon -> model + tools
 ```
 
 Finished agents leave memory and can be resumed later. Interrupted agents are
-reconciled on restart, and pending messages survive daemon failure. Four main agents
+reconciled on restart, and pending messages survive daemon failure. Eight main agents
 may work concurrently by default; configure another limit with `max-agents` or
 `SUBAGENT_MAX_AGENTS` (`0` explicitly means unlimited).
 
@@ -115,8 +115,11 @@ JSONL shapes.
 
 ## Agents, Side runs, and tools
 
-Main agents have stable `agt_<ULID>` IDs and unique 4–40 character display names.
-Names make lists readable; commands still use IDs. Each agent can select a model and
+Main agents have globally stable `agt_<ULID>` IDs, short installation-local `a_1`
+references, and unique 4–40 character display names. Commands accept short refs, full
+ULIDs, or exact Agent names. Side runs, messages, and Events similarly expose `s_`,
+`m_`, and `e_` refs. Local refs are persistent, monotonic per type, and never reused;
+use ULIDs for exports and cross-installation data. Each agent can select a model and
 work in `readonly` or `write` mode.
 
 Side runs are durable one-shot questions over a snapshot of a parent's context. They
@@ -152,7 +155,8 @@ Environment variables override persisted configuration:
 | `OPENAI_API_KEY` | Required daemon credential; never persisted |
 | `OPENAI_BASE_URL` | Chat Completions base URL |
 | `OPENAI_MODEL` | Default model |
-| `SUBAGENT_MAX_AGENTS` | Concurrent main-agent limit; default `4` |
+| `SUBAGENT_MAX_AGENTS` | Concurrent main-agent limit; default `8` |
+| `SUBAGENT_STALL_NOTIFICATION_SECONDS` | Possible-stall threshold; default `180`, `0` disables |
 | `SUBAGENT_WEB_PASSWORD` | Optional localhost Web UI password |
 
 Persist non-secret settings with `subagent config set`. Restart the daemon after a

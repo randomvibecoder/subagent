@@ -201,8 +201,15 @@ impl ToolRuntime {
             .filter_map(Result::ok)
         {
             let rel = entry.path().strip_prefix(&root).unwrap_or(entry.path());
+            if rel.as_os_str().is_empty() {
+                continue;
+            }
             if set.is_match(rel) {
-                paths.push(rel.to_string_lossy().into_owned());
+                let path = rel.to_string_lossy().into_owned();
+                if path.is_empty() {
+                    continue;
+                }
+                paths.push(path);
                 if paths.len() >= limit {
                     break;
                 }
@@ -894,6 +901,18 @@ mod tests {
         for name in ["write", "edit", "apply_patch"] {
             assert!(names.contains(&name.to_string()));
         }
+    }
+
+    #[tokio::test]
+    async fn glob_of_empty_directory_returns_no_empty_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = runtime(&temp);
+        fs::create_dir(temp.path().join("empty")).unwrap();
+        let result = runtime
+            .execute_inner("glob", r#"{"path":"empty","pattern":"*"}"#)
+            .await
+            .unwrap();
+        assert_eq!(result.content["paths"], json!([]));
     }
 
     #[tokio::test]

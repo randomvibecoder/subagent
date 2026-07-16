@@ -2,7 +2,9 @@
   "use strict";
   var UI = window.SubagentUI,
     selected = null,
+    selectedRef = null,
     selectedSide = null,
+    selectedSideRef = null,
     agentCache = new Map(),
     timelineController = null,
     inboxOffset = 0;
@@ -202,14 +204,20 @@
       UI.escapeHtml(agent.dir) +
       '</div><div class="meta">' +
       UI.escapeHtml(agent.mode) +
+      " · " +
+      UI.escapeHtml(agent.ref) +
       " · run " +
       agent.run_number +
+      " · " +
+      UI.escapeHtml(agent.model) +
       " · " +
       agent.working_sides +
       " working side" +
       (agent.working_sides === 1 ? "" : "s") +
-      '</div></div><div class="meta">Last message<br>' +
-      UI.escapeHtml(UI.humanTime(agent.last_message_at)) +
+      '</div></div><div class="meta">' +
+      UI.escapeHtml(agent.current_phase || agent.status) +
+      '<br>progress ' +
+      UI.escapeHtml(UI.humanTime(agent.last_event_at || agent.updated_at)) +
       "</div></article>"
     );
   }
@@ -248,6 +256,7 @@
         item = agentCache.get(id),
         name = item ? item.name : id;
       if (selected !== id) return;
+      selectedRef = metadata.ref;
       $("#dashboard-page").classList.add("hidden");
       $("#side-page").classList.add("hidden");
       $("#agent-page").classList.remove("hidden");
@@ -256,7 +265,7 @@
       $("#crumb-name").textContent = name;
       $("#agent-status").textContent = metadata.status;
       $("#agent-status").className = "status " + metadata.status;
-      $("#copy-id").textContent = id;
+      $("#copy-id").textContent = metadata.ref + " · " + id;
       $("#rename-form [name=name]").value = name;
       $("#agent-meta").innerHTML =
         "<span>" +
@@ -266,10 +275,22 @@
         "</span><span>" +
         UI.escapeHtml(metadata.model) +
         "</span><span>" +
+        UI.escapeHtml(metadata.current_phase || metadata.status) +
+        "</span><span>" +
         UI.escapeHtml(metadata.dir) +
         "</span><span>updated " +
         UI.escapeHtml(UI.humanTime(metadata.updated_at)) +
-        "</span>";
+        "</span><span>model event " +
+        UI.escapeHtml(UI.humanTime(metadata.last_model_event_at)) +
+        "</span><span>tool event " +
+        UI.escapeHtml(UI.humanTime(metadata.last_tool_event_at)) +
+        "</span>" +
+        (metadata.provider_request_id
+          ? "<span>request " + UI.escapeHtml(metadata.provider_request_id) + "</span>"
+          : "") +
+        (metadata.retry_count
+          ? "<span>retry " + metadata.retry_count + "</span>"
+          : "");
       $("#stop").disabled = metadata.status !== "working";
       $("#time-form input").disabled = metadata.status !== "working";
       $("#time-form button").disabled = metadata.status !== "working";
@@ -713,7 +734,9 @@
             return (
               '<article class="side-list-item" data-side="' +
               UI.escapeHtml(side.id) +
-              '"><div class="side-question-preview">' +
+              '"><div class="side-question-preview"><span class="meta">' +
+              UI.escapeHtml(side.ref) +
+              "</span> " +
               UI.escapeHtml(side.question_preview) +
               '</div><div><span class="status ' +
               UI.escapeHtml(side.status) +
@@ -738,6 +761,7 @@
     var side = await api("/api/sides/" + encodeURIComponent(sideId));
     selected = side.agent_id;
     selectedSide = sideId;
+    selectedSideRef = side.ref;
     if (!agentCache.has(selected)) await loadAgents();
     var parent = agentCache.get(selected);
     $("#dashboard-page").classList.add("hidden");
@@ -748,16 +772,23 @@
       "Side · " + (parent ? parent.name : "Agent");
     $("#side-page-status").textContent = side.status;
     $("#side-page-status").className = "status " + side.status;
-    $("#copy-side-id").textContent = side.id;
+    $("#copy-side-id").textContent = side.ref + " · " + side.id;
     $("#side-back-parent").textContent = parent ? parent.name : "Parent";
     $("#side-page-meta").innerHTML =
       "<span>readonly mode</span><span>" +
       side.tool_calls +
       " tool calls</span><span>" +
       UI.escapeHtml(side.model) +
+      "</span><span>" +
+      UI.escapeHtml(side.current_phase || side.status) +
       "</span><span>created " +
       UI.escapeHtml(UI.humanTime(side.created_at)) +
-      "</span>";
+      "</span><span>progress " +
+      UI.escapeHtml(UI.humanTime(side.last_event_at || side.updated_at)) +
+      "</span>" +
+      (side.provider_request_id
+        ? "<span>request " + UI.escapeHtml(side.provider_request_id) + "</span>"
+        : "");
     showSideTab(tab, side);
   }
   function showSideTab(tab, side) {
@@ -921,12 +952,12 @@
     route(["agents", encodeURIComponent(selected), "side"]);
   };
   $("#copy-id").onclick = function () {
-    navigator.clipboard.writeText(selected);
-    notice("Agent ID copied");
+    navigator.clipboard.writeText(selectedRef || selected);
+    notice("Agent reference copied");
   };
   $("#copy-side-id").onclick = function () {
-    navigator.clipboard.writeText(selectedSide);
-    notice("Side ID copied");
+    navigator.clipboard.writeText(selectedSideRef || selectedSide);
+    notice("Side reference copied");
   };
   $("#stop-side").onclick = async function () {
     try {

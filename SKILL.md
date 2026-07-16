@@ -80,10 +80,10 @@ subagent agents spawn \
   --name "Website"
 ~~~
 
-Output is one Agent. Save its stable agt_<ULID> ID:
+Output is one Agent. Prefer its short local `ref`; retain `id` for exports and external integrations:
 
 ~~~json
-{"type":"agent","id":"agt_...","dir":"/home/me/project","status":"working","spawned_at":"2026-07-10T12:00:00Z","last_message_at":"2026-07-10T12:00:00Z","updated_at":"2026-07-10T12:00:00Z"}
+{"type":"agent","id":"agt_...","ref":"a_1","dir":"/home/me/project","status":"working","spawned_at":"2026-07-10T12:00:00Z","last_message_at":"2026-07-10T12:00:00Z","updated_at":"2026-07-10T12:00:00Z"}
 ~~~
 
 The actual Agent contains every field defined in the schema reference.
@@ -94,23 +94,23 @@ List all working agents:
 subagent agents list --status working
 ~~~
 
-Each match is one compact agent_list_item line. Zero matches emits zero lines:
+Each match is one compact agent_list_item line followed by a `list_summary`. Zero matches still emits `{"type":"list_summary","resource":"agents","count":0}`:
 
 ~~~json
-{"type":"agent_list_item","id":"agt_1...","name":"Website","status":"working","dir":"/home/me/project","mode":"readonly","spawned_at":"...","last_message_at":"...","updated_at":"...","run_number":1,"working_sides":0}
-{"type":"agent_list_item","id":"agt_2...","name":"Tests","status":"working","dir":"/home/me/tests","mode":"write","spawned_at":"...","last_message_at":"...","updated_at":"...","run_number":1,"working_sides":1}
+{"type":"agent_list_item","id":"agt_1...","ref":"a_1","name":"Website","status":"working","model":"gpt-5.4-mini","current_phase":"requesting_model","last_event_at":"...","dir":"/home/me/project","mode":"readonly","spawned_at":"...","last_message_at":"...","updated_at":"...","run_number":1,"working_sides":0}
+{"type":"list_summary","resource":"agents","count":1}
 ~~~
 
 Inspect one:
 
 ~~~sh
-subagent agents status agt_...
+subagent agents status a_1
 ~~~
 
 Read its transcript:
 
 ~~~sh
-subagent agents logs agt_...
+subagent agents logs a_1
 ~~~
 
 By default this emits the newest 20 system, user, and assistant Events in chronological
@@ -121,7 +121,7 @@ Prefer the high-signal inbox when coordinating several agents:
 
 ~~~sh
 subagent inbox
-subagent inbox --agent agt_... --priority 3 --limit 50 --offset 0
+subagent inbox --agent a_1 --priority 3 --limit 50 --offset 0
 ~~~
 
 Inbox emits durable Notifications newest-first, one per line. The default is the
@@ -134,32 +134,32 @@ context.
 Send durable follow-up work:
 
 ~~~sh
-subagent agents send agt_... --message "Also add dark mode"
+subagent agents send a_1 --message "Also add dark mode"
 ~~~
 
 The daemon stores the message before returning:
 
 ~~~json
-{"type":"message_sent","message_id":"msg_...","agent_id":"agt_...","status":"queued","sent_at":"2026-07-10T12:05:00Z"}
+{"type":"message_sent","message_id":"msg_...","message_ref":"m_1","agent_id":"agt_...","agent_ref":"a_1","status":"queued","agent_resumed":false,"run_number":1,"agent_status":"working","resume_state":"not_needed","sent_at":"2026-07-10T12:05:00Z"}
 ~~~
 
 Sent means durably accepted, not yet consumed by the model. Poll it:
 
 ~~~sh
-subagent messages status agt_... msg_...
+subagent messages status a_1 m_1
 ~~~
 
 ~~~json
-{"type":"message","id":"msg_...","agent_id":"agt_...","content":"Also add dark mode","status":"delivered","sent_at":"...","delivered_at":"...","cancelled_at":null}
+{"type":"message","id":"msg_...","ref":"m_1","agent_id":"agt_...","agent_ref":"a_1","content":"Also add dark mode","status":"delivered","sent_at":"...","delivered_at":"...","cancelled_at":null}
 ~~~
 
 Start one durable readonly Side question:
 
 ~~~sh
-subagent sides create agt_... --message "Which framework is it using?"
+subagent sides create a_1 --message "Which framework is it using?"
 ~~~
 
-Output is a side_created receipt with a stable side_<ULID>. It returns immediately.
+Output is a side_created receipt with a stable `side_<ULID>` and local `s_` reference. It returns immediately.
 Inspect the saved answer and tool trace with sides status and sides logs. agents side
 and agents btw are creation aliases.
 
@@ -188,9 +188,10 @@ subagent agents list
     [--spawned-after RFC3339] [--spawned-before RFC3339]
     [--finished-after RFC3339] [--finished-before RFC3339]
     [--sort spawned_at|updated_at|finished_at]
-    [--order asc|desc] [--limit N] [--offset N]
+    [--order asc|desc] [--limit N] [--offset N] [--verbose]
 
 subagent agents status AGENT_ID
+subagent agents wait AGENT_ID [--timeout-seconds SECONDS]
 subagent agents rename AGENT_ID NEW_NAME
 
 subagent agents logs AGENT_ID
@@ -216,10 +217,12 @@ paths, .., and escaping symlinks are permitted because DIR is a working director
 a security boundary.
 
 NAME is mandatory, trimmed, 4–40 Unicode scalar values, control-free, case-sensitive,
-and unique across all stored agents. It is only a human label in list output; all
-commands still require ID. Rename works in every state and returns one agent_renamed
+and unique across all stored agents. Commands accept the short local reference, full
+ULID, or an exact unambiguous Agent name. Rename works in every state and returns one agent_renamed
 receipt. MINUTES is an integer from 1 through 6000; omission means no deadline.
 Each agent_list_item also contains working_sides, from zero through two.
+Compact list output includes model, current_phase, and last_event_at. `--verbose`
+emits the full Agent telemetry plus working_sides and seconds_since_last_event.
 MODEL overrides the daemon default only for the new Agent and remains attached across
 resumed runs. Omit it to use the daemon default.
 
@@ -248,9 +251,16 @@ Sides and removes all its Side histories. Side never appends to parent context.
 Agent timestamps:
 
 - spawned_at: creation time.
-- last_message_at: latest daemon acceptance of a user message; initially spawn time.
+- last_message_at and last_message_sent_at: latest daemon acceptance of a user message.
+- last_message_delivered_at: latest message actually consumed by the model loop.
 - updated_at: latest consumed message, model/tool activity, deadline change, or state
 transition.
+
+Working status includes `current_phase`, request/model/tool activity timestamps,
+`provider_request_id`, and `retry_count`. A daemon watchdog emits one deduplicated
+`possible_stall` notification after 180 seconds without progress by default. Configure
+`stall-notification-seconds`; zero disables it. The watchdog diagnoses but never stops
+or resumes work.
 
 Omitted Side MODEL inherits the parent Agent model; an override applies only to the
 new Side.
@@ -323,7 +333,7 @@ subagent messages status AGENT_ID MESSAGE_ID
 subagent messages cancel AGENT_ID MESSAGE_ID
 ~~~
 
-List emits one Message per line. Cancel works only while pending. Delivery is FIFO.
+List emits one Message per line followed by `list_summary`. Cancel works only while pending. Delivery is FIFO.
 Pending messages survive daemon failure. On restart, interrupted agents with pending
 messages automatically resume as capacity becomes available. A delivered user_message
 Event contains its message_id.
@@ -336,13 +346,16 @@ subagent config get KEY
 subagent config set KEY VALUE
 ~~~
 
-Keys: base-url, model, max-agents, context-token-budget, and
-tool-output-preview-bytes. Base URL/model must be nonempty; context and preview budgets
-must be positive. max-agents defaults to 4; set it to 0 only when unlimited
+Keys: base-url, model, max-agents, context-token-budget,
+tool-output-preview-bytes, and stall-notification-seconds. Base URL/model must be
+nonempty; context and preview budgets must be positive. max-agents defaults to 8; set it to 0 only when unlimited
 concurrency is intentional. Restart the daemon after setting.
 
 Precedence is compiled defaults, persisted config, then environment overrides.
-List/get show effective values; set changes persisted values without copying overrides.
+List emits one `config_value` per key; get emits one. Each record separates default,
+persisted, caller-local effective, and running-daemon active values and their sources.
+`restart_required` reports whether the active daemon differs. Set changes persisted
+values without copying overrides.
 
 ## Modes and safety
 
@@ -369,5 +382,7 @@ reverts the working directory, project files, Git state, commits, or branches.
 - End active work: agents stop.
 - Remove daemon history: agents delete only with explicit authorization.
 
-The latest binary, this skill, the protocol reference, and the JSON Schema form one
-contract. Backward compatibility with older releases is not promised.
+The binary reports `version` and `protocol_version` in daemon status. Operational CLI
+commands reject an incompatible running daemon with `protocol_mismatch`; restart the
+daemon after replacing the binary. The latest binary, this skill, the protocol
+reference, and the JSON Schema form one contract.
