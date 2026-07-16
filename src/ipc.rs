@@ -11,6 +11,7 @@ pub enum Request {
         message: String,
         name: String,
         mode: AgentMode,
+        model: Option<String>,
         wall_time_minutes: Option<u64>,
     },
     AgentList {
@@ -42,7 +43,14 @@ pub enum Request {
     AgentSide {
         id: String,
         message: String,
+        model: Option<String>,
         wall_time_minutes: Option<u64>,
+    },
+    Inbox {
+        limit: usize,
+        offset: usize,
+        minimum_priority: u8,
+        agent_id: Option<String>,
     },
     SideList {
         agent_id: String,

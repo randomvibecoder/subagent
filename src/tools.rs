@@ -88,6 +88,7 @@ impl ToolRuntime {
             }
             "view_image" => self.view_image(&args),
             "read_output" => self.read_output(&args),
+            "notify" => self.notify(&args),
             _ => bail!("unknown tool: {name}"),
         }
     }
@@ -97,6 +98,42 @@ impl ToolRuntime {
             bail!("tool is unavailable in readonly mode");
         }
         Ok(())
+    }
+
+    fn notify(&self, args: &Value) -> Result<ToolResult> {
+        let event_type = required_str(args, "event_type")?;
+        let priority = match event_type {
+            "progress" => 1,
+            "milestone" => 2,
+            "input_required" => 3,
+            "blocked" => 4,
+            _ => bail!("event_type must be progress, milestone, input_required, or blocked"),
+        };
+        let summary = required_str(args, "summary")?.trim();
+        if summary.is_empty() {
+            bail!("summary must not be empty");
+        }
+        if summary.chars().count() > 5_000 {
+            bail!("summary must contain at most 5000 characters");
+        }
+        let status = if self.agent_id.starts_with("side_") {
+            self.store.load_side_metadata(&self.agent_id)?.status
+        } else {
+            self.store.load_metadata(&self.agent_id)?.status
+        };
+        let notification = self.store.append_notification(
+            &self.agent_id,
+            event_type,
+            priority,
+            status,
+            summary,
+        )?;
+        Ok(ToolResult::plain(json!({
+            "ok":true,
+            "notification_id":notification.id,
+            "priority":notification.priority,
+            "event_type":notification.event_type
+        })))
     }
 
     fn path(&self, args: &Value) -> Result<PathBuf> {
@@ -421,6 +458,7 @@ impl TerminalManager {
             .arg(&command)
             .current_dir(&cwd)
             .env_remove("OPENAI_API_KEY")
+            .env_remove("SUBAGENT_WEB_PASSWORD")
             .stdin(Stdio::piped())
             .stdout(Stdio::from(stdout_file))
             .stderr(Stdio::from(stderr_file));
@@ -765,6 +803,11 @@ pub fn tool_definitions(mode: AgentMode) -> Vec<Value> {
             "read_output",
             "Read a bounded byte range from stored command output.",
             json!({"type":"object","properties":{"output_ref":{"type":"string"},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":65536}},"required":["output_ref"],"additionalProperties":false}),
+        ),
+        tool(
+            "notify",
+            "Publish a concise progress, milestone, input-required, or blocked update to the master's durable inbox.",
+            json!({"type":"object","properties":{"event_type":{"type":"string","enum":["progress","milestone","input_required","blocked"]},"summary":{"type":"string","minLength":1,"maxLength":5000}},"required":["event_type","summary"],"additionalProperties":false}),
         ),
     ];
     if mode == AgentMode::Write {

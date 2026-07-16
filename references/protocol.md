@@ -9,12 +9,13 @@ release binary, SKILL.md, this reference, and cli.schema.json must change togeth
 2. Primitive inputs
 3. Core objects and lifecycle
 4. Commands
-5. Durable messages
-6. Events, logs, and context
-7. Side agents
-8. Model API
-9. Agent tools
-10. Storage and security
+5. Notifications
+6. Durable messages
+7. Events, logs, and context
+8. Side agents
+9. Model API
+10. Agent tools
+11. Storage and security
 
 ## 1. Framing and errors
 
@@ -76,6 +77,7 @@ Integer CLI/config values use unsigned base-10 Rust usize parsing on the support
 x86-64 build. Negative values, fractions, underscores, and overflow are rejected.
 Leading plus and leading zero behavior follows Rust FromStr; do not emit either.
 Log limit is explicitly 1 through 10000. Tool-specific limits are below.
+Inbox limit is 1 through 100 and priority is 1 through 5.
 
 ### RFC3339
 
@@ -115,8 +117,9 @@ Agent timestamps:
 - in a terminal state, only its matching terminal timestamp is non-null.
 - deadline_at is null without a deadline and is cleared at terminal transition.
 
-The model field is selected at spawn and remains attached to that agent across daemon
-configuration changes and resumed runs. Side runs use the parent Agent's model.
+The model field is selected from `--model` or the daemon default at spawn and remains
+attached to that agent across daemon configuration changes and resumed runs. Side
+runs inherit the parent model unless their creation command overrides it.
 
 Transitions:
 
@@ -155,8 +158,12 @@ credentials or make a model request.
 
 `--web-ui-port PORT` optionally starts the embedded human dashboard on
 127.0.0.1 only; PORT is 1 through 65535. Without it, no TCP listener exists. Start and
-status include `web_ui_url`, null when disabled and otherwise a fresh tokenized URL for
-that daemon start. The browser UI is not a public protocol surface.
+status include a plain `web_ui_url`, null when disabled. `web_auth` is null when the UI
+is disabled, `none` when enabled without authentication, and `basic` when
+SUBAGENT_WEB_PASSWORD was set at daemon startup. Basic Auth uses the fixed username
+subagent. An explicitly empty or non-UTF-8 password prevents daemon startup. The
+password is never persisted or returned. The browser UI is not a public protocol
+surface.
 
 ### daemon status
 
@@ -177,7 +184,8 @@ current directory; symlinks resolve. Git is not required. A missing or invalid
 directory fails before IPC.
 
 Mode defaults readonly. Omitted wall time has no deadline. Name is required as
-specified above. max-agents zero is unlimited; otherwise spawn rejects at working capacity and
+specified above. Optional `--model` must be nonempty after trimming and overrides the
+daemon default for this Agent. max-agents zero is unlimited; otherwise spawn rejects at working capacity and
 does not create an Agent. Success saves metadata/context/Events, registers the worker,
 and returns one working Agent without waiting for a model call.
 
@@ -261,7 +269,40 @@ The daemon captures config and API key at startup. Existing Agents keep their st
 model. Resumed and side runs use the running daemon's API key with the stored model.
 Empty API key is rejected. Credentials are not validated until a model request.
 
-## 5. Durable messages
+### inbox
+
+`subagent inbox` reads the durable global notification journal. It emits compact
+Notification JSONL newest-first. Defaults are limit 20, offset zero, and minimum
+priority 2. Limit is 1 through 100. `--priority N` includes N and higher. `--agent`
+matches the main Agent ID and includes that Agent's Side notifications. Unknown Agent
+IDs match no records. Offset applies after priority and Agent filtering.
+
+The visible journal is capped to the newest 10,000 global records. It has no follow,
+wait, read/unread, acknowledgement, or deletion command. Deleting an Agent or Side
+does not delete its existing Notifications.
+
+## 5. Notifications
+
+~~~json
+{"type":"notification","id":"ntf_...","sequence":42,"agent_id":"agt_...","agent_name":"Website","side_id":null,"timestamp":"RFC3339","event_type":"milestone","priority":2,"status":"working","summary":"Homepage complete"}
+~~~
+
+IDs are ntf_ plus ULID and sequence is globally increasing; gaps are permitted after
+an I/O failure. summary is at most 5,000 Unicode scalar values. Side records contain
+the parent Agent ID/name plus a non-null side_id. Agent names are captured at creation
+of each Notification and do not change when the Agent is later renamed.
+
+Automatic mappings are spawned/resumed priority 1, finished priority 2, stopped
+priority 3, and failed priority 4. A finish summary is the final assistant content,
+or a generic completion string when empty, truncated to 5,000 scalar values. Recovery
+stop Notifications explain daemon interruption.
+
+The notify tool publishes progress priority 1, milestone priority 2, input_required
+priority 3, or blocked priority 4. Priority 5 is reserved. Notifications are a
+high-signal coordination feed; model messages, reasoning, tool calls, and tool results
+are not copied into it.
+
+## 6. Durable messages
 
 Messages are stored in each Agent directory. Shape:
 
@@ -290,7 +331,7 @@ For a delivered send Event:
 The message_sent receipt is an acceptance snapshot and always says queued; polling may
 already show delivered by the time the client receives it.
 
-## 6. Events, logs, and context
+## 7. Events, logs, and context
 
 Event shape:
 
@@ -327,7 +368,7 @@ internal delivery markers. Context can already be compacted: older tool payloads
 be replaced by output references and older turns summarized/removed. Events are the
 lifetime journal. Context output can contain large strings and image data URLs.
 
-## 7. Side runs
+## 8. Side runs
 
 `sides create AGENT_ID` copies the parent's current persisted model messages, drops an
 incomplete trailing tool turn, compacts to the daemon budget, adds the Side
@@ -341,6 +382,9 @@ agents side and agents btw are exact creation aliases. Side is one-shot: it acce
 follow-up messages. At most two Side runs may be working for one parent. This limit is
 independent of max-agents; a third creation returns capacity_exceeded and creates
 nothing.
+
+Optional `--model` overrides the parent model for that Side only. Without it, the Side
+inherits the parent model. The selected value is stored in Side metadata.
 
 `sides list AGENT_ID` supports repeatable OR status filters plus limit/offset and emits
 newest-first side_list_item JSONL. question_preview is the first 200 Unicode scalar
@@ -366,7 +410,7 @@ Side Events never enter parent context or Events. Each Side owns its terminal ma
 and cannot see parent terminals. Readonly remains advisory because Bash is
 unrestricted; the prompt forbids mutation but this is not a sandbox.
 
-## 8. Model API
+## 9. Model API
 
 The daemon uses OpenAI Chat Completions. It POSTs to BASE_URL with trailing slashes
 removed plus /chat/completions, Authorization: Bearer API_KEY, Accept:
@@ -383,7 +427,7 @@ JSON object or null. The CLI schema fixes its outer type but deliberately permit
 provider fields. HTTP/network errors become api_error; retryable is true for network,
 429, and 5xx.
 
-## 9. Agent tools
+## 10. Agent tools
 
 DIR is the default, not a boundary. Relative paths join DIR. Absolute paths, .., and
 symlinks may access anywhere permitted to the daemon user.
@@ -439,7 +483,8 @@ sequentially and are not atomic across files; failure can leave earlier changes.
 
 command required. workdir defaults DIR and relative workdir joins DIR. Runs
 /bin/bash -lc COMMAND in a new process group. Bash login semantics may load shell
-startup configuration. It inherits daemon environment except OPENAI_API_KEY. stdin is
+startup configuration. It inherits daemon environment except OPENAI_API_KEY and
+SUBAGENT_WEB_PASSWORD. stdin is
 piped and left open. stdout and stderr append to the same private output file; kernel
 write order determines merged ordering.
 
@@ -494,7 +539,18 @@ mime_guess, not decoder probing. MIME must start image/. The raw data becomes a 
 URL in a model-visible user message after the current tool-call batch. Multiple image
 results append multiple messages in call order.
 
-## 10. Storage and security
+### notify
+
+Available in readonly and write modes, including Sides. Input requires event_type
+`progress|milestone|input_required|blocked` and a nonempty summary of at most 5,000
+Unicode scalar values. The daemon derives priorities 1, 2, 3, and 4 respectively and
+captures the owner's current status. Success returns:
+
+~~~json
+{"ok":true,"notification_id":"ntf_...","priority":2,"event_type":"milestone"}
+~~~
+
+## 11. Storage and security
 
 Config uses XDG_CONFIG_HOME/subagent or HOME/.config/subagent. State uses
 XDG_STATE_HOME/subagent or HOME/.local/state/subagent. Runtime socket/lock use
@@ -503,7 +559,14 @@ XDG_RUNTIME_DIR or state/run. Private directories are mode 0700 and files/socket
 
 Each Agent directory stores metadata.json, context.json, messages.json, events.jsonl,
 and outputs. Metadata/context/messages use private atomic temporary-write plus rename.
-Events append and flush each JSONL line. No retention cleanup exists.
+Events append and flush each JSONL line. Per-owner sequence counters avoid rescanning
+complete Event files on append. Event/log queries scan incrementally and retain only
+their bounded result window in memory.
+
+The global notifications.jsonl journal and notification-sequence counter live in the
+state directory. Queries expose only the latest 10,000 global records. The physical
+journal is compacted in 1,000-entry batches, retaining those latest 10,000, so it may
+temporarily contain up to 10,999 lines.
 
 One daemon is supported per user/runtime directory. IDs survive daemon restarts and
 binary replacement while state remains. The daemon is detached but not installed as a

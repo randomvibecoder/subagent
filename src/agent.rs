@@ -62,6 +62,7 @@ impl AgentManager {
         message: String,
         name: String,
         mode: AgentMode,
+        model: Option<String>,
         wall_time_minutes: Option<u64>,
     ) -> Result<AgentMetadata> {
         let _operation = self.operations.lock().unwrap();
@@ -77,6 +78,7 @@ impl AgentManager {
         })?;
         self.ensure_name_available(&name, None)?;
         let dir = canonical_dir(&dir)?;
+        let model = normalize_model(model.as_deref().unwrap_or(&self.cfg.file.model))?;
         let deadline = deadline_from_minutes(wall_time_minutes)?;
         let now = Utc::now();
         let id = format!("agt_{}", ulid::Ulid::new());
@@ -87,7 +89,7 @@ impl AgentManager {
             dir,
             mode,
             advisory_readonly: mode == AgentMode::Readonly,
-            model: self.cfg.file.model.clone(),
+            model,
             status: AgentStatus::Working,
             spawned_at: now,
             last_message_at: now,
@@ -120,6 +122,8 @@ impl AgentManager {
             "user_message",
             json!({"content":context.messages[1]["content"],"source":"spawn"}),
         )?;
+        self.store
+            .append_notification(&id, "spawned", 1, AgentStatus::Working, "Agent spawned")?;
         self.start_worker(meta.clone(), context)?;
         Ok(meta)
     }
@@ -164,6 +168,13 @@ impl AgentManager {
             id,
             "lifecycle",
             json!({"status":"working","reason":"resumed","run_number":meta.run_number}),
+        )?;
+        self.store.append_notification(
+            id,
+            "resumed",
+            1,
+            AgentStatus::Working,
+            format!("Agent resumed for run {}", meta.run_number),
         )?;
         let context = self.store.load_context(id)?;
         self.start_worker(meta.clone(), context)?;
@@ -386,11 +397,13 @@ impl AgentManager {
         &self,
         id: &str,
         message: String,
+        model: Option<String>,
         wall_time_minutes: Option<u64>,
     ) -> Result<Value> {
         let _operation = self.operations.lock().unwrap();
         validate_message(&message)?;
         let meta = self.store.load_metadata(id)?;
+        let model = normalize_model(model.as_deref().unwrap_or(&meta.model))?;
         let working = self.store.working_side_count(id)?;
         if working >= 2 {
             return Err(coded_error(
@@ -406,7 +419,7 @@ impl AgentManager {
         let inherited_context_messages = context.messages.len();
         context.messages.push(json!({
             "role":"system",
-            "content":"You are a persistent, strictly non-modifying side agent branching from a parent coding-agent conversation. Your only goal is to answer the new side question using the inherited context. If the answer is not already established, inspect files, search with glob or grep, run non-mutating Bash commands such as rg or grep, poll terminals, read stored output, or view images. Do not create, edit, delete, rename, or otherwise modify files, repositories, processes, configuration, or external state. Work independently: your messages and tool activity are recorded in the Side run but are not added to the parent's transcript. Return a focused answer as soon as the question is resolved."
+            "content":"You are a persistent, strictly non-modifying side agent branching from a parent coding-agent conversation. Your only goal is to answer the new side question using the inherited context. If the answer is not already established, inspect files, search with glob or grep, run non-mutating Bash commands such as rg or grep, poll terminals, read stored output, or view images. Do not create, edit, delete, rename, or otherwise modify files, repositories, processes, configuration, or external state. Work independently: your messages and tool activity are recorded in the Side run but are not added to the parent's transcript. Use notify for meaningful progress, milestones, questions requiring input, or blockers; do not notify for every tool call. Return a focused answer as soon as the question is resolved."
         }));
         context
             .messages
@@ -421,7 +434,7 @@ impl AgentManager {
             status: AgentStatus::Working,
             question: message.clone(),
             answer: None,
-            model: meta.model.clone(),
+            model,
             mode: AgentMode::Readonly,
             parent_mode: meta.mode,
             created_at: now,
@@ -441,6 +454,13 @@ impl AgentManager {
             &side_id,
             "user_message",
             json!({"content":message,"source":"create"}),
+        )?;
+        self.store.append_notification(
+            &side_id,
+            "spawned",
+            1,
+            AgentStatus::Working,
+            "Side agent spawned",
         )?;
         let terminals = TerminalManager::default();
         let (stop_tx, stop_rx) = watch::channel(false);
@@ -565,7 +585,7 @@ async fn run_side(
     let client = OpenAiClient::new(
         cfg.api_key.clone(),
         cfg.file.base_url.clone(),
-        parent.model.clone(),
+        side.model.clone(),
     )?;
     let runtime = ToolRuntime {
         agent_id: side.id.clone(),
@@ -622,6 +642,16 @@ async fn run_side(
             side.deadline_at = None;
             store.save_side_metadata(&side)?;
             store.append_side_event(&side.id, "lifecycle", json!({"status":"finished"}))?;
+            store.append_notification(
+                &side.id,
+                "finished",
+                2,
+                AgentStatus::Finished,
+                side.answer
+                    .as_deref()
+                    .filter(|answer| !answer.is_empty())
+                    .unwrap_or("Side agent finished"),
+            )?;
             return Ok(());
         }
         let mut image_messages = Vec::new();
@@ -750,7 +780,7 @@ async fn run_worker(
             }
             store.save_context(&meta.id, &context)?;
             terminals.terminate_all().await;
-            mark_finished(&store, &meta.id)?;
+            mark_finished(&store, &meta.id, &turn.content)?;
             return Ok(());
         }
         let mut image_messages = Vec::new();
@@ -822,7 +852,7 @@ fn system_message(meta: &AgentMetadata) -> Value {
             "You may inspect and modify the workspace. Complete the task, verify the result, and stop only when finished."
         }
     };
-    json!({"role":"system","content":format!("You are a background coding agent managed by the subagent daemon. Working directory: {}. {} Use dedicated file tools before shell equivalents. Long-running commands return terminal IDs; poll them with write_stdin. Keep tool output focused.",meta.dir,mode)})
+    json!({"role":"system","content":format!("You are a background coding agent managed by the subagent daemon. Working directory: {}. {} Use dedicated file tools before shell equivalents. Long-running commands return terminal IDs; poll them with write_stdin. Use notify for meaningful progress, milestones, questions requiring input, or blockers; do not notify for every tool call. Keep tool output focused.",meta.dir,mode)})
 }
 
 fn validate_message(m: &str) -> Result<()> {
@@ -938,7 +968,7 @@ fn estimated_tokens(messages: &[Value]) -> usize {
         .unwrap_or(0)
 }
 
-fn mark_finished(store: &Store, id: &str) -> Result<()> {
+fn mark_finished(store: &Store, id: &str, final_message: &str) -> Result<()> {
     let mut m = store.load_metadata(id)?;
     let now = Utc::now();
     m.status = AgentStatus::Finished;
@@ -947,6 +977,17 @@ fn mark_finished(store: &Store, id: &str) -> Result<()> {
     m.deadline_at = None;
     store.save_metadata(&m)?;
     store.append_event(id, "lifecycle", json!({"status":"finished"}))?;
+    store.append_notification(
+        id,
+        "finished",
+        2,
+        AgentStatus::Finished,
+        if final_message.is_empty() {
+            "Agent finished"
+        } else {
+            final_message
+        },
+    )?;
     Ok(())
 }
 fn mark_stopped(store: &Store, id: &str, reason: &str) -> Result<()> {
@@ -959,11 +1000,18 @@ fn mark_stopped(store: &Store, id: &str, reason: &str) -> Result<()> {
     m.deadline_at = None;
     store.save_metadata(&m)?;
     store.append_event(id, "lifecycle", json!({"status":"stopped","reason":reason}))?;
+    store.append_notification(
+        id,
+        "stopped",
+        3,
+        AgentStatus::Stopped,
+        format!("Agent stopped: {reason}"),
+    )?;
     Ok(())
 }
 fn mark_failed(store: &Store, id: &str, error: String) -> Result<()> {
     let mut m = store.load_metadata(id)?;
-    if m.status == AgentStatus::Stopped {
+    if m.status != AgentStatus::Working {
         return Ok(());
     }
     let now = Utc::now();
@@ -974,6 +1022,7 @@ fn mark_failed(store: &Store, id: &str, error: String) -> Result<()> {
     m.deadline_at = None;
     store.save_metadata(&m)?;
     store.append_event(id, "error", json!({"status":"failed","error":error}))?;
+    store.append_notification(id, "failed", 4, AgentStatus::Failed, &error)?;
     Ok(())
 }
 
@@ -990,6 +1039,13 @@ fn mark_side_stopped(store: &Store, id: &str, reason: &str) -> Result<()> {
     meta.stop_reason = Some(reason.into());
     store.save_side_metadata(&meta)?;
     store.append_side_event(id, "lifecycle", json!({"status":"stopped","reason":reason}))?;
+    store.append_notification(
+        id,
+        "stopped",
+        3,
+        AgentStatus::Stopped,
+        format!("Side agent stopped: {reason}"),
+    )?;
     Ok(())
 }
 
@@ -1006,7 +1062,21 @@ fn mark_side_failed(store: &Store, id: &str, error: String) -> Result<()> {
     meta.last_error = Some(error.clone());
     store.save_side_metadata(&meta)?;
     store.append_side_event(id, "error", json!({"status":"failed","error":error}))?;
+    store.append_notification(id, "failed", 4, AgentStatus::Failed, &error)?;
     Ok(())
+}
+
+fn normalize_model(value: &str) -> Result<String> {
+    let model = value.trim();
+    if model.is_empty() {
+        return Err(coded_error(
+            "invalid_argument",
+            "model must not be empty",
+            json!({"field":"model"}),
+            false,
+        ));
+    }
+    Ok(model.to_string())
 }
 
 #[cfg(test)]

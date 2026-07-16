@@ -70,13 +70,28 @@ class Handler(BaseHTTPRequestHandler):
             if message.get("role") == "system"
             and isinstance(message.get("content"), str)
         )
+        model = request.get("model", "")
 
         if latest_user == "DELAY" and not has_tool_result:
             time.sleep(10)
         if latest_user == "SIDE_DELAY" and not has_tool_result:
             time.sleep(10)
 
-        if "READONLY_PROMPT" in latest_user:
+        if "MODEL_ECHO" in latest_user:
+            deltas = [{"content": model}]
+        elif "NOTIFY_TOOL" in latest_user and not has_tool_result:
+            deltas = fragment_calls(
+                [
+                    function_call(
+                        0,
+                        "notify",
+                        {"event_type": "milestone", "summary": "explicit milestone"},
+                    )
+                ]
+            )
+        elif "NOTIFY_TOOL" in latest_user:
+            deltas = [{"content": "notification task complete"}]
+        elif "READONLY_PROMPT" in latest_user:
             correct = (
                 "must not modify files or system state" in system_text
                 and "sed without -i" in system_text
@@ -139,7 +154,7 @@ class Handler(BaseHTTPRequestHandler):
                         0,
                         "exec_command",
                         {
-                            "command": "if env | grep '^OPENAI_API_KEY='; then exit 9; else printf hidden; fi",
+                            "command": "if env | grep -E '^(OPENAI_API_KEY|SUBAGENT_WEB_PASSWORD)='; then exit 9; else printf hidden; fi",
                             "yield_time_ms": 250,
                         },
                     )

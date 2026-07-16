@@ -2,7 +2,7 @@ use crate::{
     agent::AgentManager,
     config::{RuntimeConfig, ensure_private_dir},
     ipc::{Request, coded_error, error_json_for},
-    store::{AgentStatus, EventRecord, Store, canonical_filter_dir},
+    store::{AgentStatus, EventRecord, InboxFilter, Store, canonical_filter_dir},
 };
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
@@ -23,14 +23,17 @@ pub async fn serve(cfg: RuntimeConfig, web_ui_port: Option<u16>) -> Result<()> {
     let cfg = Arc::new(cfg);
     let manager = AgentManager::new(cfg.clone(), store.clone());
     manager.schedule_pending()?;
-    let web_ui_url = if let Some(port) = web_ui_port {
-        Some(
-            crate::web::start(port, manager.clone(), store.clone())
-                .await?
-                .url,
+    let (web_ui_url, web_auth) = if let Some(port) = web_ui_port {
+        let runtime = crate::web::start(
+            port,
+            manager.clone(),
+            store.clone(),
+            cfg.web_password.as_deref(),
         )
+        .await?;
+        (Some(runtime.url), Some(runtime.auth))
     } else {
-        None
+        (None, None)
     };
     let socket = cfg.paths.socket();
     if socket.exists() {
@@ -48,8 +51,8 @@ pub async fn serve(cfg: RuntimeConfig, web_ui_port: Option<u16>) -> Result<()> {
     loop {
         tokio::select! {
             accepted=listener.accept()=>{
-                let (stream,_)=accepted?;let manager=manager.clone();let store=store.clone();let cfg=cfg.clone();let tx=shutdown_tx.clone();let web_ui_url=web_ui_url.clone();
-                tokio::spawn(async move{if let Err(e)=handle_connection(stream,manager,store,cfg,tx,web_ui_url).await{eprintln!("ipc error: {e:#}");}});
+                let (stream,_)=accepted?;let manager=manager.clone();let store=store.clone();let cfg=cfg.clone();let tx=shutdown_tx.clone();let web_ui_url=web_ui_url.clone();let web_auth=web_auth.clone();
+                tokio::spawn(async move{if let Err(e)=handle_connection(stream,manager,store,cfg,tx,web_ui_url,web_auth).await{eprintln!("ipc error: {e:#}");}});
             }
             _=shutdown_rx.changed()=>{if *shutdown_rx.borrow(){break}}
         }
@@ -67,12 +70,23 @@ async fn handle_connection(
     cfg: Arc<RuntimeConfig>,
     shutdown: watch::Sender<bool>,
     web_ui_url: Option<String>,
+    web_auth: Option<String>,
 ) -> Result<()> {
     let (read_half, mut write_half) = stream.into_split();
     let mut lines = BufReader::new(read_half).lines();
     let line = lines.next_line().await?.context("empty request")?;
     let request: Request = serde_json::from_str(&line).context("invalid request JSON")?;
-    match dispatch(request, &manager, &store, &cfg, &shutdown, &web_ui_url).await {
+    match dispatch(
+        request,
+        &manager,
+        &store,
+        &cfg,
+        &shutdown,
+        &web_ui_url,
+        &web_auth,
+    )
+    .await
+    {
         Ok(Output::Lines(values)) => {
             for value in values {
                 write_json_line(&mut write_half, &value).await?
@@ -119,10 +133,11 @@ async fn dispatch(
     cfg: &RuntimeConfig,
     shutdown: &watch::Sender<bool>,
     web_ui_url: &Option<String>,
+    web_auth: &Option<String>,
 ) -> Result<Output> {
     let lines = match req {
         Request::DaemonStatus => vec![
-            json!({"type":"daemon","status":"running","pid":std::process::id(),"socket":cfg.paths.socket(),"working_agents":manager.working_count(),"max_agents":cfg.file.max_agents,"model":cfg.file.model,"base_url":cfg.file.base_url,"web_ui_url":web_ui_url}),
+            json!({"type":"daemon","status":"running","pid":std::process::id(),"socket":cfg.paths.socket(),"working_agents":manager.working_count(),"max_agents":cfg.file.max_agents,"model":cfg.file.model,"base_url":cfg.file.base_url,"web_ui_url":web_ui_url,"web_auth":web_auth}),
         ],
         Request::DaemonStop => {
             shutdown.send(true).ok();
@@ -135,12 +150,14 @@ async fn dispatch(
             message,
             name,
             mode,
+            model,
             wall_time_minutes,
         } => vec![agent_value(manager.spawn(
             dir,
             message,
             name,
             mode,
+            model,
             wall_time_minutes,
         )?)?],
         Request::AgentList { mut filter } => {
@@ -180,7 +197,7 @@ async fn dispatch(
                 ];
             }
             if follow {
-                validate_log_cursor(&store.read_events(&id)?, after.as_deref())?;
+                query_logs(store, &id, false, &types, after.as_deref(), limit)?;
                 return Ok(Output::Follow {
                     id,
                     types,
@@ -189,7 +206,7 @@ async fn dispatch(
                     side: false,
                 });
             }
-            select_logs(store.read_events(&id)?, &types, after.as_deref(), limit)?
+            query_logs(store, &id, false, &types, after.as_deref(), limit)?
                 .into_iter()
                 .map(serde_json::to_value)
                 .collect::<Result<_, _>>()?
@@ -203,8 +220,34 @@ async fn dispatch(
         Request::AgentSide {
             id,
             message,
+            model,
             wall_time_minutes,
-        } => vec![manager.create_side(&id, message, wall_time_minutes)?],
+        } => vec![manager.create_side(&id, message, model, wall_time_minutes)?],
+        Request::Inbox {
+            limit,
+            offset,
+            minimum_priority,
+            agent_id,
+        } => {
+            if !(1..=100).contains(&limit) || !(1..=5).contains(&minimum_priority) {
+                return Err(coded_error(
+                    "invalid_argument",
+                    "inbox limit must be 1..=100 and priority must be 1..=5",
+                    json!({"limit":limit,"priority":minimum_priority}),
+                    false,
+                ));
+            }
+            store
+                .list_notifications(&InboxFilter {
+                    limit,
+                    offset,
+                    minimum_priority,
+                    agent_id,
+                })?
+                .into_iter()
+                .map(serde_json::to_value)
+                .collect::<Result<_, _>>()?
+        }
         Request::SideList {
             agent_id,
             statuses,
@@ -233,7 +276,7 @@ async fn dispatch(
                 types = vec!["user_message".into(), "assistant_message".into()];
             }
             if follow {
-                validate_log_cursor(&store.read_side_events(&id)?, after.as_deref())?;
+                query_logs(store, &id, true, &types, after.as_deref(), limit)?;
                 return Ok(Output::Follow {
                     id,
                     types,
@@ -242,15 +285,10 @@ async fn dispatch(
                     side: true,
                 });
             }
-            select_logs(
-                store.read_side_events(&id)?,
-                &types,
-                after.as_deref(),
-                limit,
-            )?
-            .into_iter()
-            .map(serde_json::to_value)
-            .collect::<Result<_, _>>()?
+            query_logs(store, &id, true, &types, after.as_deref(), limit)?
+                .into_iter()
+                .map(serde_json::to_value)
+                .collect::<Result<_, _>>()?
         }
         Request::SideStop { id } => vec![serde_json::to_value(
             manager.stop_side(&id, "user_request").await?,
@@ -303,39 +341,30 @@ fn agent_value(meta: crate::store::AgentMetadata) -> Result<Value> {
     Ok(value)
 }
 
-fn select_logs(
-    mut events: Vec<EventRecord>,
+fn query_logs(
+    store: &Store,
+    id: &str,
+    side: bool,
     types: &[String],
     after: Option<&str>,
     limit: usize,
 ) -> Result<Vec<EventRecord>> {
-    validate_log_cursor(&events, after)?;
-    if let Some(after) = after {
-        let pos = events.iter().position(|e| e.event_id == after).unwrap();
-        events.drain(..=pos);
-    }
-    if !types.is_empty() {
-        events.retain(|e| types.iter().any(|t| t == &e.event_type));
-    }
     let limit = if limit == 0 { 100 } else { limit };
-    if events.len() > limit {
-        events.drain(..events.len() - limit);
-    }
-    Ok(events)
-}
-
-fn validate_log_cursor(events: &[EventRecord], after: Option<&str>) -> Result<()> {
-    if let Some(after) = after
-        && !events.iter().any(|event| event.event_id == after)
-    {
-        return Err(coded_error(
-            "event_not_found",
-            format!("event cursor not found: {after}"),
-            json!({"event_id":after}),
-            false,
-        ));
-    }
-    Ok(())
+    store
+        .query_events(id, side, types, after, None, limit)
+        .map_err(|error| {
+            if let Some(after) = after
+                && error.to_string().contains("event cursor not found")
+            {
+                return coded_error(
+                    "event_not_found",
+                    format!("event cursor not found: {after}"),
+                    json!({"event_id":after}),
+                    false,
+                );
+            }
+            error
+        })
 }
 
 fn context_lines(id: &str, context: crate::store::ContextSnapshot) -> Result<Vec<Value>> {
@@ -359,21 +388,14 @@ async fn follow_logs<W: tokio::io::AsyncWrite + Unpin>(
     side: bool,
 ) -> Result<()> {
     let mut cursor = after.map(str::to_string);
-    let read = || {
-        if side {
-            store.read_side_events(id)
-        } else {
-            store.read_events(id)
-        }
-    };
-    let initial = select_logs(read()?, types, after, limit)?;
+    let initial = query_logs(store, id, side, types, after, limit)?;
     for event in initial {
         cursor = Some(event.event_id.clone());
         write_json_line(writer, &serde_json::to_value(event)?).await?;
     }
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-        let events = select_logs(read()?, types, cursor.as_deref(), usize::MAX)?;
+        let events = query_logs(store, id, side, types, cursor.as_deref(), 10_000)?;
         for event in events {
             cursor = Some(event.event_id.clone());
             if write_json_line(writer, &serde_json::to_value(event)?)
@@ -444,51 +466,4 @@ fn set_socket_permissions(path: &Path) -> Result<()> {
 #[cfg(not(unix))]
 fn set_socket_permissions(_path: &Path) -> Result<()> {
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use chrono::Utc;
-
-    fn event(id: &str, sequence: u64, event_type: &str) -> EventRecord {
-        EventRecord {
-            event_id: id.into(),
-            agent_id: "agt_test".into(),
-            side_id: None,
-            sequence,
-            timestamp: Utc::now(),
-            event_type: event_type.into(),
-            data: json!({}),
-        }
-    }
-
-    #[test]
-    fn log_cursor_is_exclusive_and_filtering_precedes_limit() {
-        let events = vec![
-            event("evt_1", 1, "lifecycle"),
-            event("evt_2", 2, "assistant_message"),
-            event("evt_3", 3, "lifecycle"),
-            event("evt_4", 4, "assistant_message"),
-        ];
-        let selected =
-            select_logs(events, &["assistant_message".into()], Some("evt_1"), 1).unwrap();
-        assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].event_id, "evt_4");
-    }
-
-    #[test]
-    fn unknown_log_cursor_is_rejected() {
-        let error = select_logs(
-            vec![event("evt_1", 1, "lifecycle")],
-            &[],
-            Some("evt_missing"),
-            100,
-        )
-        .unwrap_err();
-        assert_eq!(
-            error.downcast_ref::<crate::ipc::CodedError>().unwrap().code,
-            "event_not_found"
-        );
-    }
 }

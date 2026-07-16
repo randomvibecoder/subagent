@@ -31,6 +31,7 @@ impl Default for FileConfig {
 pub struct RuntimeConfig {
     pub file: FileConfig,
     pub api_key: String,
+    pub web_password: Option<String>,
     pub paths: Paths,
 }
 
@@ -198,9 +199,16 @@ impl RuntimeConfig {
         if api_key.trim().is_empty() {
             bail!("OPENAI_API_KEY is empty");
         }
+        let web_password = match env::var("SUBAGENT_WEB_PASSWORD") {
+            Ok(value) if value.is_empty() => bail!("SUBAGENT_WEB_PASSWORD is empty"),
+            Ok(value) => Some(value),
+            Err(env::VarError::NotPresent) => None,
+            Err(env::VarError::NotUnicode(_)) => bail!("SUBAGENT_WEB_PASSWORD is not UTF-8"),
+        };
         Ok(Self {
             file,
             api_key,
+            web_password,
             paths,
         })
     }

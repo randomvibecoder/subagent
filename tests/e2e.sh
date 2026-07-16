@@ -9,6 +9,7 @@ export XDG_CONFIG_HOME="$ROOT/config"
 export XDG_STATE_HOME="$ROOT/state"
 export XDG_RUNTIME_DIR="$ROOT/run"
 export OPENAI_API_KEY=test-key
+export SUBAGENT_WEB_PASSWORD=test-web-password
 export OPENAI_BASE_URL=http://127.0.0.1:18080/v1
 export OPENAI_MODEL=test-model
 WEB_PORT=${SUBAGENT_E2E_WEB_PORT:-17342}
@@ -61,7 +62,12 @@ wait_side_status() {
 
 $BIN config set max-agents 1 >/dev/null
 python3 -c 'import pathlib,sys; body=pathlib.Path(sys.argv[1]).read_text(); assert "test-model" not in body and "127.0.0.1:18080" not in body' "$XDG_CONFIG_HOME/subagent/config.toml"
-$BIN daemon start | python3 -c 'import json,sys; assert json.load(sys.stdin)["status"] == "running"'
+if SUBAGENT_WEB_PASSWORD='' $BIN daemon start 2>"$ROOT/empty-web-password-error.jsonl"; then
+  echo "empty Web UI password unexpectedly started the daemon" >&2
+  exit 1
+fi
+python3 -c 'import json,sys; value=json.load(open(sys.argv[1])); assert value["code"] == "cli_error" and "SUBAGENT_WEB_PASSWORD is empty" in value["message"]' "$ROOT/empty-web-password-error.jsonl"
+$BIN daemon start | python3 -c 'import json,sys; value=json.load(sys.stdin); assert value["status"] == "running" and value["web_ui_url"] is None and value["web_auth"] is None'
 
 mkdir -p "$ROOT/caller/project"
 RELATIVE=$(cd "$ROOT/caller" && "$BIN" agents spawn --name relative-test --dir project --message FINAL_ONLY)
@@ -74,6 +80,24 @@ READONLY=$($BIN agents spawn --name readonly-test --dir "$ROOT/project" --mode r
 READONLY_ID=$(printf '%s\n' "$READONLY" | json_field id)
 wait_status "$READONLY_ID" finished
 $BIN agents logs "$READONLY_ID" --type assistant_message | python3 -c 'import json,sys; rows=[json.loads(x) for x in sys.stdin]; assert rows[-1]["data"]["content"] == "readonly prompt correct"'
+
+MODEL=$($BIN agents spawn --name model-override --dir "$ROOT/project" --mode readonly --model custom-main-model --message MODEL_ECHO)
+MODEL_ID=$(printf '%s\n' "$MODEL" | json_field id)
+wait_status "$MODEL_ID" finished
+$BIN agents status "$MODEL_ID" | python3 -c 'import json,sys; assert json.load(sys.stdin)["model"] == "custom-main-model"'
+$BIN agents logs "$MODEL_ID" --type assistant_message | python3 -c 'import json,sys; assert json.loads(sys.stdin.readlines()[-1])["data"]["content"] == "custom-main-model"'
+$BIN agents send "$MODEL_ID" --message MODEL_ECHO >/dev/null
+wait_status "$MODEL_ID" finished
+$BIN agents status "$MODEL_ID" | python3 -c 'import json,sys; row=json.load(sys.stdin); assert row["model"] == "custom-main-model" and row["run_number"] == 2'
+$BIN agents logs "$MODEL_ID" --type assistant_message | python3 -c 'import json,sys; assert json.loads(sys.stdin.readlines()[-1])["data"]["content"] == "custom-main-model"'
+$BIN inbox --agent "$MODEL_ID" --priority 1 --limit 10 | python3 -c 'import json,sys; rows=[json.loads(line) for line in sys.stdin]; assert [row["event_type"] for row in rows[:3]] == ["finished","resumed","finished"]'
+
+NOTIFY=$($BIN agents spawn --name notify-test --dir "$ROOT/project" --mode readonly --message NOTIFY_TOOL)
+NOTIFY_ID=$(printf '%s\n' "$NOTIFY" | json_field id)
+wait_status "$NOTIFY_ID" finished
+$BIN inbox --agent "$NOTIFY_ID" | python3 -c 'import json,sys; rows=[json.loads(line) for line in sys.stdin]; assert [row["event_type"] for row in rows] == ["finished","milestone"]; assert rows[0]["summary"] == "notification task complete" and rows[1]["summary"] == "explicit milestone"; assert all(row["priority"] >= 2 for row in rows)'
+$BIN inbox --agent "$NOTIFY_ID" --limit 1 --offset 1 --priority 1 | python3 -c 'import json,sys; row=json.load(sys.stdin); assert row["event_type"] == "milestone"'
+[[ -z "$($BIN inbox --agent "$NOTIFY_ID" --priority 3)" ]]
 
 printf '%s\n' WRITE_EDIT_PATCH >"$ROOT/task.md"
 SPAWN=$($BIN agents spawn --dir "$ROOT/project" --mode write --name tool-test --message-file "$ROOT/task.md")
@@ -119,14 +143,19 @@ SIDE=$($BIN agents side "$SIDE_PARENT_ID" --message SIDE_TOOL_QUESTION)
 SIDE_ID=$(printf '%s\n' "$SIDE" | json_field id)
 printf '%s\n' "$SIDE" | python3 -c 'import json,sys; row=json.load(sys.stdin); assert row["type"] == "side_created" and row["status"] == "working"'
 wait_side_status "$SIDE_ID" finished
-$BIN sides status "$SIDE_ID" | python3 -c 'import json,sys; row=json.load(sys.stdin); assert row["answer"] == "side inherited context and tools"; assert row["tool_calls"] == 5; assert row["inherited_context_messages"] >= 3; assert row["mode"] == "readonly" and row["parent_mode"] == "write"'
+$BIN sides status "$SIDE_ID" | python3 -c 'import json,sys; row=json.load(sys.stdin); assert row["answer"] == "side inherited context and tools"; assert row["tool_calls"] == 5; assert row["inherited_context_messages"] >= 3; assert row["mode"] == "readonly" and row["parent_mode"] == "write" and row["model"] == "test-model"'
 $BIN sides logs "$SIDE_ID" --type tool_call --limit 100 | python3 -c 'import json,sys; rows=[json.loads(line) for line in sys.stdin]; assert len(rows) == 5 and all(row["side_id"] == sys.argv[1] for row in rows)' "$SIDE_ID"
 [[ -e "$XDG_STATE_HOME/subagent/sides/$SIDE_ID/metadata.json" ]]
 BTW=$($BIN agents btw "$SIDE_PARENT_ID" --message SIDE_CONTEXT_ONLY)
 BTW_ID=$(printf '%s\n' "$BTW" | json_field id)
 wait_side_status "$BTW_ID" finished
 $BIN sides status "$BTW_ID" | python3 -c 'import json,sys; row=json.load(sys.stdin); assert row["answer"] == "context inherited" and row["tool_calls"] == 0'
-$BIN sides list "$SIDE_PARENT_ID" | python3 -c 'import json,sys; rows=[json.loads(line) for line in sys.stdin]; assert len(rows) == 2 and all(row["type"] == "side_list_item" for row in rows)'
+SIDE_MODEL=$($BIN sides create "$SIDE_PARENT_ID" --model custom-side-model --message MODEL_ECHO)
+SIDE_MODEL_ID=$(printf '%s\n' "$SIDE_MODEL" | json_field id)
+wait_side_status "$SIDE_MODEL_ID" finished
+$BIN sides status "$SIDE_MODEL_ID" | python3 -c 'import json,sys; row=json.load(sys.stdin); assert row["answer"] == "custom-side-model" and row["model"] == "custom-side-model"'
+$BIN inbox --agent "$SIDE_PARENT_ID" --priority 2 --limit 100 | python3 -c 'import json,sys; rows=[json.loads(line) for line in sys.stdin]; assert any(row["side_id"] == sys.argv[1] and row["event_type"] == "finished" for row in rows)' "$SIDE_MODEL_ID"
+$BIN sides list "$SIDE_PARENT_ID" | python3 -c 'import json,sys; rows=[json.loads(line) for line in sys.stdin]; assert len(rows) == 3 and all(row["type"] == "side_list_item" for row in rows)'
 [[ "$CONTEXT_BEFORE" == "$(sha256sum "$XDG_STATE_HOME/subagent/agents/$SIDE_PARENT_ID/context.json" | cut -d' ' -f1)" ]]
 [[ "$EVENTS_BEFORE" == "$(sha256sum "$XDG_STATE_HOME/subagent/agents/$SIDE_PARENT_ID/events.jsonl" | cut -d' ' -f1)" ]]
 SIDE_DELAY_1=$($BIN sides create "$SIDE_PARENT_ID" --message SIDE_DELAY)
@@ -213,30 +242,45 @@ $BIN messages list "$INTERRUPTED_ID" | python3 tests/validate_schema.py
 $BIN sides list "$SIDE_PARENT_ID" | python3 tests/validate_schema.py
 $BIN sides status "$SIDE_ID" | python3 tests/validate_schema.py
 $BIN sides logs "$SIDE_ID" --all --limit 1000 | python3 tests/validate_schema.py
+$BIN inbox --limit 100 --priority 1 | python3 tests/validate_schema.py
 
 $BIN daemon stop | python3 -c 'import json,sys; assert json.load(sys.stdin)["status"] == "stopping"'
 for _ in $(seq 1 100); do
   [[ ! -S "$XDG_RUNTIME_DIR/subagent.sock" ]] && break
   sleep 0.05
 done
+unset SUBAGENT_WEB_PASSWORD
 WEB=$($BIN daemon start --web-ui-port "$WEB_PORT")
-WEB_URL=$(printf '%s\n' "$WEB" | json_field web_ui_url)
-TOKEN=${WEB_URL##*#token=}
-curl -fsS "http://127.0.0.1:$WEB_PORT/assets/app.css" | python3 -c 'import re,sys; css=sys.stdin.read(); assert re.search(r"background:\s*#000000",css) and re.search(r"color:\s*#ffffff",css)'
-curl -fsS "http://127.0.0.1:$WEB_PORT/" | python3 -c 'import sys; html=sys.stdin.read(); assert all(value in html for value in ("dashboard-page","agent-page","side-page","open-spawn","agent-tabs","side-tabs","main-scroll","side-list","side-main-tab","controls-tab","side-dialog"))'
-curl -fsS "http://127.0.0.1:$WEB_PORT/assets/ui-core.js" | python3 -c 'import sys; js=sys.stdin.read(); assert "patchDiffHtml" in js and "patchLineKind" in js and "deletion" in js and "addition" in js'
-curl -fsS "http://127.0.0.1:$WEB_PORT/assets/app.js" | python3 -c 'import sys; js=sys.stdin.read(); assert all(value in js for value in ("TimelineController","loadOlder","nearBottom","tool-accordion","/api/sides/"))'
+printf '%s\n' "$WEB" | python3 -c 'import json,sys; value=json.load(sys.stdin); assert value["web_auth"] == "none" and value["web_ui_url"] == sys.argv[1]' "http://127.0.0.1:$WEB_PORT/"
+curl -fsS "http://127.0.0.1:$WEB_PORT/api/agents" | python3 -c 'import json,sys; [json.loads(line) for line in sys.stdin]'
+$BIN daemon stop >/dev/null
+for _ in $(seq 1 100); do
+  [[ ! -S "$XDG_RUNTIME_DIR/subagent.sock" ]] && break
+  sleep 0.05
+done
+
+WEB=$(SUBAGENT_WEB_PASSWORD='test-web-password' $BIN daemon start --web-ui-port "$WEB_PORT")
+printf '%s\n' "$WEB" | python3 -c 'import json,sys; value=json.load(sys.stdin); assert value["web_auth"] == "basic" and value["web_ui_url"] == sys.argv[1]' "http://127.0.0.1:$WEB_PORT/"
+[[ "$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$WEB_PORT/")" == 401 ]]
+[[ "$(curl -sS -u 'subagent:wrong-password' -o /dev/null -w '%{http_code}' "http://127.0.0.1:$WEB_PORT/")" == 401 ]]
+curl -sS -D - -o /dev/null "http://127.0.0.1:$WEB_PORT/" | tr -d '\r' | grep -qi '^www-authenticate: Basic realm="subagent"'
+curl -fsS -u 'subagent:test-web-password' "http://127.0.0.1:$WEB_PORT/assets/app.css" | python3 -c 'import re,sys; css=sys.stdin.read(); assert re.search(r"background:\s*#000000",css) and re.search(r"color:\s*#ffffff",css)'
+curl -fsS -u 'subagent:test-web-password' "http://127.0.0.1:$WEB_PORT/" | python3 -c 'import sys; html=sys.stdin.read(); assert all(value in html for value in ("dashboard-page","agent-page","side-page","open-spawn","agent-tabs","side-tabs","main-scroll","side-list","side-main-tab","controls-tab","side-dialog","inbox-filters","inbox-agent"))'
+curl -fsS -u 'subagent:test-web-password' "http://127.0.0.1:$WEB_PORT/assets/ui-core.js" | python3 -c 'import sys; js=sys.stdin.read(); assert "patchDiffHtml" in js and "patchLineKind" in js and "deletion" in js and "addition" in js'
+curl -fsS -u 'subagent:test-web-password' "http://127.0.0.1:$WEB_PORT/assets/app.js" | python3 -c 'import sys; js=sys.stdin.read(); assert all(value in js for value in ("TimelineController","loadOlder","nearBottom","tool-accordion","/api/sides/","loadInbox","/api/inbox"))'
 [[ "$(curl -sS -o /dev/null -w '%{http_code}' "http://127.0.0.1:$WEB_PORT/api/agents")" == 401 ]]
-curl -fsS -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:$WEB_PORT/api/agents" | python3 -c 'import json,sys; [json.loads(line) for line in sys.stdin]'
-curl -fsS -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:$WEB_PORT/api/agents/$SIDE_PARENT_ID/sides" | python3 -c 'import json,sys; rows=[json.loads(line) for line in sys.stdin]; assert rows and all(row["type"] == "side_list_item" for row in rows)'
-curl -fsS -X POST -H "Authorization: Bearer $TOKEN" -H "Origin: http://127.0.0.1:$WEB_PORT" -H 'Content-Type: application/json' -d '{"name":"web-renamed"}' "http://127.0.0.1:$WEB_PORT/api/agents/$INTERRUPTED_ID/rename" | python3 -c 'import json,sys; assert json.load(sys.stdin)["name"] == "web-renamed"'
+curl -fsS -u 'subagent:test-web-password' "http://127.0.0.1:$WEB_PORT/api/agents" | python3 -c 'import json,sys; [json.loads(line) for line in sys.stdin]'
+curl -fsS -u 'subagent:test-web-password' "http://127.0.0.1:$WEB_PORT/api/inbox?priority=2&limit=10&offset=0" | python3 -c 'import json,sys; rows=[json.loads(line) for line in sys.stdin]; assert rows and all(row["type"] == "notification" and row["priority"] >= 2 for row in rows)'
+curl -fsS -u 'subagent:test-web-password' "http://127.0.0.1:$WEB_PORT/api/inbox?agent=$NOTIFY_ID&priority=1&limit=1&offset=1" | python3 -c 'import json,sys; row=json.load(sys.stdin); assert row["agent_id"] == sys.argv[1] and row["event_type"] == "milestone"' "$NOTIFY_ID"
+curl -fsS -u 'subagent:test-web-password' "http://127.0.0.1:$WEB_PORT/api/agents/$SIDE_PARENT_ID/sides" | python3 -c 'import json,sys; rows=[json.loads(line) for line in sys.stdin]; assert rows and all(row["type"] == "side_list_item" for row in rows)'
+curl -fsS -u 'subagent:test-web-password' -X POST -H "Origin: http://127.0.0.1:$WEB_PORT" -H 'Content-Type: application/json' -d '{"name":"web-renamed"}' "http://127.0.0.1:$WEB_PORT/api/agents/$INTERRUPTED_ID/rename" | python3 -c 'import json,sys; assert json.load(sys.stdin)["name"] == "web-renamed"'
 $BIN agents delete "$SIDE_PARENT_ID" | python3 -c 'import json,sys; assert json.load(sys.stdin)["type"] == "agent_deleted"'
 if $BIN sides status "$SIDE_ID" 2>"$ROOT/deleted-side-error.jsonl"; then
   echo "Side history survived parent cascade deletion" >&2
   exit 1
 fi
 python3 -c 'import json,sys; assert json.load(open(sys.argv[1]))["code"] == "side_not_found"' "$ROOT/deleted-side-error.jsonl"
-$BIN daemon status | python3 -c 'import json,sys; assert json.load(sys.stdin)["web_ui_url"].startswith(sys.argv[1])' "http://127.0.0.1:$WEB_PORT/#token="
+$BIN daemon status | python3 -c 'import json,sys; value=json.load(sys.stdin); assert value["web_ui_url"] == sys.argv[1] and value["web_auth"] == "basic"' "http://127.0.0.1:$WEB_PORT/"
 $BIN daemon stop >/dev/null
 
 echo '{"type":"test_result","status":"passed","suite":"e2e"}'

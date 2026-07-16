@@ -1,34 +1,17 @@
 (function () {
   "use strict";
   var UI = window.SubagentUI,
-    token = "",
     selected = null,
     selectedSide = null,
     agentCache = new Map(),
-    timelineController = null;
+    timelineController = null,
+    inboxOffset = 0;
   var visibleTypes =
     "system_message,user_message,assistant_message,tool_call,tool_result,lifecycle,error";
   var $ = function (selector) {
     return document.querySelector(selector);
   };
 
-  function initToken() {
-    var raw = location.hash.slice(1);
-    if (raw.indexOf("token=") === 0) {
-      var params = new URLSearchParams(raw);
-      token = params.get("token") || "";
-      if (token) sessionStorage.setItem("subagent_token", token);
-      var agent = params.get("agent");
-      history.replaceState(
-        null,
-        "",
-        location.pathname +
-          location.search +
-          (agent ? "#/agents/" + encodeURIComponent(agent) + "/main" : "#/"),
-      );
-    } else token = sessionStorage.getItem("subagent_token") || "";
-    if (!token) notice("This dashboard URL is missing its access token.");
-  }
   function notice(value) {
     var element = $("#notice");
     element.textContent = UI.noticeText(value);
@@ -40,10 +23,7 @@
   }
   async function api(path, options) {
     options = options || {};
-    options.headers = Object.assign(
-      { Authorization: "Bearer " + token },
-      options.headers || {},
-    );
+    options.headers = Object.assign({}, options.headers || {});
     if (options.body) options.headers["Content-Type"] = "application/json";
     var response = await fetch(path, options),
       text = await response.text(),
@@ -58,9 +38,7 @@
     return value;
   }
   async function lines(path) {
-    var response = await fetch(path, {
-        headers: { Authorization: "Bearer " + token },
-      }),
+    var response = await fetch(path),
       text = await response.text();
     if (!response.ok) {
       var value = null;
@@ -120,6 +98,22 @@
           }
         };
       });
+      var inboxAgent = $("#inbox-agent"),
+        selectedAgent = inboxAgent.value;
+      inboxAgent.innerHTML =
+        '<option value="">All agents</option>' +
+        agents
+          .map(function (agent) {
+            return (
+              '<option value="' +
+              UI.escapeHtml(agent.id) +
+              '">' +
+              UI.escapeHtml(agent.name) +
+              "</option>"
+            );
+          })
+          .join("");
+      inboxAgent.value = selectedAgent;
       return agents;
     } catch (error) {
       $("#connection").textContent = "disconnected";
@@ -127,6 +121,72 @@
       notice(error.message);
       return [];
     }
+  }
+
+  async function loadInbox() {
+    if ($("#dashboard-page").classList.contains("hidden")) return;
+    var form = $("#inbox-filters"),
+      values = new FormData(form),
+      limit = Number(values.get("limit") || 20),
+      params = new URLSearchParams({
+        limit: String(limit),
+        offset: String(inboxOffset),
+        priority: String(values.get("priority") || 2),
+      }),
+      agent = values.get("agent");
+    if (agent) params.set("agent", agent);
+    try {
+      var notifications = await lines("/api/inbox?" + params.toString());
+      $("#inbox").innerHTML = notifications.length
+        ? notifications.map(notificationHtml).join("")
+        : '<div class="empty-state">No matching notifications.</div>';
+      $("#inbox-previous").disabled = inboxOffset === 0;
+      $("#inbox-next").disabled = notifications.length < limit;
+      $("#inbox-page").textContent =
+        "Page " + (Math.floor(inboxOffset / limit) + 1);
+    } catch (error) {
+      notice(error.message);
+    }
+  }
+
+  function notificationHtml(notification) {
+    var summary = notification.summary || "",
+      preview = summary.length > 240 ? summary.slice(0, 240) + "…" : summary,
+      body =
+        summary.length > 240
+          ? '<details class="notification-summary"><summary>' +
+            UI.escapeHtml(preview) +
+            "</summary><div>" +
+            UI.escapeHtml(summary) +
+            "</div></details>"
+          : '<div class="notification-summary">' +
+            UI.escapeHtml(summary) +
+            "</div>";
+    return (
+      '<article class="notification priority-' +
+      notification.priority +
+      '"><div class="notification-top"><span class="notification-priority">P' +
+      notification.priority +
+      '</span><button class="notification-agent text-button" type="button" data-agent="' +
+      UI.escapeHtml(notification.agent_id) +
+      '">' +
+      UI.escapeHtml(notification.agent_name) +
+      "</button>" +
+      (notification.side_id
+        ? '<span class="meta">Side ' + UI.escapeHtml(notification.side_id) + "</span>"
+        : "") +
+      '<span class="status ' +
+      UI.escapeHtml(notification.status) +
+      '">' +
+      UI.escapeHtml(notification.status) +
+      '</span><span class="meta notification-time">' +
+      UI.escapeHtml(UI.humanTime(notification.timestamp)) +
+      '</span></div><div class="event-kind">' +
+      UI.escapeHtml(notification.event_type) +
+      "</div>" +
+      body +
+      "</article>"
+    );
   }
   function agentCardHtml(agent) {
     return (
@@ -173,6 +233,7 @@
       $("#dashboard-page").classList.remove("hidden");
       document.title = "Subagent";
       await loadAgents();
+      await loadInbox();
       return;
     }
     selected = parts[1];
@@ -202,6 +263,8 @@
         UI.escapeHtml(metadata.mode) +
         " mode</span><span>run " +
         metadata.run_number +
+        "</span><span>" +
+        UI.escapeHtml(metadata.model) +
         "</span><span>" +
         UI.escapeHtml(metadata.dir) +
         "</span><span>updated " +
@@ -344,7 +407,7 @@
     var self = this,
       url = this.streamUrl + "?types=" + encodeURIComponent(visibleTypes);
     if (this.newest) url += "&after=" + encodeURIComponent(this.newest);
-    this.stream = new AuthEventStream(url, token, function (message) {
+    this.stream = new AuthEventStream(url, function (message) {
       var event = JSON.parse(message.data),
         follow = self.nearBottom();
       self.newest = event.event_id;
@@ -515,10 +578,9 @@
         };
       });
   }
-  function AuthEventStream(url, accessToken, onMessage) {
+  function AuthEventStream(url, onMessage) {
     var controller = new AbortController();
     fetch(url, {
-      headers: { Authorization: "Bearer " + accessToken },
       signal: controller.signal,
     })
       .then(async function (response) {
@@ -654,7 +716,9 @@
     $("#side-page-meta").innerHTML =
       "<span>readonly mode</span><span>" +
       side.tool_calls +
-      " tool calls</span><span>created " +
+      " tool calls</span><span>" +
+      UI.escapeHtml(side.model) +
+      "</span><span>created " +
       UI.escapeHtml(UI.humanTime(side.created_at)) +
       "</span>";
     showSideTab(tab, side);
@@ -853,6 +917,24 @@
     }
   };
   $("#refresh").onclick = loadAgents;
+  $("#refresh-inbox").onclick = loadInbox;
+  $("#inbox-filters").onchange = function () {
+    inboxOffset = 0;
+    loadInbox();
+  };
+  $("#inbox-previous").onclick = function () {
+    var limit = Number($("#inbox-filters [name=limit]").value);
+    inboxOffset = Math.max(0, inboxOffset - limit);
+    loadInbox();
+  };
+  $("#inbox-next").onclick = function () {
+    inboxOffset += Number($("#inbox-filters [name=limit]").value);
+    loadInbox();
+  };
+  $("#inbox").onclick = function (event) {
+    var button = event.target.closest(".notification-agent");
+    if (button) route(["agents", encodeURIComponent(button.dataset.agent), "main"]);
+  };
   $("#open-spawn").onclick = function () {
     $("#spawn-dialog").showModal();
   };
@@ -868,7 +950,7 @@
   $("#close-side").onclick = $("#cancel-side").onclick = function () {
     $("#side-dialog").close();
   };
-  initToken();
   window.addEventListener("hashchange", renderRoute);
+  setInterval(loadInbox, 5000);
   renderRoute();
 })();

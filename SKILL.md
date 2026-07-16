@@ -40,9 +40,9 @@ subagent daemon start
 ~~~
 
 The daemon captures these values at startup. Restart it after config or environment
-changes. It removes OPENAI_API_KEY from agent shell environments, but this is not a
-sandbox: agents retain the daemon user's other host, filesystem, process, network, and
-credential access.
+changes. It removes OPENAI_API_KEY and SUBAGENT_WEB_PASSWORD from agent shell
+environments, but this is not a sandbox: agents retain the daemon user's other host,
+filesystem, process, network, and credential access.
 
 ## Optional Web UI
 
@@ -55,9 +55,19 @@ UI. To enable the localhost-only interface for a human:
 subagent daemon start --web-ui-port 7341
 ~~~
 
-Open the `web_ui_url` returned by `daemon start` or `daemon status`. Keep its URL token
-private. The Web UI exposes human-facing views of CLI capabilities; it is not required
-for daemon or agent operation.
+To require a password even on localhost, set it only in the startup environment:
+
+~~~sh
+SUBAGENT_WEB_PASSWORD='choose-a-secret' \
+  subagent daemon start --web-ui-port 7341
+~~~
+
+Open the plain `web_ui_url` returned by `daemon start` or `daemon status`. HTTP Basic
+Auth uses the fixed username `subagent`. If `SUBAGENT_WEB_PASSWORD` is absent, the
+localhost UI is unauthenticated. `web_auth` reports `basic`, `none`, or `null` when the
+UI is disabled; the password is never returned and is removed from agent shell
+environments. The Web UI exposes human-facing views of CLI capabilities; it is not
+required for daemon or agent operation.
 
 ## Happy path
 
@@ -106,6 +116,20 @@ subagent agents logs agt_...
 By default this emits the newest 20 system, user, and assistant Events in chronological
 order. Tool calls/results, reasoning, lifecycle, and errors are excluded so they do not
 waste model context.
+
+Prefer the high-signal inbox when coordinating several agents:
+
+~~~sh
+subagent inbox
+subagent inbox --agent agt_... --priority 3 --limit 50 --offset 0
+~~~
+
+Inbox emits durable Notifications newest-first, one per line. The default is the
+newest 20 entries at priority 2 or higher. Agents publish meaningful progress,
+milestones, requests for input, and blockers; spawn, resume, finish, stop, and failure
+notifications are automatic. This is the recommended master-agent view because it
+avoids importing transcripts, code, tool calls, and tool results into the master's
+context.
 
 Send durable follow-up work:
 
@@ -156,7 +180,7 @@ shutdown. Agent commands never auto-start the daemon.
 
 ~~~text
 subagent agents spawn --name NAME --dir DIR (--message TEXT | --message-file PATH)
-    [--mode readonly|write] [--wall-time-minutes MINUTES]
+    [--mode readonly|write] [--model MODEL] [--wall-time-minutes MINUTES]
 
 subagent agents list
     [--status working|finished|stopped|failed]...
@@ -179,7 +203,8 @@ subagent agents send AGENT_ID
     (--message TEXT | --message-file PATH) [--wall-time-minutes MINUTES]
 
 subagent agents side AGENT_ID
-    (--message TEXT | --message-file PATH) [--wall-time-minutes MINUTES]
+    (--message TEXT | --message-file PATH) [--model MODEL]
+    [--wall-time-minutes MINUTES]
 
 subagent agents time AGENT_ID MINUTES
 subagent agents stop AGENT_ID
@@ -195,12 +220,15 @@ and unique across all stored agents. It is only a human label in list output; al
 commands still require ID. Rename works in every state and returns one agent_renamed
 receipt. MINUTES is an integer from 1 through 6000; omission means no deadline.
 Each agent_list_item also contains working_sides, from zero through two.
+MODEL overrides the daemon default only for the new Agent and remains attached across
+resumed runs. Omit it to use the daemon default.
 
 ### Sides
 
 ~~~text
 subagent sides create AGENT_ID
-    (--message TEXT | --message-file PATH) [--wall-time-minutes MINUTES]
+    (--message TEXT | --message-file PATH) [--model MODEL]
+    [--wall-time-minutes MINUTES]
 subagent sides list AGENT_ID
     [--status working|finished|stopped|failed]... [--limit N] [--offset N]
 subagent sides status SIDE_ID
@@ -222,7 +250,27 @@ Agent timestamps:
 - spawned_at: creation time.
 - last_message_at: latest daemon acceptance of a user message; initially spawn time.
 - updated_at: latest consumed message, model/tool activity, deadline change, or state
-  transition.
+transition.
+
+Omitted Side MODEL inherits the parent Agent model; an override applies only to the
+new Side.
+
+### Inbox
+
+~~~text
+subagent inbox [--limit N] [--offset N] [--priority 1|2|3|4|5]
+    [--agent AGENT_ID]
+~~~
+
+Output is Notification JSONL, newest first. limit defaults 20 and accepts 1–100;
+offset defaults zero. priority is a minimum threshold, defaults 2, and therefore
+`--priority 3` includes priorities 3, 4, and 5. agent filters by the main Agent ID and
+also includes its Side notifications. The journal exposes its newest 10,000 entries.
+There is no follow, wait, read/unread, or acknowledgement state.
+
+Priority meanings are: 1 routine progress, 2 milestone/finish, 3 input required or
+stop, 4 blocker/failure, and 5 reserved critical severity. Natural finish summary is
+the final Agent message, capped at 5,000 Unicode scalar values.
 - run_started_at: start of the current run.
 
 ### Log types
@@ -310,6 +358,8 @@ reverts the working directory, project files, Git state, commits, or branches.
 
 - New independent task: agents spawn.
 - List active work: agents list --status working.
+- Coordinate many agents without context rot: inbox, optionally filtered by agent or
+  priority.
 - Inspect normal conversation: agents logs.
 - Inspect tools/errors: agents logs with --type or --all.
 - Durable instruction: agents send, then messages status.

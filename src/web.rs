@@ -1,7 +1,7 @@
 use crate::{
     agent::AgentManager,
-    ipc::{AgentMode, ListFilter, error_json_for},
-    store::{AgentStatus, EventRecord, Store},
+    ipc::{AgentMode, ListFilter, coded_error, error_json_for},
+    store::{AgentStatus, EventRecord, InboxFilter, Store},
 };
 use anyhow::{Result, anyhow};
 use async_stream::stream;
@@ -12,6 +12,7 @@ use axum::{
     response::{IntoResponse, Response, Sse, sse::Event},
     routing::{get, post},
 };
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{convert::Infallible, net::Ipv4Addr, sync::Arc, time::Duration};
@@ -24,22 +25,38 @@ const JS: &str = include_str!("../web/app.js");
 struct WebState {
     manager: AgentManager,
     store: Store,
-    token: Arc<String>,
+    basic_authorization: Option<Arc<String>>,
     origin: Arc<String>,
 }
 
 pub struct WebRuntime {
     pub url: String,
+    pub auth: String,
 }
 
-pub async fn start(port: u16, manager: AgentManager, store: Store) -> Result<WebRuntime> {
-    let token = format!("web_{}", ulid::Ulid::new());
+pub async fn start(
+    port: u16,
+    manager: AgentManager,
+    store: Store,
+    password: Option<&str>,
+) -> Result<WebRuntime> {
     let origin = format!("http://127.0.0.1:{port}");
-    let url = format!("{origin}/#token={token}");
+    let url = format!("{origin}/");
+    let basic_authorization = password.map(|password| {
+        Arc::new(format!(
+            "Basic {}",
+            STANDARD.encode(format!("subagent:{password}"))
+        ))
+    });
+    let auth = if basic_authorization.is_some() {
+        "basic"
+    } else {
+        "none"
+    };
     let state = WebState {
         manager,
         store,
-        token: Arc::new(token),
+        basic_authorization,
         origin: Arc::new(origin),
     };
     let app = Router::new()
@@ -48,6 +65,7 @@ pub async fn start(port: u16, manager: AgentManager, store: Store) -> Result<Web
         .route("/assets/ui-core.js", get(ui_core))
         .route("/assets/app.js", get(js))
         .route("/api/agents", get(list_agents).post(spawn_agent))
+        .route("/api/inbox", get(inbox))
         .route("/api/agents/{id}", get(agent_status).delete(delete_agent))
         .route("/api/agents/{id}/rename", post(rename_agent))
         .route("/api/agents/{id}/events", get(agent_events))
@@ -81,23 +99,40 @@ pub async fn start(port: u16, manager: AgentManager, store: Store) -> Result<Web
             eprintln!("web UI error: {error}");
         }
     });
-    Ok(WebRuntime { url })
+    Ok(WebRuntime {
+        url,
+        auth: auth.into(),
+    })
 }
 
-async fn index() -> Response {
-    asset("text/html; charset=utf-8", INDEX)
+async fn index(State(state): State<WebState>, headers: HeaderMap) -> Response {
+    protected_asset(&state, &headers, "text/html; charset=utf-8", INDEX)
 }
-async fn css() -> Response {
-    asset("text/css; charset=utf-8", CSS)
+async fn css(State(state): State<WebState>, headers: HeaderMap) -> Response {
+    protected_asset(&state, &headers, "text/css; charset=utf-8", CSS)
 }
-async fn ui_core() -> Response {
-    asset(
+async fn ui_core(State(state): State<WebState>, headers: HeaderMap) -> Response {
+    protected_asset(
+        &state,
+        &headers,
         "text/javascript; charset=utf-8",
         include_str!("../web/ui-core.js"),
     )
 }
-async fn js() -> Response {
-    asset("text/javascript; charset=utf-8", JS)
+async fn js(State(state): State<WebState>, headers: HeaderMap) -> Response {
+    protected_asset(&state, &headers, "text/javascript; charset=utf-8", JS)
+}
+
+fn protected_asset(
+    state: &WebState,
+    headers: &HeaderMap,
+    content_type: &'static str,
+    content: &'static str,
+) -> Response {
+    if !basic_authorized(state, headers) {
+        return unauthorized_response();
+    }
+    asset(content_type, content)
 }
 
 fn asset(content_type: &'static str, content: &'static str) -> Response {
@@ -105,6 +140,28 @@ fn asset(content_type: &'static str, content: &'static str) -> Response {
     response.headers_mut().insert(
         header::CONTENT_SECURITY_POLICY,
         HeaderValue::from_static("default-src 'self'; connect-src 'self'; style-src 'self'; script-src 'self'; img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'"),
+    );
+    response
+}
+
+fn basic_authorized(state: &WebState, headers: &HeaderMap) -> bool {
+    state.basic_authorization.as_deref().is_none_or(|expected| {
+        headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            == Some(expected.as_str())
+    })
+}
+
+fn unauthorized_response() -> Response {
+    let mut response = (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({"type":"error","code":"unauthorized","message":"authentication required","details":{},"retryable":false})),
+    )
+        .into_response();
+    response.headers_mut().insert(
+        header::WWW_AUTHENTICATE,
+        HeaderValue::from_static("Basic realm=\"subagent\", charset=\"UTF-8\""),
     );
     response
 }
@@ -124,7 +181,7 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let message = self.0.to_string();
         if message == "unauthorized" {
-            return (StatusCode::UNAUTHORIZED, Json(json!({"type":"error","code":"unauthorized","message":message,"details":{},"retryable":false}))).into_response();
+            return unauthorized_response();
         }
         if message == "invalid origin" {
             return (StatusCode::FORBIDDEN, Json(json!({"type":"error","code":"invalid_origin","message":message,"details":{},"retryable":false}))).into_response();
@@ -142,12 +199,7 @@ impl IntoResponse for ApiError {
 type ApiResult<T> = std::result::Result<T, ApiError>;
 
 fn authorize(state: &WebState, headers: &HeaderMap, mutation: bool) -> ApiResult<()> {
-    let expected = format!("Bearer {}", state.token);
-    if headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        != Some(expected.as_str())
-    {
+    if !basic_authorized(state, headers) {
         return Err(ApiError(anyhow!("unauthorized")));
     }
     if mutation
@@ -188,6 +240,52 @@ async fn list_agents(State(state): State<WebState>, headers: HeaderMap) -> ApiRe
     Ok(ndjson(values))
 }
 
+#[derive(Default, Deserialize)]
+struct InboxQuery {
+    limit: Option<usize>,
+    offset: Option<usize>,
+    priority: Option<u8>,
+    agent: Option<String>,
+}
+
+async fn inbox(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Query(query): Query<InboxQuery>,
+) -> ApiResult<Response> {
+    authorize(&state, &headers, false)?;
+    let limit = query.limit.unwrap_or(20);
+    let priority = query.priority.unwrap_or(2);
+    if !(1..=100).contains(&limit) {
+        return Err(ApiError(coded_error(
+            "invalid_argument",
+            "limit must be from 1 through 100",
+            json!({"field":"limit"}),
+            false,
+        )));
+    }
+    if !(1..=5).contains(&priority) {
+        return Err(ApiError(coded_error(
+            "invalid_argument",
+            "priority must be from 1 through 5",
+            json!({"field":"priority"}),
+            false,
+        )));
+    }
+    let values = state
+        .store
+        .list_notifications(&InboxFilter {
+            limit,
+            offset: query.offset.unwrap_or(0),
+            minimum_priority: priority,
+            agent_id: query.agent.filter(|value| !value.is_empty()),
+        })?
+        .into_iter()
+        .map(serde_json::to_value)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(ndjson(values))
+}
+
 #[derive(Deserialize)]
 struct SpawnBody {
     dir: String,
@@ -195,6 +293,7 @@ struct SpawnBody {
     name: String,
     #[serde(default)]
     mode: Option<AgentMode>,
+    model: Option<String>,
     wall_time_minutes: Option<u64>,
 }
 async fn spawn_agent(
@@ -208,6 +307,7 @@ async fn spawn_agent(
         body.message,
         body.name,
         body.mode.unwrap_or(AgentMode::Write),
+        body.model,
         body.wall_time_minutes,
     )?;
     Ok(Json(agent_value(meta)?))
@@ -259,27 +359,16 @@ async fn agent_events(
     Query(query): Query<EventsQuery>,
 ) -> ApiResult<Response> {
     authorize(&state, &headers, false)?;
-    let mut events = state.store.read_events(&id)?;
-    if let Some(before) = query.before {
-        let pos = events
-            .iter()
-            .position(|e| e.event_id == before)
-            .ok_or_else(|| anyhow!("event cursor not found"))?;
-        events.truncate(pos);
-    }
-    if let Some(after) = query.after {
-        let pos = events
-            .iter()
-            .position(|e| e.event_id == after)
-            .ok_or_else(|| anyhow!("event cursor not found"))?;
-        events.drain(..=pos);
-    }
     let types = event_types(query.types.as_deref());
-    events.retain(|e| types.is_empty() || types.iter().any(|t| t == &e.event_type));
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
-    if events.len() > limit {
-        events.drain(..events.len() - limit);
-    }
+    let events = state.store.query_events(
+        &id,
+        false,
+        &types,
+        query.after.as_deref(),
+        query.before.as_deref(),
+        limit,
+    )?;
     Ok(ndjson(events.iter().map(event_preview)))
 }
 
@@ -289,12 +378,7 @@ async fn full_event(
     Path((id, event_id)): Path<(String, String)>,
 ) -> ApiResult<Json<EventRecord>> {
     authorize(&state, &headers, false)?;
-    let event = state
-        .store
-        .read_events(&id)?
-        .into_iter()
-        .find(|e| e.event_id == event_id)
-        .ok_or_else(|| anyhow!("event not found"))?;
+    let event = state.store.find_event(&id, false, &event_id)?;
     Ok(Json(event))
 }
 
@@ -308,18 +392,13 @@ async fn event_stream(
     state.store.load_metadata(&id)?;
     let mut cursor = query.after;
     if cursor.is_none() {
-        cursor = state
-            .store
-            .read_events(&id)?
-            .last()
-            .map(|e| e.event_id.clone());
+        cursor = state.store.latest_event_id(&id, false)?;
     }
     let types = event_types(query.types.as_deref());
     let output = stream! {
         loop {
-            let events = state.store.read_events(&id).unwrap_or_default();
-            let start = cursor.as_ref().and_then(|c| events.iter().position(|e| &e.event_id == c)).map(|p| p + 1).unwrap_or(0);
-            for event in events.iter().skip(start) {
+            let events = state.store.query_events(&id, false, &[], cursor.as_deref(), None, 10_000).unwrap_or_default();
+            for event in &events {
                 cursor = Some(event.event_id.clone());
                 if types.is_empty() || types.iter().any(|t| t == &event.event_type) {
                     yield Ok(Event::default().id(event.event_id.clone()).event("event").data(serde_json::to_string(&event_preview(event)).unwrap()));
@@ -424,6 +503,7 @@ fn utf8_preview(value: &str, max: usize) -> (&str, bool) {
 #[derive(Deserialize)]
 struct MessageBody {
     message: String,
+    model: Option<String>,
     wall_time_minutes: Option<u64>,
 }
 async fn send_message(
@@ -449,6 +529,7 @@ async fn side_question(
     Ok(Json(state.manager.create_side(
         &id,
         body.message,
+        body.model,
         body.wall_time_minutes.or(Some(2)),
     )?))
 }
@@ -498,6 +579,7 @@ async fn create_side(
     Ok(Json(state.manager.create_side(
         &id,
         body.message,
+        body.model,
         body.wall_time_minutes.or(Some(2)),
     )?))
 }
@@ -537,27 +619,16 @@ async fn side_events(
     Query(query): Query<EventsQuery>,
 ) -> ApiResult<Response> {
     authorize(&state, &headers, false)?;
-    let mut events = state.store.read_side_events(&id)?;
-    if let Some(before) = query.before {
-        let position = events
-            .iter()
-            .position(|event| event.event_id == before)
-            .ok_or_else(|| anyhow!("event cursor not found"))?;
-        events.truncate(position);
-    }
-    if let Some(after) = query.after {
-        let position = events
-            .iter()
-            .position(|event| event.event_id == after)
-            .ok_or_else(|| anyhow!("event cursor not found"))?;
-        events.drain(..=position);
-    }
     let types = event_types(query.types.as_deref());
-    events.retain(|event| types.is_empty() || types.iter().any(|kind| kind == &event.event_type));
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
-    if events.len() > limit {
-        events.drain(..events.len() - limit);
-    }
+    let events = state.store.query_events(
+        &id,
+        true,
+        &types,
+        query.after.as_deref(),
+        query.before.as_deref(),
+        limit,
+    )?;
     Ok(ndjson(events.iter().map(event_preview)))
 }
 
@@ -567,12 +638,7 @@ async fn full_side_event(
     Path((id, event_id)): Path<(String, String)>,
 ) -> ApiResult<Json<EventRecord>> {
     authorize(&state, &headers, false)?;
-    let event = state
-        .store
-        .read_side_events(&id)?
-        .into_iter()
-        .find(|event| event.event_id == event_id)
-        .ok_or_else(|| anyhow!("event not found"))?;
+    let event = state.store.find_event(&id, true, &event_id)?;
     Ok(Json(event))
 }
 
@@ -586,18 +652,13 @@ async fn side_event_stream(
     state.store.load_side_metadata(&id)?;
     let mut cursor = query.after;
     if cursor.is_none() {
-        cursor = state
-            .store
-            .read_side_events(&id)?
-            .last()
-            .map(|event| event.event_id.clone());
+        cursor = state.store.latest_event_id(&id, true)?;
     }
     let types = event_types(query.types.as_deref());
     let output = stream! {
         loop {
-            let events = state.store.read_side_events(&id).unwrap_or_default();
-            let start = cursor.as_ref().and_then(|value| events.iter().position(|event| &event.event_id == value)).map(|position| position + 1).unwrap_or(0);
-            for event in events.iter().skip(start) {
+            let events = state.store.query_events(&id, true, &[], cursor.as_deref(), None, 10_000).unwrap_or_default();
+            for event in &events {
                 cursor = Some(event.event_id.clone());
                 if types.is_empty() || types.iter().any(|kind| kind == &event.event_type) {
                     yield Ok(Event::default().id(event.event_id.clone()).event("event").data(serde_json::to_string(&event_preview(event)).unwrap()));

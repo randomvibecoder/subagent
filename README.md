@@ -13,6 +13,8 @@ to parse around.
 - OpenAI-compatible chat-completions API
 - Full coding tools, including Bash and eight background terminals per agent
 - Durable, readonly Side runs with saved answers and tool traces
+- Durable high-signal notifications for master-agent coordination
+- Per-Agent and per-Side model overrides
 
 ## Install
 
@@ -95,7 +97,7 @@ Use that ID to inspect or continue the work:
 ```sh
 subagent agents status agt_01...
 subagent agents send agt_01... --message "Also check token refresh behavior."
-subagent agents logs agt_01... --follow
+subagent inbox --agent agt_01...
 ```
 
 `send` returns immediately after the daemon durably stores the message:
@@ -128,6 +130,7 @@ orderly shutdown.
 | `daemon start` | Start the detached per-user daemon |
 | `daemon status` | Report daemon PID, socket, model, and capacity |
 | `daemon stop` | Stop the daemon and its working agents |
+| `inbox` | Read newest-first high-signal Agent and Side notifications |
 | `agents spawn` | Create and immediately start a persistent agent |
 | `agents list` | Filter, sort, and paginate stored agents |
 | `agents status ID` | Read one agent's current metadata |
@@ -160,7 +163,8 @@ printf '%s\n' "Review this repository" | \
 Names are mandatory, case-sensitive, unique across stored agents, and 4–40 Unicode
 characters. IDs remain authoritative for every command. Agents start in `readonly`
 mode unless `--mode write` is supplied. Optional `--wall-time-minutes MINUTES` values
-are integers from 1 through 6000.
+are integers from 1 through 6000. `--model MODEL` overrides the daemon default for
+that Agent and remains selected when the Agent resumes.
 
 ### List filters
 
@@ -190,12 +194,25 @@ Start the daemon with a localhost-only dashboard when a human wants to monitor i
 subagent daemon start --web-ui-port 7341
 ```
 
-The daemon response includes a fresh tokenized `web_ui_url`. Open that exact URL in a
-browser. The embedded dark-only UI binds only `127.0.0.1`, uses `#000000` for the
+The embedded dark-only UI binds only `127.0.0.1`. The daemon response includes a plain
+`web_ui_url`; open it in a browser. To require HTTP Basic Auth, set the password only
+in the daemon startup environment (the fixed username is `subagent`):
+
+```sh
+SUBAGENT_WEB_PASSWORD='choose-a-secret' \
+  subagent daemon start --web-ui-port 7341
+```
+
+When the variable is absent, the localhost UI has no authentication. `daemon status`
+reports `web_auth` as `basic`, `none`, or `null` when the UI is disabled, and never
+returns the password. The password is stripped from agent shell environments. The UI
+uses `#000000` for the
 background, `#ffffff` for primary text, and light gray for secondary metadata. It
 supports the human-facing equivalents of spawn, rename, list/status, filtered live
 logs, send, message inspection/cancellation, side questions, time, stop, and confirmed
-delete. The dashboard opens each agent on a dedicated routed page. Tool activity is
+delete. Its dashboard notification panel filters by minimum priority, Agent, page
+size, and offset; it refreshes every five seconds and collapses long summaries. The
+dashboard opens each agent on a dedicated routed page. Tool activity is
 rendered as readable collapsed accordions instead of raw JSON; `apply_patch` calls use
 a one-pane Git-style diff with red deletions and green additions. Agent pages have
 Main, Side, and Controls tabs. Main opens at the newest event and loads history while
@@ -203,6 +220,20 @@ scrolling upward, using the full remaining viewport without a conversation card.
 Side is a history index; every Side run opens on its own full-screen page with the
 same Main/Controls layout and saved tool trace. The UI
 intentionally omits config, daemon administration, and raw context.
+
+### Notifications
+
+Use the inbox as the normal coordination surface for a master agent. It returns
+compact JSONL without transcript or tool payloads:
+
+```sh
+subagent inbox
+subagent inbox --priority 3 --agent agt_01... --limit 50 --offset 0
+```
+
+Results are newest-first. Defaults are 20 entries and priority 2 or higher; limit is
+1–100. The retained journal contains the latest 10,000 Notifications. There is no
+follow, wait, acknowledgement, or read/unread state.
 
 ### Logs and context
 
@@ -248,6 +279,7 @@ to its transcript:
 
 ```sh
 subagent sides create agt_01... \
+  --model optional-side-model \
   --message "Which module validates refresh tokens, and why?"
 ```
 
@@ -278,6 +310,7 @@ All agents can receive these tools:
 | `terminate_all_terminals` | Stop every terminal owned by the agent |
 | `read_output` | Read bounded chunks from complete stored command output |
 | `view_image` | Attach a local image to the next model request |
+| `notify` | Publish progress, milestone, input-required, or blocked updates to the inbox |
 
 Write-mode agents additionally receive three mutation styles:
 
@@ -289,7 +322,7 @@ Write-mode agents additionally receive three mutation styles:
 
 Each agent may own at most eight live background terminals. Terminal process groups
 are cleaned up when an agent finishes, stops, fails, times out, or the daemon exits.
-The API key is removed from agent shell environments.
+The API key and optional Web UI password are removed from agent shell environments.
 
 ## Configuration
 
@@ -298,6 +331,7 @@ Environment variables override stored configuration:
 | Variable | Meaning |
 | --- | --- |
 | `OPENAI_API_KEY` | Required daemon credential; never written to configuration |
+| `SUBAGENT_WEB_PASSWORD` | Optional HTTP Basic Auth password for the localhost Web UI; fixed username `subagent` |
 | `OPENAI_BASE_URL` | OpenAI-compatible API base URL |
 | `OPENAI_MODEL` | Model sent to chat completions |
 | `SUBAGENT_MAX_AGENTS` | Maximum simultaneously working agents; `0` is unlimited |
@@ -321,12 +355,15 @@ Defaults follow the XDG base-directory convention:
 ~/.config/subagent/config.toml
 ~/.local/state/subagent/
 ├── daemon.log
+├── notifications.jsonl
+├── notification-sequence
 └── agents/
     └── agt_<ULID>/
         ├── metadata.json
         ├── context.json
         ├── messages.json
         ├── events.jsonl
+        ├── event-sequence
         └── outputs/
 ```
 

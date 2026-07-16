@@ -54,6 +54,8 @@ enum TopCommand {
         about = "Inspect and cancel durable agent messages. Output: JSONL."
     )]
     Messages(MessagesCommand),
+    #[command(about = "Read the durable high-signal notification journal. Output: JSONL.")]
+    Inbox(InboxArgs),
     #[command(subcommand, about = "Manage non-secret configuration. Output: JSONL.")]
     Config(ConfigCommand),
     #[command(name = "__serve", hide = true)]
@@ -220,6 +222,9 @@ struct SpawnArgs {
     /// readonly omits structured write tools but Bash remains advisory.
     #[arg(long, value_enum, default_value = "readonly")]
     mode: ModeArg,
+    /// Override the daemon's default model for this agent.
+    #[arg(long)]
+    model: Option<String>,
     /// Optional deadline in integer minutes from spawn; 1 through 6000.
     #[arg(long, value_name = "MINUTES", value_parser = parse_minutes)]
     wall_time_minutes: Option<u64>,
@@ -327,9 +332,31 @@ struct SideArgs {
     /// Read UTF-8 input from PATH; use - for stdin.
     #[arg(long, value_name = "PATH")]
     message_file: Option<String>,
+    /// Override the parent agent's model for this Side run.
+    #[arg(long)]
+    model: Option<String>,
     /// Optional side-agent deadline in integer minutes; 1 through 6000.
     #[arg(long, value_name = "MINUTES", value_parser = parse_minutes)]
     wall_time_minutes: Option<u64>,
+}
+
+#[derive(Args)]
+#[command(
+    after_help = "Each line is one notification, newest first. --priority N includes priority N and higher."
+)]
+struct InboxArgs {
+    /// Maximum notifications to emit, from 1 through 100.
+    #[arg(long, default_value_t = 20, value_parser = parse_inbox_limit)]
+    limit: usize,
+    /// Number of matching notifications to skip.
+    #[arg(long, default_value_t = 0)]
+    offset: usize,
+    /// Minimum priority to include, from 1 through 5.
+    #[arg(long, default_value_t = 2, value_parser = parse_priority)]
+    priority: u8,
+    /// Include notifications for only this main agent ID.
+    #[arg(long, value_name = "AGENT_ID")]
+    agent: Option<String>,
 }
 
 pub async fn run() -> Result<()> {
@@ -365,6 +392,15 @@ async fn run_inner() -> Result<()> {
         TopCommand::Daemon(DaemonCommand::Status) => request(Request::DaemonStatus).await,
         TopCommand::Daemon(DaemonCommand::Stop) => request(Request::DaemonStop).await,
         TopCommand::Config(command) => config_command(command),
+        TopCommand::Inbox(args) => {
+            request(Request::Inbox {
+                limit: args.limit,
+                offset: args.offset,
+                minimum_priority: args.priority,
+                agent_id: args.agent,
+            })
+            .await
+        }
         TopCommand::Messages(command) => {
             let req = match command {
                 MessagesCommand::List { agent_id, statuses } => {
@@ -392,6 +428,7 @@ async fn run_inner() -> Result<()> {
                 SidesCommand::Create(args) => Request::AgentSide {
                     id: args.id,
                     message: read_message(args.message, args.message_file).await?,
+                    model: args.model,
                     wall_time_minutes: args.wall_time_minutes,
                 },
                 SidesCommand::List {
@@ -429,6 +466,7 @@ async fn run_inner() -> Result<()> {
                     message: read_message(a.message, a.message_file).await?,
                     name: a.name,
                     mode: a.mode.into(),
+                    model: a.model,
                     wall_time_minutes: a.wall_time_minutes,
                 },
                 AgentsCommand::List(a) => Request::AgentList {
@@ -468,6 +506,7 @@ async fn run_inner() -> Result<()> {
                 AgentsCommand::Side(a) => Request::AgentSide {
                     id: a.id,
                     message: read_message(a.message, a.message_file).await?,
+                    model: a.model,
                     wall_time_minutes: a.wall_time_minutes,
                 },
                 AgentsCommand::Time { id, minutes } => Request::AgentTime { id, minutes },
@@ -627,6 +666,26 @@ fn parse_log_limit(value: &str) -> std::result::Result<usize, String> {
         return Err("limit must be an integer from 1 through 10000".into());
     }
     Ok(limit)
+}
+
+fn parse_inbox_limit(value: &str) -> std::result::Result<usize, String> {
+    let limit = value
+        .parse::<usize>()
+        .map_err(|_| "limit must be an integer from 1 through 100".to_string())?;
+    if !(1..=100).contains(&limit) {
+        return Err("limit must be an integer from 1 through 100".into());
+    }
+    Ok(limit)
+}
+
+fn parse_priority(value: &str) -> std::result::Result<u8, String> {
+    let priority = value
+        .parse::<u8>()
+        .map_err(|_| "priority must be an integer from 1 through 5".to_string())?;
+    if !(1..=5).contains(&priority) {
+        return Err("priority must be an integer from 1 through 5".into());
+    }
+    Ok(priority)
 }
 
 fn parse_minutes(value: &str) -> std::result::Result<u64, String> {

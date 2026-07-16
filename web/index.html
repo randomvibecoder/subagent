@@ -78,6 +78,10 @@
                 max="6000"
                 placeholder="No limit"
             /></label>
+            <label class="wide"
+              ><span>Model override</span
+              ><input name="model" placeholder="Use daemon default"
+            /></label>
             <label class="task"
               ><span>Task</span
               ><textarea
@@ -100,6 +104,34 @@
             </div>
           </div>
           <div id="agents" class="agent-list"></div>
+        </section>
+        <section class="panel inbox-panel">
+          <div class="section-heading inbox-heading">
+            <div>
+              <h2>Notifications</h2>
+              <p>High-signal updates from main and Side agents.</p>
+            </div>
+            <button id="refresh-inbox" type="button">Refresh</button>
+          </div>
+          <form id="inbox-filters" class="inbox-filters">
+            <label><span>Minimum priority</span><select name="priority">
+              <option value="1">1 · all progress</option>
+              <option value="2" selected>2 · milestones+</option>
+              <option value="3">3 · action required+</option>
+              <option value="4">4 · blocked or failed+</option>
+              <option value="5">5 · critical only</option>
+            </select></label>
+            <label><span>Agent</span><select id="inbox-agent" name="agent"><option value="">All agents</option></select></label>
+            <label><span>Entries</span><select name="limit">
+              <option value="10">10</option><option value="20" selected>20</option><option value="50">50</option><option value="100">100</option>
+            </select></label>
+          </form>
+          <div id="inbox" class="inbox-list"><div class="empty-state">Loading notifications…</div></div>
+          <div class="inbox-pagination">
+            <button id="inbox-previous" type="button" disabled>Previous</button>
+            <span id="inbox-page" class="meta">Page 1</span>
+            <button id="inbox-next" type="button" disabled>Next</button>
+          </div>
         </section>
       </div>
 
@@ -277,7 +309,7 @@
               <textarea
                 rows="2"
                 disabled
-                placeholder="Side runs are one-shot. Start a new Side for another question."
+                placeholder="Side runs are one-shot."
               ></textarea>
               <button id="new-side-from-page" class="primary" type="button">
                 New Side
@@ -343,6 +375,10 @@
             max="6000"
             value="2"
             required
+        /></label>
+        <label
+          ><span>Model override</span
+          ><input name="model" placeholder="Inherit parent model"
         /></label>
         <div class="form-footer">
           <button id="cancel-side" type="button">Cancel</button

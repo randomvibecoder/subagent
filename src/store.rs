@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     cmp::Ordering,
+    collections::VecDeque,
     fs,
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
@@ -189,6 +190,30 @@ pub struct EventRecord {
     pub data: Value,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NotificationRecord {
+    #[serde(rename = "type")]
+    pub kind: String,
+    pub id: String,
+    pub sequence: u64,
+    pub agent_id: String,
+    pub agent_name: String,
+    pub side_id: Option<String>,
+    pub timestamp: DateTime<Utc>,
+    pub event_type: String,
+    pub priority: u8,
+    pub status: AgentStatus,
+    pub summary: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct InboxFilter {
+    pub limit: usize,
+    pub offset: usize,
+    pub minimum_priority: u8,
+    pub agent_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ContextSnapshot {
     pub messages: Vec<Value>,
@@ -199,6 +224,7 @@ pub struct ContextSnapshot {
 
 #[derive(Clone)]
 pub struct Store {
+    state_root: PathBuf,
     agents_root: PathBuf,
     sides_root: PathBuf,
     write_lock: Arc<Mutex<()>>,
@@ -210,6 +236,7 @@ impl Store {
         ensure_private_dir(&paths.agents_dir())?;
         ensure_private_dir(&paths.sides_dir())?;
         Ok(Self {
+            state_root: paths.state_dir.clone(),
             agents_root: paths.agents_dir(),
             sides_root: paths.sides_dir(),
             write_lock: Arc::new(Mutex::new(())),
@@ -234,6 +261,15 @@ impl Store {
     }
     fn events_path(&self, id: &str) -> PathBuf {
         self.agent_dir(id).join("events.jsonl")
+    }
+    fn event_sequence_path(&self, id: &str) -> PathBuf {
+        self.owner_dir(id).join("event-sequence")
+    }
+    fn notifications_path(&self) -> PathBuf {
+        self.state_root.join("notifications.jsonl")
+    }
+    fn notification_sequence_path(&self) -> PathBuf {
+        self.state_root.join("notification-sequence")
     }
     fn context_path(&self, id: &str) -> PathBuf {
         self.agent_dir(id).join("context.json")
@@ -413,17 +449,28 @@ impl Store {
     }
 
     pub fn has_message_event(&self, id: &str, message_id: &str) -> Result<bool> {
-        Ok(self.read_events(id)?.iter().any(|event| {
-            event.event_type == "user_message"
+        let path = self.events_path(id);
+        let file = fs::File::open(&path).with_context(|| format!("agent not found: {id}"))?;
+        for line in BufReader::new(file).lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let event: EventRecord = serde_json::from_str(&line)?;
+            if event.event_type == "user_message"
                 && event.data.get("message_id").and_then(Value::as_str) == Some(message_id)
-        }))
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     pub fn append_event(&self, id: &str, event_type: &str, data: Value) -> Result<EventRecord> {
         #[cfg(unix)]
         use std::os::unix::fs::OpenOptionsExt;
         let _guard = self.write_lock.lock().unwrap();
-        let sequence = self.event_count(id)? + 1;
+        let sequence = self.next_sequence(&self.events_path(id), &self.event_sequence_path(id))?;
         let event = EventRecord {
             event_id: format!("evt_{}", ulid::Ulid::new()),
             agent_id: id.to_string(),
@@ -448,27 +495,200 @@ impl Store {
         Ok(event)
     }
 
-    fn event_count(&self, id: &str) -> Result<u64> {
-        let path = self.events_path(id);
-        if !path.exists() {
-            return Ok(0);
-        }
-        Ok(BufReader::new(fs::File::open(path)?).lines().count() as u64)
+    fn next_sequence(&self, journal: &Path, counter: &Path) -> Result<u64> {
+        let current = if counter.exists() {
+            fs::read_to_string(counter)?.trim().parse::<u64>()?
+        } else if journal.exists() {
+            BufReader::new(fs::File::open(journal)?)
+                .lines()
+                .map_while(Result::ok)
+                .filter_map(|line| serde_json::from_str::<Value>(&line).ok())
+                .filter_map(|value| value.get("sequence").and_then(Value::as_u64))
+                .max()
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let next = current.saturating_add(1);
+        write_private_atomic(counter, next.to_string().as_bytes())?;
+        Ok(next)
     }
 
-    pub fn read_events(&self, id: &str) -> Result<Vec<EventRecord>> {
-        let path = self.events_path(id);
-        let file = fs::File::open(&path).with_context(|| format!("agent not found: {id}"))?;
-        BufReader::new(file)
-            .lines()
-            .filter_map(|line| match line {
-                Ok(s) if !s.trim().is_empty() => {
-                    Some(serde_json::from_str(&s).map_err(anyhow::Error::from))
-                }
-                Ok(_) => None,
-                Err(e) => Some(Err(e.into())),
+    pub fn append_notification(
+        &self,
+        owner_id: &str,
+        event_type: &str,
+        priority: u8,
+        status: AgentStatus,
+        summary: impl AsRef<str>,
+    ) -> Result<NotificationRecord> {
+        #[cfg(unix)]
+        use std::os::unix::fs::OpenOptionsExt;
+        if !(1..=5).contains(&priority) {
+            bail!("notification priority must be from 1 through 5");
+        }
+        let _guard = self.write_lock.lock().unwrap();
+        let (agent_id, agent_name, side_id) = if owner_id.starts_with("side_") {
+            let side = self.load_side_metadata(owner_id)?;
+            let parent = self.load_metadata(&side.agent_id)?;
+            (side.agent_id, parent.name, Some(owner_id.to_string()))
+        } else {
+            let agent = self.load_metadata(owner_id)?;
+            (agent.id, agent.name, None)
+        };
+        let path = self.notifications_path();
+        let sequence = self.next_sequence(&path, &self.notification_sequence_path())?;
+        let notification = NotificationRecord {
+            kind: "notification".into(),
+            id: format!("ntf_{}", ulid::Ulid::new()),
+            sequence,
+            agent_id,
+            agent_name,
+            side_id,
+            timestamp: Utc::now(),
+            event_type: event_type.to_string(),
+            priority,
+            status,
+            summary: truncate_chars(summary.as_ref(), 5_000),
+        };
+        let mut options = fs::OpenOptions::new();
+        options.create(true).append(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options.open(&path)?;
+        serde_json::to_writer(&mut file, &notification)?;
+        file.write_all(b"\n")?;
+        file.flush()?;
+        if sequence > 10_000 && sequence % 1_000 == 0 {
+            self.compact_notifications_locked()?;
+        }
+        Ok(notification)
+    }
+
+    pub fn list_notifications(&self, filter: &InboxFilter) -> Result<Vec<NotificationRecord>> {
+        let path = self.notifications_path();
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        let mut retained = VecDeque::with_capacity(10_000);
+        for line in BufReader::new(fs::File::open(path)?).lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let notification: NotificationRecord = serde_json::from_str(&line)?;
+            if retained.len() == 10_000 {
+                retained.pop_front();
+            }
+            retained.push_back(notification);
+        }
+        Ok(retained
+            .into_iter()
+            .rev()
+            .filter(|notification| notification.priority >= filter.minimum_priority)
+            .filter(|notification| {
+                filter
+                    .agent_id
+                    .as_ref()
+                    .is_none_or(|id| &notification.agent_id == id)
             })
-            .collect()
+            .skip(filter.offset)
+            .take(filter.limit)
+            .collect())
+    }
+
+    fn compact_notifications_locked(&self) -> Result<()> {
+        let notifications = self.list_notifications(&InboxFilter {
+            limit: 10_000,
+            offset: 0,
+            minimum_priority: 1,
+            agent_id: None,
+        })?;
+        let mut body = Vec::new();
+        for notification in notifications.into_iter().rev() {
+            serde_json::to_writer(&mut body, &notification)?;
+            body.push(b'\n');
+        }
+        write_private_atomic(&self.notifications_path(), &body)
+    }
+
+    pub fn query_events(
+        &self,
+        id: &str,
+        side: bool,
+        types: &[String],
+        after: Option<&str>,
+        before: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<EventRecord>> {
+        let limit = limit.max(1);
+        let path = if side {
+            self.load_side_metadata(id)?;
+            self.side_dir(id).join("events.jsonl")
+        } else {
+            self.load_metadata(id)?;
+            self.events_path(id)
+        };
+        let file = fs::File::open(&path).with_context(|| format!("history not found: {id}"))?;
+        let mut after_found = after.is_none();
+        let mut before_found = before.is_none();
+        let mut selected = VecDeque::with_capacity(limit.min(10_000));
+        for line in BufReader::new(file).lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let event: EventRecord = serde_json::from_str(&line)?;
+            if before == Some(event.event_id.as_str()) {
+                before_found = true;
+                break;
+            }
+            if !after_found {
+                if after == Some(event.event_id.as_str()) {
+                    after_found = true;
+                }
+                continue;
+            }
+            if !types.is_empty() && !types.iter().any(|kind| kind == &event.event_type) {
+                continue;
+            }
+            if selected.len() == limit {
+                selected.pop_front();
+            }
+            selected.push_back(event);
+        }
+        if !after_found || !before_found {
+            bail!("event cursor not found");
+        }
+        Ok(selected.into())
+    }
+
+    pub fn find_event(&self, id: &str, side: bool, event_id: &str) -> Result<EventRecord> {
+        let path = if side {
+            self.load_side_metadata(id)?;
+            self.side_dir(id).join("events.jsonl")
+        } else {
+            self.load_metadata(id)?;
+            self.events_path(id)
+        };
+        for line in BufReader::new(fs::File::open(path)?).lines() {
+            let line = line?;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let event: EventRecord = serde_json::from_str(&line)?;
+            if event.event_id == event_id {
+                return Ok(event);
+            }
+        }
+        bail!("event not found")
+    }
+
+    pub fn latest_event_id(&self, id: &str, side: bool) -> Result<Option<String>> {
+        Ok(self
+            .query_events(id, side, &[], None, None, 1)?
+            .last()
+            .map(|event| event.event_id.clone()))
     }
 
     pub fn list(&self, filter: &ListFilter) -> Result<Vec<AgentMetadata>> {
@@ -517,6 +737,13 @@ impl Store {
                     &meta.id,
                     "lifecycle",
                     json!({"status":"stopped","reason":"daemon_interrupted"}),
+                )?;
+                self.append_notification(
+                    &meta.id,
+                    "stopped",
+                    3,
+                    AgentStatus::Stopped,
+                    "Agent stopped because the daemon was interrupted",
                 )?;
                 count += 1;
             }
@@ -582,11 +809,7 @@ impl Store {
         let _guard = self.write_lock.lock().unwrap();
         let mut meta = self.load_side_metadata(id)?;
         let path = self.side_dir(id).join("events.jsonl");
-        let sequence = if path.exists() {
-            BufReader::new(fs::File::open(&path)?).lines().count() as u64 + 1
-        } else {
-            1
-        };
+        let sequence = self.next_sequence(&path, &self.event_sequence_path(id))?;
         let event = EventRecord {
             event_id: format!("evt_{}", ulid::Ulid::new()),
             agent_id: meta.agent_id.clone(),
@@ -607,22 +830,6 @@ impl Store {
         meta.updated_at = event.timestamp;
         self.save_side_metadata(&meta)?;
         Ok(event)
-    }
-
-    pub fn read_side_events(&self, id: &str) -> Result<Vec<EventRecord>> {
-        self.load_side_metadata(id)?;
-        let path = self.side_dir(id).join("events.jsonl");
-        let file = fs::File::open(&path).with_context(|| format!("side not found: {id}"))?;
-        BufReader::new(file)
-            .lines()
-            .filter_map(|line| match line {
-                Ok(value) if !value.trim().is_empty() => {
-                    Some(serde_json::from_str(&value).map_err(anyhow::Error::from))
-                }
-                Ok(_) => None,
-                Err(error) => Some(Err(error.into())),
-            })
-            .collect()
     }
 
     pub fn list_sides(&self, agent_id: &str) -> Result<Vec<SideMetadata>> {
@@ -675,6 +882,13 @@ impl Store {
                     &id,
                     "lifecycle",
                     json!({"status":"stopped","reason":"daemon_interrupted"}),
+                )?;
+                self.append_notification(
+                    &id,
+                    "stopped",
+                    3,
+                    AgentStatus::Stopped,
+                    "Side agent stopped because the daemon was interrupted",
                 )?;
                 count += 1;
             }
@@ -777,6 +991,10 @@ fn compare_meta(a: &AgentMetadata, b: &AgentMetadata, key: &str) -> Ordering {
         _ => a.spawned_at.cmp(&b.spawned_at),
     }
     .then_with(|| a.id.cmp(&b.id))
+}
+
+fn truncate_chars(value: &str, maximum: usize) -> String {
+    value.chars().take(maximum).collect()
 }
 
 pub fn normalize_agent_name(name: &str) -> Result<String> {
@@ -904,14 +1122,108 @@ mod name_tests {
             )
             .unwrap();
         assert_eq!(event.side_id.as_deref(), Some(side.id.as_str()));
+        let assistant = store
+            .append_side_event(&side.id, "assistant_message", json!({"content":"answer"}))
+            .unwrap();
+        fs::remove_file(store.event_sequence_path(&side.id)).unwrap();
+        let migrated = store
+            .append_side_event(&side.id, "reasoning", json!({"content":"checked"}))
+            .unwrap();
+        assert_eq!(migrated.sequence, assistant.sequence + 1);
+        let selected = store
+            .query_events(
+                &side.id,
+                true,
+                &["assistant_message".into()],
+                Some(&event.event_id),
+                None,
+                1,
+            )
+            .unwrap();
+        assert_eq!(selected[0].event_id, assistant.event_id);
         assert_eq!(store.working_side_count(&agent.id).unwrap(), 1);
         assert_eq!(store.recover_interrupted_sides().unwrap(), 1);
         assert_eq!(
             store.load_side_metadata(&side.id).unwrap().status,
             AgentStatus::Stopped
         );
+        let notification = store
+            .append_notification(
+                &agent.id,
+                "milestone",
+                2,
+                AgentStatus::Finished,
+                "x".repeat(6_000),
+            )
+            .unwrap();
+        assert_eq!(notification.summary.chars().count(), 5_000);
+        let inbox = store
+            .list_notifications(&InboxFilter {
+                limit: 1,
+                offset: 0,
+                minimum_priority: 2,
+                agent_id: Some(agent.id.clone()),
+            })
+            .unwrap();
+        assert_eq!(inbox[0].id, notification.id);
         store.delete_sides_for_agent(&agent.id).unwrap();
         assert!(!store.side_dir(&side.id).exists());
+        assert!(
+            !store
+                .list_notifications(&InboxFilter {
+                    limit: 10,
+                    offset: 0,
+                    minimum_priority: 1,
+                    agent_id: Some(agent.id.clone()),
+                })
+                .unwrap()
+                .is_empty()
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn inbox_exposes_only_newest_ten_thousand_records() {
+        let root = std::env::temp_dir().join(format!("subagent-inbox-store-{}", ulid::Ulid::new()));
+        let paths = Paths {
+            config_dir: root.join("config"),
+            state_dir: root.join("state"),
+            runtime_dir: root.join("run"),
+        };
+        let store = Store::new(&paths).unwrap();
+        let mut file = fs::File::create(store.notifications_path()).unwrap();
+        for sequence in 1..=10_001 {
+            serde_json::to_writer(
+                &mut file,
+                &NotificationRecord {
+                    kind: "notification".into(),
+                    id: format!("ntf_{sequence:026}"),
+                    sequence,
+                    agent_id: "agt_01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
+                    agent_name: "Agent".into(),
+                    side_id: None,
+                    timestamp: Utc::now(),
+                    event_type: "progress".into(),
+                    priority: 1,
+                    status: AgentStatus::Working,
+                    summary: sequence.to_string(),
+                },
+            )
+            .unwrap();
+            file.write_all(b"\n").unwrap();
+        }
+        file.flush().unwrap();
+        let inbox = store
+            .list_notifications(&InboxFilter {
+                limit: 10_000,
+                offset: 0,
+                minimum_priority: 1,
+                agent_id: None,
+            })
+            .unwrap();
+        assert_eq!(inbox.len(), 10_000);
+        assert_eq!(inbox.first().unwrap().sequence, 10_001);
+        assert_eq!(inbox.last().unwrap().sequence, 2);
         let _ = fs::remove_dir_all(root);
     }
 }
