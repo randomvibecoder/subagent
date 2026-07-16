@@ -247,9 +247,7 @@ async fn dispatch(
                     .last()
                     .and_then(|value| value.get("id"))
                     .and_then(Value::as_str)
-                    .map(|id| {
-                        store.list_cursor(&store.load_metadata(id)?, &filter.sort, &filter.order)
-                    })
+                    .map(|id| store.list_cursor(&store.load_metadata(id)?, &filter))
                     .transpose()?
             } else {
                 None
@@ -290,10 +288,13 @@ async fn dispatch(
                     side: false,
                 });
             }
-            query_logs(store, &id, false, &types, after.as_deref(), limit)?
+            let mut values = query_logs(store, &id, false, &types, after.as_deref(), limit)?
                 .into_iter()
                 .map(serde_json::to_value)
-                .collect::<Result<_, _>>()?
+                .collect::<Result<Vec<_>, _>>()?;
+            let agent = store.load_metadata(&id)?;
+            values.push(json!({"type":"logs_summary","owner":"agent","agent_id":id,"agent_ref":agent.local_ref,"side_id":null,"side_ref":null,"count":values.len()}));
+            values
         }
         Request::AgentContext { id } => context_lines(store, &id, store.load_context(&id)?)?,
         Request::AgentSend {
@@ -310,6 +311,7 @@ async fn dispatch(
         Request::Inbox {
             limit,
             offset,
+            after_cursor,
             minimum_priority,
             agent_id,
             include_acknowledged,
@@ -322,14 +324,19 @@ async fn dispatch(
                     false,
                 ));
             }
-            let mut values = store
-                .list_notifications(&InboxFilter {
-                    limit,
-                    offset,
-                    minimum_priority,
-                    agent_id,
-                    include_acknowledged,
-                })?
+            if after_cursor.is_some() && offset != 0 {
+                return Err(cursor_offset_error("inbox", offset));
+            }
+            let page = store.list_notifications_page(&InboxFilter {
+                limit,
+                offset,
+                after_cursor,
+                minimum_priority,
+                agent_id,
+                include_acknowledged,
+            })?;
+            let mut values = page
+                .items
                 .into_iter()
                 .map(serde_json::to_value)
                 .collect::<Result<Vec<_>, _>>()?;
@@ -337,6 +344,7 @@ async fn dispatch(
                 "type":"inbox_summary",
                 "count":values.len(),
                 "acknowledged_through":store.notification_acknowledged_through()?,
+                "next_cursor":page.next_cursor,
             }));
             values
         }
@@ -368,6 +376,7 @@ async fn dispatch(
             statuses,
             limit,
             offset,
+            after_cursor,
         } => {
             if !(1..=MAX_LIST_LIMIT).contains(&limit) {
                 return Err(coded_error(
@@ -377,13 +386,18 @@ async fn dispatch(
                     false,
                 ));
             }
-            let mut values = manager
-                .list_sides(&agent_id, &statuses, limit, offset)?
+            if after_cursor.is_some() && offset != 0 {
+                return Err(cursor_offset_error("side list", offset));
+            }
+            let page =
+                manager.list_sides(&agent_id, &statuses, limit, offset, after_cursor.as_deref())?;
+            let mut values = page
+                .items
                 .into_iter()
                 .map(serde_json::to_value)
                 .collect::<Result<Vec<_>, _>>()?;
             let agent_ref = store.load_metadata(&agent_id)?.local_ref;
-            values.push(json!({"type":"list_summary","resource":"sides","agent_id":agent_id,"agent_ref":agent_ref,"count":values.len()}));
+            values.push(json!({"type":"list_summary","resource":"sides","agent_id":agent_id,"agent_ref":agent_ref,"count":values.len(),"next_cursor":page.next_cursor}));
             values
         }
         Request::SideStatus { id } => vec![serde_json::to_value(store.load_side_metadata(&id)?)?],
@@ -408,10 +422,13 @@ async fn dispatch(
                     side: true,
                 });
             }
-            query_logs(store, &id, true, &types, after.as_deref(), limit)?
+            let mut values = query_logs(store, &id, true, &types, after.as_deref(), limit)?
                 .into_iter()
                 .map(serde_json::to_value)
-                .collect::<Result<_, _>>()?
+                .collect::<Result<Vec<_>, _>>()?;
+            let side = store.load_side_metadata(&id)?;
+            values.push(json!({"type":"logs_summary","owner":"side","agent_id":side.agent_id,"agent_ref":side.agent_ref,"side_id":id,"side_ref":side.local_ref,"count":values.len()}));
+            values
         }
         Request::SideStop { id } => vec![serde_json::to_value(
             manager.stop_side(&id, "user_request").await?,
@@ -430,20 +447,29 @@ async fn dispatch(
             vec![agent_value(manager.stop(&id, "user_request").await?)?]
         }
         Request::AgentDelete { id } => vec![manager.delete_agent(&id).await?],
-        Request::MessageList { agent_id, statuses } => {
-            let mut values = store
-                .read_messages(&agent_id)?
+        Request::MessageList {
+            agent_id,
+            statuses,
+            limit,
+            after_cursor,
+        } => {
+            if !(1..=MAX_LIST_LIMIT).contains(&limit) {
+                return Err(coded_error(
+                    "invalid_argument",
+                    "message list limit must be from 1 through 1000",
+                    json!({"field":"limit","minimum":1,"maximum":MAX_LIST_LIMIT,"value":limit}),
+                    false,
+                ));
+            }
+            let page =
+                store.list_messages_page(&agent_id, &statuses, limit, after_cursor.as_deref())?;
+            let mut values = page
+                .items
                 .into_iter()
-                .filter(|message| {
-                    statuses.is_empty()
-                        || statuses
-                            .iter()
-                            .any(|status| status == message.status.as_str())
-                })
                 .map(serde_json::to_value)
                 .collect::<Result<Vec<_>, _>>()?;
             let agent_ref = store.load_metadata(&agent_id)?.local_ref;
-            values.push(json!({"type":"list_summary","resource":"messages","agent_id":agent_id,"agent_ref":agent_ref,"count":values.len()}));
+            values.push(json!({"type":"list_summary","resource":"messages","agent_id":agent_id,"agent_ref":agent_ref,"count":values.len(),"next_cursor":page.next_cursor}));
             values
         }
         Request::MessageStatus {
@@ -541,11 +567,13 @@ fn resolve_local_references(req: Request, store: &Store) -> Result<Request> {
             statuses,
             limit,
             offset,
+            after_cursor,
         } => Request::SideList {
             agent_id: store.resolve_agent_id(&agent_id)?,
             statuses,
             limit,
             offset,
+            after_cursor,
         },
         Request::SideStatus { id } => Request::SideStatus {
             id: store.resolve_side_id(&id)?,
@@ -577,9 +605,16 @@ fn resolve_local_references(req: Request, store: &Store) -> Result<Request> {
                 follow,
             }
         }
-        Request::MessageList { agent_id, statuses } => Request::MessageList {
+        Request::MessageList {
+            agent_id,
+            statuses,
+            limit,
+            after_cursor,
+        } => Request::MessageList {
             agent_id: store.resolve_agent_id(&agent_id)?,
             statuses,
+            limit,
+            after_cursor,
         },
         Request::MessageStatus {
             agent_id,
@@ -606,12 +641,14 @@ fn resolve_local_references(req: Request, store: &Store) -> Result<Request> {
         Request::Inbox {
             limit,
             offset,
+            after_cursor,
             minimum_priority,
             agent_id,
             include_acknowledged,
         } => Request::Inbox {
             limit,
             offset,
+            after_cursor,
             minimum_priority,
             agent_id: agent_id.map(|id| store.resolve_agent_id(&id)).transpose()?,
             include_acknowledged,
@@ -654,6 +691,15 @@ async fn wait_for_agent(
 
 fn agent_value(meta: crate::store::AgentMetadata) -> Result<Value> {
     Ok(serde_json::to_value(meta)?)
+}
+
+fn cursor_offset_error(resource: &str, offset: usize) -> anyhow::Error {
+    coded_error(
+        "invalid_argument",
+        format!("{resource} cursor may only be combined with offset 0"),
+        json!({"fields":["after_cursor","offset"],"offset":offset}),
+        false,
+    )
 }
 
 fn query_logs(

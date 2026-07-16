@@ -246,6 +246,7 @@ async fn list_agents(State(state): State<WebState>, headers: HeaderMap) -> ApiRe
 struct InboxQuery {
     limit: Option<usize>,
     offset: Option<usize>,
+    after_cursor: Option<String>,
     priority: Option<u8>,
     agent: Option<String>,
     all: Option<bool>,
@@ -281,15 +282,25 @@ async fn inbox(
         .filter(|value| !value.is_empty())
         .map(|value| state.store.resolve_agent_id(&value))
         .transpose()?;
-    let mut values = state
-        .store
-        .list_notifications(&InboxFilter {
-            limit,
-            offset: query.offset.unwrap_or(0),
-            minimum_priority: priority,
-            agent_id,
-            include_acknowledged: query.all.unwrap_or(false),
-        })?
+    let offset = query.offset.unwrap_or(0);
+    if query.after_cursor.is_some() && offset != 0 {
+        return Err(ApiError(coded_error(
+            "invalid_argument",
+            "inbox cursor may only be combined with offset 0",
+            json!({"fields":["after_cursor","offset"],"offset":offset}),
+            false,
+        )));
+    }
+    let page = state.store.list_notifications_page(&InboxFilter {
+        limit,
+        offset,
+        after_cursor: query.after_cursor,
+        minimum_priority: priority,
+        agent_id,
+        include_acknowledged: query.all.unwrap_or(false),
+    })?;
+    let mut values = page
+        .items
         .into_iter()
         .map(serde_json::to_value)
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -297,6 +308,7 @@ async fn inbox(
         "type":"inbox_summary",
         "count":values.len(),
         "acknowledged_through":state.store.notification_acknowledged_through()?,
+        "next_cursor":page.next_cursor,
     }));
     Ok(ndjson(values))
 }
@@ -605,6 +617,7 @@ struct SidesQuery {
     statuses: Option<String>,
     limit: Option<usize>,
     offset: Option<usize>,
+    after_cursor: Option<String>,
 }
 
 async fn list_sides(
@@ -630,12 +643,26 @@ async fn list_sides(
             false,
         )));
     }
-    let values = state
-        .manager
-        .list_sides(&id, &statuses, limit, query.offset.unwrap_or(0))?
+    let offset = query.offset.unwrap_or(0);
+    if query.after_cursor.is_some() && offset != 0 {
+        return Err(ApiError(coded_error(
+            "invalid_argument",
+            "side list cursor may only be combined with offset 0",
+            json!({"fields":["after_cursor","offset"],"offset":offset}),
+            false,
+        )));
+    }
+    let page =
+        state
+            .manager
+            .list_sides(&id, &statuses, limit, offset, query.after_cursor.as_deref())?;
+    let agent_ref = state.store.load_metadata(&id)?.local_ref;
+    let mut values = page
+        .items
         .into_iter()
         .map(serde_json::to_value)
         .collect::<std::result::Result<Vec<_>, _>>()?;
+    values.push(json!({"type":"list_summary","resource":"sides","agent_id":id,"agent_ref":agent_ref,"count":values.len(),"next_cursor":page.next_cursor}));
     Ok(ndjson(values))
 }
 
@@ -765,18 +792,47 @@ async fn stop_agent(
         state.manager.stop(&id, "user_request").await?,
     )?))
 }
+#[derive(Default, Deserialize)]
+struct MessagesQuery {
+    statuses: Option<String>,
+    limit: Option<usize>,
+    after_cursor: Option<String>,
+}
+
 async fn list_messages(
     State(state): State<WebState>,
     headers: HeaderMap,
     Path(id): Path<String>,
+    Query(query): Query<MessagesQuery>,
 ) -> ApiResult<Response> {
     authorize(&state, &headers, false)?;
-    let values = state
-        .store
-        .read_messages(&id)?
+    let limit = query.limit.unwrap_or(100);
+    if !(1..=crate::ipc::MAX_LIST_LIMIT).contains(&limit) {
+        return Err(ApiError(coded_error(
+            "invalid_argument",
+            "message list limit must be from 1 through 1000",
+            json!({"field":"limit","minimum":1,"maximum":crate::ipc::MAX_LIST_LIMIT,"value":limit}),
+            false,
+        )));
+    }
+    let statuses = query
+        .statuses
+        .unwrap_or_default()
+        .split(',')
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let page =
+        state
+            .store
+            .list_messages_page(&id, &statuses, limit, query.after_cursor.as_deref())?;
+    let mut values = page
+        .items
         .into_iter()
         .map(serde_json::to_value)
         .collect::<std::result::Result<Vec<_>, _>>()?;
+    let agent_ref = state.store.load_metadata(&id)?.local_ref;
+    values.push(json!({"type":"list_summary","resource":"messages","agent_id":id,"agent_ref":agent_ref,"count":values.len(),"next_cursor":page.next_cursor}));
     Ok(ndjson(values))
 }
 async fn message_status(

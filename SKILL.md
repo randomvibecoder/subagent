@@ -113,9 +113,9 @@ Read its transcript:
 subagent agents logs a_1
 ~~~
 
-By default this emits the newest 20 system, user, and assistant Events in chronological
-order. Tool calls/results, reasoning, lifecycle, and errors are excluded so they do not
-waste model context.
+By default Agent logs emit the newest 20 system, user, and assistant Events in
+chronological order, followed by `logs_summary`. Tool calls/results, reasoning,
+lifecycle, and errors are excluded so they do not waste model context.
 
 Prefer the high-signal inbox when coordinating several agents:
 
@@ -217,8 +217,9 @@ paths, .., and escaping symlinks are permitted because DIR is a working director
 a security boundary.
 
 NAME is mandatory, trimmed, 4–40 Unicode scalar values, control-free, case-sensitive,
-and unique across all stored agents. Commands accept the short local reference, full
-ULID, or an exact unambiguous Agent name. Rename works in every state and returns one agent_renamed
+and unique across all stored agents. Canonical system IDs/refs are reserved, while
+prefix-like names such as `a_team` remain valid. Commands resolve the full durable ID,
+then short local reference, then exact Agent name. Rename works in every state and returns one agent_renamed
 receipt. MINUTES is an integer from 1 through 6000; omission means no deadline.
 Each agent_list_item also contains working_sides, from zero through two.
 Compact list output includes model, current_phase, and last_event_at. `--verbose`
@@ -239,6 +240,7 @@ subagent sides create AGENT
     [--wall-time-minutes MINUTES]
 subagent sides list AGENT
     [--status working|finished|stopped|failed]... [--limit N] [--offset N]
+    [--after-cursor CURSOR]
 subagent sides status SIDE
 subagent sides logs SIDE
     [--type EVENT_TYPE]... [--all] [--after EVENT_ID] [--limit N] [--follow]
@@ -247,7 +249,8 @@ subagent sides delete SIDE
 ~~~
 
 Side creation is asynchronous and persistent. At most two Side runs may be working
-for one parent; a third returns capacity_exceeded. list emits compact Side records,
+for one parent; a third returns capacity_exceeded. list emits compact Side records
+including model/current_phase and a cursor-bearing summary,
 status includes the full question and nullable answer, and logs exposes the saved
 conversation, reasoning, tool calls, and tool results. A daemon interruption marks a
 working Side stopped instead of resuming it. Deleting a parent stops its working
@@ -279,14 +282,15 @@ new Side.
 
 ~~~text
 subagent inbox [--limit N] [--offset N] [--priority 1|2|3|4|5]
-    [--agent AGENT] [--all]
+    [--after-cursor CURSOR] [--agent AGENT] [--all]
 subagent inbox ack SEQUENCE_OR_NOTIFICATION_ID
 subagent inbox follow [--after SEQUENCE] [--priority 1|2|3|4|5]
     [--agent AGENT]
 ~~~
 
 Plain output is unread Notification JSONL, newest first, followed by exactly one
-`inbox_summary` containing the emitted count and global acknowledgement watermark.
+`inbox_summary` containing the emitted count, global acknowledgement watermark, and
+nullable cursor toward older matches.
 limit defaults 20 and accepts 1–100;
 offset defaults zero. priority is a minimum threshold, defaults 2, and therefore
 `--priority 3` includes priorities 3, 4, and 5. agent accepts a ref, durable ID, or
@@ -303,14 +307,17 @@ the final Agent message, capped at 5,000 Unicode scalar values.
 ### Log types
 
 Valid types are system_message, user_message, assistant_message, reasoning, tool_call,
-tool_result, lifecycle, and error.
+tool_result, lifecycle, and error. Agent logs default to system/user/assistant; Side
+logs default to user/assistant. New Side histories do contain a system_message that can
+be selected explicitly.
 
-- No --type: system, user, and assistant only.
+- No --type: the Agent or Side default described above.
 - Repeated --type: only those exact types.
 - --all: every type; conflicts with --type.
 - --limit: 1 through 10000; default 20.
 - --after: exclusive same-agent Event cursor.
 - --follow: flush new matches and exit after the agent becomes terminal.
+- Finite output always ends with logs_summary; follow emits Events only.
 
 ### Raw context debugging
 
@@ -346,11 +353,14 @@ compacted. Use agents logs --all for persisted Event history.
 
 ~~~text
 subagent messages list AGENT [--status pending|delivered|cancelled]...
+    [--limit N] [--after-cursor CURSOR]
 subagent messages status AGENT MESSAGE_ID
 subagent messages cancel AGENT MESSAGE_ID
 ~~~
 
-List emits one Message per line followed by `list_summary`. Cancel works only while pending. Delivery is FIFO.
+List emits newest-first, applies repeated status filters with OR, and ends with an
+Agent-scoped cursor-bearing `list_summary`. Limit defaults 100 and accepts 1–1000.
+Cancel works only while pending. Delivery is FIFO.
 Pending messages survive daemon failure. On restart, interrupted agents with pending
 messages automatically resume as capacity becomes available. A delivered user_message
 Event contains its message_id.
@@ -402,7 +412,7 @@ reverts the working directory, project files, Git state, commits, or branches.
 - End active work: agents stop.
 - Remove daemon history: agents delete only with explicit authorization.
 
-The v0.1.6 contract uses `protocol_version:3`. The binary reports `version` and
+The v0.1.7 contract uses `protocol_version:4`. The binary reports `version` and
 `protocol_version` in daemon status. Operational CLI
 commands reject an incompatible running daemon with `protocol_mismatch`; restart the
 daemon after replacing the binary. The latest binary, this skill, the protocol

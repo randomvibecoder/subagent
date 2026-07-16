@@ -67,6 +67,9 @@
     },
     {
       "$ref": "#/$defs/InboxSummary"
+    },
+    {
+      "$ref": "#/$defs/LogsSummary"
     }
   ],
   "$defs": {
@@ -175,7 +178,7 @@
         "priority": {
           "type": "integer",
           "minimum": 1,
-          "maximum": 5
+          "maximum": 4
         },
         "status": {
           "enum": [
@@ -192,7 +195,13 @@
         "acknowledged": {
           "type": "boolean"
         }
-      }
+      },
+      "allOf": [
+        {"if": {"properties": {"event_type": {"enum": ["spawned", "resumed", "progress"]}}}, "then": {"properties": {"priority": {"const": 1}}}},
+        {"if": {"properties": {"event_type": {"enum": ["milestone", "finished"]}}}, "then": {"properties": {"priority": {"const": 2}}}},
+        {"if": {"properties": {"event_type": {"enum": ["input_required", "possible_stall", "stopped"]}}}, "then": {"properties": {"priority": {"const": 3}}}},
+        {"if": {"properties": {"event_type": {"enum": ["blocked", "failed"]}}}, "then": {"properties": {"priority": {"const": 4}}}}
+      ]
     },
     "Agent": {
       "type": "object",
@@ -653,43 +662,32 @@
       "additionalProperties": false
     },
     "ListSummary": {
-      "type": "object",
-      "required": [
-        "type",
-        "resource",
-        "count"
-      ],
-      "properties": {
-        "type": {
-          "const": "list_summary"
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "resource", "count", "next_cursor"],
+          "properties": {
+            "type": {"const": "list_summary"},
+            "resource": {"const": "agents"},
+            "count": {"type": "integer", "minimum": 0, "maximum": 1000},
+            "next_cursor": {"type": ["string", "null"]}
+          }
         },
-        "resource": {
-          "enum": [
-            "agents",
-            "messages",
-            "sides"
-          ]
-        },
-        "agent_id": {
-          "type": "string",
-          "pattern": "^agt_[0-9A-HJKMNP-TV-Z]{26}$"
-        },
-        "agent_ref": {
-          "type": "string",
-          "pattern": "^a_[1-9][0-9]*$"
-        },
-        "count": {
-          "type": "integer",
-          "minimum": 0
-        },
-        "next_cursor": {
-          "type": [
-            "string",
-            "null"
-          ]
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["type", "resource", "agent_id", "agent_ref", "count", "next_cursor"],
+          "properties": {
+            "type": {"const": "list_summary"},
+            "resource": {"enum": ["messages", "sides"]},
+            "agent_id": {"type": "string", "pattern": "^agt_[0-9A-HJKMNP-TV-Z]{26}$"},
+            "agent_ref": {"type": "string", "pattern": "^a_[1-9][0-9]*$"},
+            "count": {"type": "integer", "minimum": 0, "maximum": 1000},
+            "next_cursor": {"type": ["string", "null"]}
+          }
         }
-      },
-      "additionalProperties": false
+      ]
     },
     "AgentRenamed": {
       "type": "object",
@@ -847,6 +845,10 @@
     },
     "EventBase": {
       "type": "object",
+      "dependentRequired": {
+        "side_id": ["side_ref"],
+        "side_ref": ["side_id"]
+      },
       "required": [
         "event_id",
         "ref",
@@ -1368,7 +1370,13 @@
                 "blocked"
               ]
             }
-          }
+          },
+          "allOf": [
+            {"if": {"properties": {"event_type": {"const": "progress"}}}, "then": {"properties": {"priority": {"const": 1}}}},
+            {"if": {"properties": {"event_type": {"const": "milestone"}}}, "then": {"properties": {"priority": {"const": 2}}}},
+            {"if": {"properties": {"event_type": {"const": "input_required"}}}, "then": {"properties": {"priority": {"const": 3}}}},
+            {"if": {"properties": {"event_type": {"const": "blocked"}}}, "then": {"properties": {"priority": {"const": 4}}}}
+          ]
         },
         {
           "type": "object",
@@ -1649,7 +1657,21 @@
             "truncated": {
               "type": "boolean"
             }
-          }
+          },
+          "allOf": [
+            {
+              "if": {"properties": {"status": {"const": "running"}}},
+              "then": {"properties": {"ok": {"const": true}, "exit_code": {"type": "null"}}}
+            },
+            {
+              "if": {"properties": {"status": {"const": "completed"}, "exit_code": {"const": 0}}},
+              "then": {"properties": {"ok": {"const": true}}}
+            },
+            {
+              "if": {"properties": {"status": {"const": "completed"}, "exit_code": {"type": "integer", "not": {"const": 0}}}},
+              "then": {"properties": {"ok": {"const": false}}}
+            }
+          ]
         },
         {
           "type": "object",
@@ -1821,7 +1843,8 @@
               "const": "completed"
             },
             "exit_code": {
-              "type": "integer"
+              "type": "integer",
+              "not": {"const": 0}
             },
             "output": {
               "$ref": "#/$defs/Preview"
@@ -1953,7 +1976,7 @@
           "type": "string"
         },
         "protocol_version": {
-          "const": 3
+          "const": 4
         },
         "pid": {
           "type": "integer",
@@ -2170,9 +2193,13 @@
           "minimum": 0
         },
         "stop_reason": {
-          "type": [
-            "string",
-            "null"
+          "enum": [
+            "user_request",
+            "wall_time",
+            "daemon_shutdown",
+            "daemon_interrupted",
+            "parent_deleted",
+            null
           ]
         },
         "last_error": {
@@ -2236,6 +2263,8 @@
         "agent_id",
         "agent_ref",
         "status",
+        "model",
+        "current_phase",
         "question_preview",
         "created_at",
         "updated_at",
@@ -2268,6 +2297,13 @@
             "stopped",
             "failed"
           ]
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1
+        },
+        "current_phase": {
+          "$ref": "#/$defs/AgentPhase"
         },
         "question_preview": {
           "type": "string",
@@ -2476,6 +2512,67 @@
           ]
         }
       },
+      "allOf": [
+        {
+          "oneOf": [
+            {
+              "properties": {
+                "key": {"const": "base-url"},
+                "default_value": {"type": "string", "minLength": 1},
+                "persisted_value": {"type": ["string", "null"], "minLength": 1},
+                "local_effective_value": {"type": "string", "minLength": 1},
+                "active_value": {"type": ["string", "null"], "minLength": 1},
+                "local_source": {"enum": ["default", "persisted", "OPENAI_BASE_URL"]},
+                "active_source": {"enum": ["default", "persisted", "OPENAI_BASE_URL", null]}
+              }
+            },
+            {
+              "properties": {
+                "key": {"const": "model"},
+                "default_value": {"type": "string", "minLength": 1},
+                "persisted_value": {"type": ["string", "null"], "minLength": 1},
+                "local_effective_value": {"type": "string", "minLength": 1},
+                "active_value": {"type": ["string", "null"], "minLength": 1},
+                "local_source": {"enum": ["default", "persisted", "OPENAI_MODEL"]},
+                "active_source": {"enum": ["default", "persisted", "OPENAI_MODEL", null]}
+              }
+            },
+            {
+              "properties": {
+                "key": {"const": "max-agents"},
+                "default_value": {"type": "integer", "minimum": 0},
+                "persisted_value": {"type": ["integer", "null"], "minimum": 0},
+                "local_effective_value": {"type": "integer", "minimum": 0},
+                "active_value": {"type": ["integer", "null"], "minimum": 0},
+                "local_source": {"enum": ["default", "persisted", "SUBAGENT_MAX_AGENTS"]},
+                "active_source": {"enum": ["default", "persisted", "SUBAGENT_MAX_AGENTS", null]}
+              }
+            },
+            {
+              "properties": {
+                "key": {"enum": ["context-token-budget", "tool-output-preview-bytes"]},
+                "default_value": {"type": "integer", "minimum": 1},
+                "persisted_value": {"type": ["integer", "null"], "minimum": 1},
+                "local_effective_value": {"type": "integer", "minimum": 1},
+                "active_value": {"type": ["integer", "null"], "minimum": 1},
+                "local_source": {"enum": ["default", "persisted"]},
+                "active_source": {"enum": ["default", "persisted", null]}
+              }
+            },
+            {
+              "properties": {
+                "key": {"const": "stall-notification-seconds"},
+                "default_value": {"type": "integer", "minimum": 0, "maximum": 86400},
+                "persisted_value": {"type": ["integer", "null"], "minimum": 0, "maximum": 86400},
+                "local_effective_value": {"type": "integer", "minimum": 0, "maximum": 86400},
+                "active_value": {"type": ["integer", "null"], "minimum": 0, "maximum": 86400},
+                "local_source": {"enum": ["default", "persisted", "SUBAGENT_STALL_NOTIFICATION_SECONDS"]},
+                "active_source": {"enum": ["default", "persisted", "SUBAGENT_STALL_NOTIFICATION_SECONDS", null]}
+              }
+            }
+          ]
+        }
+      ],
       "additionalProperties": false
     },
     "InboxAcknowledged": {
@@ -2506,7 +2603,8 @@
       "required": [
         "type",
         "count",
-        "acknowledged_through"
+        "acknowledged_through",
+        "next_cursor"
       ],
       "properties": {
         "type": {
@@ -2520,8 +2618,29 @@
         "acknowledged_through": {
           "type": "integer",
           "minimum": 0
+        },
+        "next_cursor": {
+          "type": ["string", "null"]
         }
       }
+    },
+    "LogsSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["type", "owner", "agent_id", "agent_ref", "side_id", "side_ref", "count"],
+      "properties": {
+        "type": {"const": "logs_summary"},
+        "owner": {"enum": ["agent", "side"]},
+        "agent_id": {"type": "string", "pattern": "^agt_[0-9A-HJKMNP-TV-Z]{26}$"},
+        "agent_ref": {"type": "string", "pattern": "^a_[1-9][0-9]*$"},
+        "side_id": {"type": ["string", "null"], "pattern": "^side_[0-9A-HJKMNP-TV-Z]{26}$"},
+        "side_ref": {"type": ["string", "null"], "pattern": "^s_[1-9][0-9]*$"},
+        "count": {"type": "integer", "minimum": 0, "maximum": 10000}
+      },
+      "allOf": [
+        {"if": {"properties": {"owner": {"const": "agent"}}}, "then": {"properties": {"side_id": {"type": "null"}, "side_ref": {"type": "null"}}}},
+        {"if": {"properties": {"owner": {"const": "side"}}}, "then": {"properties": {"side_id": {"type": "string"}, "side_ref": {"type": "string"}}}}
+      ]
     }
   }
 }

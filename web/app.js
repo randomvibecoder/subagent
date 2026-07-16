@@ -700,10 +700,10 @@
   }
   async function loadPendingMessages() {
     var messages = await lines(
-        "/api/agents/" + encodeURIComponent(selected) + "/messages",
+        "/api/agents/" + encodeURIComponent(selected) + "/messages?statuses=pending&limit=1000",
       ),
       pending = messages.filter(function (message) {
-        return message.status === "pending";
+        return message.type === "message" && message.status === "pending";
       }),
       strip = $("#pending-messages");
     strip.classList.toggle("hidden", pending.length === 0);
@@ -737,7 +737,7 @@
     var sides = await lines(
       "/api/agents/" + encodeURIComponent(selected) + "/sides?limit=100",
     );
-    renderSideList(sides);
+    renderSideList(sides.filter(function (side) { return side.type === "side_list_item"; }));
   }
   function renderSideList(sides) {
     $("#side-list").innerHTML = sides.length

@@ -117,9 +117,10 @@ JSONL shapes.
 
 Main agents have globally stable `agt_<ULID>` IDs, short installation-local `a_1`
 references, and unique 4–40 character display names. Commands accept short refs, full
-ULIDs, or exact Agent names. Side runs, messages, and Events similarly expose `s_`,
+durable prefixed IDs, or exact Agent names. IDs and refs take precedence over names;
+canonical system-shaped names are reserved. Side runs, messages, and Events similarly expose `s_`,
 `m_`, and `e_` refs. Local refs are persistent, monotonic per type, and never reused;
-use ULIDs for exports and cross-installation data. Each agent can select a model and
+use durable IDs for exports and cross-installation data. Each agent can select a model and
 work in `readonly` or `write` mode.
 
 Side runs are durable one-shot questions over a snapshot of a parent's context. They
@@ -134,9 +135,10 @@ also receive `write`, exact `edit`, and OpenAI-style `apply_patch` tools.
 debugging escape hatch; redirect it to a file or filter it narrowly rather than
 printing an entire model context into another agent's conversation.
 
-Agent lists retain offset compatibility and also emit an opaque `next_cursor` for
-safer keyset pagination. Agent and Side list limits are 1 through 1000. Inbox records
-are unread by default; each finite query ends with an `inbox_summary`, acknowledgement
+Agent, Message, Side, and Inbox lists emit opaque `next_cursor` values for safer
+keyset pagination; existing Side/Inbox offsets remain compatible. Messages are
+newest-first and bounded to 1000 records per page. Finite logs end with `logs_summary`.
+Inbox records are unread by default; each finite query ends with an `inbox_summary`, acknowledgement
 uses a durable installation-local watermark, and follow streams JSONL without polling.
 
 ## Optional Web UI

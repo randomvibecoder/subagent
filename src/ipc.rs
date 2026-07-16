@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 pub const MAX_LIST_LIMIT: usize = 1_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,6 +57,7 @@ pub enum Request {
     Inbox {
         limit: usize,
         offset: usize,
+        after_cursor: Option<String>,
         minimum_priority: u8,
         agent_id: Option<String>,
         include_acknowledged: bool,
@@ -74,6 +75,7 @@ pub enum Request {
         statuses: Vec<String>,
         limit: usize,
         offset: usize,
+        after_cursor: Option<String>,
     },
     SideStatus {
         id: String,
@@ -105,6 +107,8 @@ pub enum Request {
     MessageList {
         agent_id: String,
         statuses: Vec<String>,
+        limit: usize,
+        after_cursor: Option<String>,
     },
     MessageStatus {
         agent_id: String,

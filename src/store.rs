@@ -223,6 +223,8 @@ pub struct SideListItem {
     pub agent_id: String,
     pub agent_ref: String,
     pub status: AgentStatus,
+    pub model: String,
+    pub current_phase: AgentPhase,
     pub question_preview: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -238,6 +240,8 @@ impl From<SideMetadata> for SideListItem {
             agent_id: meta.agent_id,
             agent_ref: meta.agent_ref,
             status: meta.status,
+            model: meta.model,
+            current_phase: meta.activity.current_phase,
             question_preview: meta.question.chars().take(200).collect(),
             created_at: meta.created_at,
             updated_at: meta.updated_at,
@@ -356,9 +360,15 @@ fn apply_event_activity(
 pub struct InboxFilter {
     pub limit: usize,
     pub offset: usize,
+    pub after_cursor: Option<String>,
     pub minimum_priority: u8,
     pub agent_id: Option<String>,
     pub include_acknowledged: bool,
+}
+
+pub struct Page<T> {
+    pub items: Vec<T>,
+    pub next_cursor: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -663,10 +673,15 @@ impl Store {
     }
 
     pub fn resolve_agent_id(&self, identifier: &str) -> Result<String> {
-        if identifier.starts_with("agt_") && self.metadata_path(identifier).exists() {
-            return Ok(identifier.to_string());
+        if is_canonical_agent_id(identifier) {
+            return if self.metadata_path(identifier).exists() {
+                Ok(identifier.to_string())
+            } else {
+                Err(agent_not_found(identifier))
+            };
         }
-        let mut matches = Vec::new();
+        let authoritative_ref = is_canonical_local_ref(identifier, "a_");
+        let mut name_match = None;
         for entry in fs::read_dir(&self.agents_root)? {
             let path = entry?.path().join("metadata.json");
             let Ok(meta) = fs::read(&path)
@@ -676,25 +691,14 @@ impl Store {
             else {
                 continue;
             };
-            if meta.local_ref == identifier || meta.name == identifier {
-                matches.push(meta.id);
+            if meta.local_ref == identifier {
+                return Ok(meta.id);
+            }
+            if !authoritative_ref && meta.name == identifier {
+                name_match = Some(meta.id);
             }
         }
-        match matches.as_slice() {
-            [id] => Ok(id.clone()),
-            [] => Err(coded_error(
-                "agent_not_found",
-                format!("agent not found: {identifier}"),
-                json!({"agent":identifier}),
-                false,
-            )),
-            _ => Err(coded_error(
-                "conflict",
-                format!("agent name is ambiguous: {identifier}"),
-                json!({"agent":identifier,"matches":matches}),
-                false,
-            )),
-        }
+        name_match.ok_or_else(|| agent_not_found(identifier))
     }
 
     pub fn resolve_side_id(&self, identifier: &str) -> Result<String> {
@@ -781,6 +785,58 @@ impl Store {
         }
         serde_json::from_slice(&fs::read(&path)?)
             .with_context(|| format!("parse {}", path.display()))
+    }
+
+    pub fn list_messages_page(
+        &self,
+        id: &str,
+        statuses: &[String],
+        limit: usize,
+        after_cursor: Option<&str>,
+    ) -> Result<Page<MessageRecord>> {
+        let scope = cursor_scope(id, statuses.iter().map(String::as_str));
+        let cursor = after_cursor
+            .map(|value| decode_resource_cursor(value, "messages", &scope))
+            .transpose()?;
+        let mut messages = self
+            .read_messages(id)?
+            .into_iter()
+            .filter(|message| {
+                statuses.is_empty()
+                    || statuses
+                        .iter()
+                        .any(|status| status == message.status.as_str())
+            })
+            .collect::<Vec<_>>();
+        messages.sort_by(|a, b| b.sent_at.cmp(&a.sent_at).then_with(|| b.id.cmp(&a.id)));
+        if let Some(cursor) = cursor {
+            messages.retain(|message| {
+                (timestamp_key(message.sent_at), message.id.clone())
+                    < (
+                        cursor.timestamp.expect("message cursor timestamp"),
+                        cursor.id.clone(),
+                    )
+            });
+        }
+        messages.truncate(limit.saturating_add(1));
+        let has_more = messages.len() > limit;
+        messages.truncate(limit);
+        let next_cursor = has_more
+            .then(|| {
+                let last = messages.last().expect("page with more has an item");
+                encode_resource_cursor(
+                    "messages",
+                    &scope,
+                    Some(timestamp_key(last.sent_at)),
+                    None,
+                    &last.id,
+                )
+            })
+            .transpose()?;
+        Ok(Page {
+            items: messages,
+            next_cursor,
+        })
     }
 
     fn save_messages(&self, id: &str, messages: &[MessageRecord]) -> Result<()> {
@@ -1058,10 +1114,34 @@ impl Store {
     }
 
     pub fn list_notifications(&self, filter: &InboxFilter) -> Result<Vec<NotificationRecord>> {
+        Ok(self.list_notifications_page(filter)?.items)
+    }
+
+    pub fn list_notifications_page(
+        &self,
+        filter: &InboxFilter,
+    ) -> Result<Page<NotificationRecord>> {
         let path = self.notifications_path();
         if !path.exists() {
-            return Ok(Vec::new());
+            return Ok(Page {
+                items: Vec::new(),
+                next_cursor: None,
+            });
         }
+        let scope = cursor_scope(
+            &format!(
+                "{}:{}:{}",
+                filter.agent_id.as_deref().unwrap_or("*"),
+                filter.minimum_priority,
+                filter.include_acknowledged
+            ),
+            std::iter::empty(),
+        );
+        let cursor = filter
+            .after_cursor
+            .as_deref()
+            .map(|value| decode_resource_cursor(value, "inbox", &scope))
+            .transpose()?;
         let mut retained = VecDeque::with_capacity(10_000);
         for line in BufReader::new(fs::File::open(path)?).lines() {
             let line = line?;
@@ -1086,7 +1166,7 @@ impl Store {
             retained.push_back(notification);
         }
         let acknowledged_through = self.notification_acknowledged_through()?;
-        Ok(retained
+        let mut items = retained
             .into_iter()
             .rev()
             .map(|mut notification| {
@@ -1101,9 +1181,23 @@ impl Store {
                     .as_ref()
                     .is_none_or(|id| &notification.agent_id == id)
             })
+            .filter(|notification| {
+                cursor.as_ref().is_none_or(|cursor| {
+                    notification.sequence < cursor.sequence.expect("inbox cursor sequence")
+                })
+            })
             .skip(filter.offset)
-            .take(filter.limit)
-            .collect())
+            .take(filter.limit.saturating_add(1))
+            .collect::<Vec<_>>();
+        let has_more = items.len() > filter.limit;
+        items.truncate(filter.limit);
+        let next_cursor = has_more
+            .then(|| {
+                let last = items.last().expect("page with more has an item");
+                encode_resource_cursor("inbox", &scope, None, Some(last.sequence), &last.id)
+            })
+            .transpose()?;
+        Ok(Page { items, next_cursor })
     }
 
     pub fn notification_acknowledged_through(&self) -> Result<u64> {
@@ -1198,6 +1292,7 @@ impl Store {
         let notifications = self.list_notifications(&InboxFilter {
             limit: 10_000,
             offset: 0,
+            after_cursor: None,
             minimum_priority: 1,
             agent_id: None,
             include_acknowledged: true,
@@ -1310,11 +1405,12 @@ impl Store {
         }
         if let Some(cursor) = filter.after_cursor.as_deref() {
             let cursor = decode_list_cursor(cursor)?;
-            if cursor.sort != filter.sort || cursor.order != filter.order {
+            let scope = list_filter_scope(filter)?;
+            if cursor.sort != filter.sort || cursor.order != filter.order || cursor.scope != scope {
                 return Err(coded_error(
                     "invalid_argument",
-                    "list cursor does not match the requested sort order",
-                    json!({"cursor_sort":cursor.sort,"cursor_order":cursor.order,"sort":filter.sort,"order":filter.order}),
+                    "agent list cursor does not match this query",
+                    json!({"resource":"agents"}),
                     false,
                 ));
             }
@@ -1334,11 +1430,12 @@ impl Store {
             .collect())
     }
 
-    pub fn list_cursor(&self, meta: &AgentMetadata, sort: &str, order: &str) -> Result<String> {
-        let (value, id) = list_cursor_key(meta, sort);
+    pub fn list_cursor(&self, meta: &AgentMetadata, filter: &ListFilter) -> Result<String> {
+        let (value, id) = list_cursor_key(meta, &filter.sort);
         let cursor = ListCursor {
-            sort: sort.into(),
-            order: order.into(),
+            sort: filter.sort.clone(),
+            order: filter.order.clone(),
+            scope: list_filter_scope(filter)?,
             value,
             id,
         };
@@ -1490,6 +1587,56 @@ impl Store {
                 .then_with(|| b.id.cmp(&a.id))
         });
         Ok(sides)
+    }
+
+    pub fn list_sides_page(
+        &self,
+        agent_id: &str,
+        statuses: &[String],
+        limit: usize,
+        offset: usize,
+        after_cursor: Option<&str>,
+    ) -> Result<Page<SideMetadata>> {
+        let scope = cursor_scope(agent_id, statuses.iter().map(String::as_str));
+        let cursor = after_cursor
+            .map(|value| decode_resource_cursor(value, "sides", &scope))
+            .transpose()?;
+        let mut sides = self
+            .list_sides(agent_id)?
+            .into_iter()
+            .filter(|side| {
+                statuses.is_empty() || statuses.iter().any(|status| status == side.status.as_str())
+            })
+            .filter(|side| {
+                cursor.as_ref().is_none_or(|cursor| {
+                    (timestamp_key(side.created_at), side.id.clone())
+                        < (
+                            cursor.timestamp.expect("side cursor timestamp"),
+                            cursor.id.clone(),
+                        )
+                })
+            })
+            .skip(offset)
+            .take(limit.saturating_add(1))
+            .collect::<Vec<_>>();
+        let has_more = sides.len() > limit;
+        sides.truncate(limit);
+        let next_cursor = has_more
+            .then(|| {
+                let last = sides.last().expect("page with more has an item");
+                encode_resource_cursor(
+                    "sides",
+                    &scope,
+                    Some(timestamp_key(last.created_at)),
+                    None,
+                    &last.id,
+                )
+            })
+            .transpose()?;
+        Ok(Page {
+            items: sides,
+            next_cursor,
+        })
     }
 
     pub fn working_side_count(&self, agent_id: &str) -> Result<usize> {
@@ -1685,8 +1832,90 @@ fn compare_meta(a: &AgentMetadata, b: &AgentMetadata, key: &str) -> Ordering {
 struct ListCursor {
     sort: String,
     order: String,
+    scope: String,
     value: Option<(i64, u32)>,
     id: String,
+}
+
+fn list_filter_scope(filter: &ListFilter) -> Result<String> {
+    let mut statuses = filter.statuses.clone();
+    statuses.sort();
+    statuses.dedup();
+    Ok(serde_json::to_string(&json!({
+        "statuses": statuses,
+        "dir": filter.dir,
+        "spawned_after": filter.spawned_after,
+        "spawned_before": filter.spawned_before,
+        "finished_after": filter.finished_after,
+        "finished_before": filter.finished_before,
+        "verbose": filter.verbose,
+    }))?)
+}
+
+#[derive(Serialize, Deserialize)]
+struct ResourceCursor {
+    resource: String,
+    scope: String,
+    timestamp: Option<(i64, u32)>,
+    sequence: Option<u64>,
+    id: String,
+}
+
+fn cursor_scope<'a>(owner: &str, values: impl Iterator<Item = &'a str>) -> String {
+    let mut values = values.map(str::to_owned).collect::<Vec<_>>();
+    values.sort();
+    values.dedup();
+    format!("{owner}|{}", values.join(","))
+}
+
+fn encode_resource_cursor(
+    resource: &str,
+    scope: &str,
+    timestamp: Option<(i64, u32)>,
+    sequence: Option<u64>,
+    id: &str,
+) -> Result<String> {
+    Ok(URL_SAFE_NO_PAD.encode(serde_json::to_vec(&ResourceCursor {
+        resource: resource.into(),
+        scope: scope.into(),
+        timestamp,
+        sequence,
+        id: id.into(),
+    })?))
+}
+
+fn decode_resource_cursor(value: &str, resource: &str, scope: &str) -> Result<ResourceCursor> {
+    let cursor = URL_SAFE_NO_PAD
+        .decode(value)
+        .ok()
+        .and_then(|body| serde_json::from_slice::<ResourceCursor>(&body).ok())
+        .ok_or_else(|| invalid_resource_cursor(resource))?;
+    if cursor.resource != resource || cursor.scope != scope {
+        return Err(coded_error(
+            "invalid_argument",
+            format!("{resource} cursor does not match this query"),
+            json!({"resource":resource}),
+            false,
+        ));
+    }
+    let valid_shape = match resource {
+        "messages" | "sides" => cursor.timestamp.is_some() && cursor.sequence.is_none(),
+        "inbox" => cursor.timestamp.is_none() && cursor.sequence.is_some(),
+        _ => false,
+    };
+    if !valid_shape {
+        return Err(invalid_resource_cursor(resource));
+    }
+    Ok(cursor)
+}
+
+fn invalid_resource_cursor(resource: &str) -> anyhow::Error {
+    coded_error(
+        "invalid_argument",
+        format!("invalid {resource} cursor"),
+        json!({"resource":resource}),
+        false,
+    )
 }
 
 fn list_cursor_key(meta: &AgentMetadata, sort: &str) -> (Option<(i64, u32)>, String) {
@@ -1734,7 +1963,46 @@ pub fn normalize_agent_name(name: &str) -> Result<String> {
     if name.chars().any(char::is_control) {
         bail!("agent name must not contain control characters");
     }
+    if is_reserved_system_identifier(name) {
+        bail!("agent name must not be a canonical system ID or short reference");
+    }
     Ok(name.to_string())
+}
+
+fn agent_not_found(identifier: &str) -> anyhow::Error {
+    coded_error(
+        "agent_not_found",
+        format!("agent not found: {identifier}"),
+        json!({"agent":identifier}),
+        false,
+    )
+}
+
+fn is_canonical_agent_id(value: &str) -> bool {
+    value
+        .strip_prefix("agt_")
+        .is_some_and(|suffix| suffix.parse::<ulid::Ulid>().is_ok())
+}
+
+fn is_canonical_local_ref(value: &str, prefix: &str) -> bool {
+    value.strip_prefix(prefix).is_some_and(|suffix| {
+        !suffix.is_empty()
+            && !suffix.starts_with('0')
+            && suffix.bytes().all(|byte| byte.is_ascii_digit())
+    })
+}
+
+fn is_reserved_system_identifier(value: &str) -> bool {
+    ["a_", "s_", "m_", "e_"]
+        .iter()
+        .any(|prefix| is_canonical_local_ref(value, prefix))
+        || ["agt_", "side_", "msg_", "evt_", "ntf_", "term_", "out_"]
+            .iter()
+            .any(|prefix| {
+                value
+                    .strip_prefix(prefix)
+                    .is_some_and(|suffix| suffix.parse::<ulid::Ulid>().is_ok())
+            })
 }
 
 pub fn canonical_dir(dir: &str) -> Result<String> {
@@ -1783,6 +2051,21 @@ mod name_tests {
         assert!(normalize_agent_name("abc").is_err());
         assert!(normalize_agent_name(&"x".repeat(41)).is_err());
         assert!(normalize_agent_name("bad\nname").is_err());
+        for allowed in ["a_team", "agt_team", "side_project", "m_team", "evt_team"] {
+            assert_eq!(normalize_agent_name(allowed).unwrap(), allowed);
+        }
+        for reserved in [
+            "a_1",
+            "s_2",
+            "m_3",
+            "e_4",
+            "agt_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "side_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "msg_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+            "evt_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        ] {
+            assert!(normalize_agent_name(reserved).is_err(), "{reserved}");
+        }
     }
 
     #[test]
@@ -1821,6 +2104,18 @@ mod name_tests {
             activity: ActivityTelemetry::new(now),
         };
         store.create(&agent, &ContextSnapshot::default()).unwrap();
+        let mut colliding_name = agent.clone();
+        colliding_name.id = format!("agt_{}", ulid::Ulid::new());
+        colliding_name.local_ref = "a_2".into();
+        colliding_name.name = "a_1".into();
+        store
+            .create(&colliding_name, &ContextSnapshot::default())
+            .unwrap();
+        assert_eq!(store.resolve_agent_id("a_1").unwrap(), agent.id);
+        assert_eq!(
+            store.resolve_agent_id(&colliding_name.id).unwrap(),
+            colliding_name.id
+        );
         let side = SideMetadata {
             kind: "side".into(),
             id: "side_01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
@@ -1896,6 +2191,7 @@ mod name_tests {
             .list_notifications(&InboxFilter {
                 limit: 1,
                 offset: 0,
+                after_cursor: None,
                 minimum_priority: 2,
                 agent_id: Some(agent.id.clone()),
                 include_acknowledged: false,
@@ -1912,6 +2208,7 @@ mod name_tests {
                 .list_notifications(&InboxFilter {
                     limit: 10,
                     offset: 0,
+                    after_cursor: None,
                     minimum_priority: 1,
                     agent_id: Some(agent.id.clone()),
                     include_acknowledged: false,
@@ -1940,6 +2237,7 @@ mod name_tests {
                 .list_notifications(&InboxFilter {
                     limit: 10,
                     offset: 0,
+                    after_cursor: None,
                     minimum_priority: 1,
                     agent_id: Some(agent.id.clone()),
                     include_acknowledged: true,
@@ -2000,6 +2298,7 @@ mod name_tests {
             .list_notifications(&InboxFilter {
                 limit: 10_000,
                 offset: 0,
+                after_cursor: None,
                 minimum_priority: 1,
                 agent_id: None,
                 include_acknowledged: true,

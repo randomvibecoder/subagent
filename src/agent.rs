@@ -3,8 +3,8 @@ use crate::{
     ipc::{AgentMode, coded_error},
     model::{ModelProgress, OpenAiClient, assistant_message},
     store::{
-        AgentListItem, AgentMetadata, AgentStatus, ContextSnapshot, MessageRecord, SideListItem,
-        SideMetadata, Store, canonical_dir, normalize_agent_name,
+        AgentListItem, AgentMetadata, AgentStatus, ContextSnapshot, MessageRecord, Page,
+        SideListItem, SideMetadata, Store, canonical_dir, normalize_agent_name,
     },
     tools::{TerminalManager, ToolRuntime, tool_definitions},
 };
@@ -12,7 +12,7 @@ use anyhow::Result;
 use chrono::{Duration as ChronoDuration, Utc};
 use serde_json::{Value, json};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
 };
 use tokio::sync::{mpsc, watch};
@@ -23,6 +23,7 @@ pub struct AgentManager {
     store: Store,
     active: Arc<Mutex<HashMap<String, AgentControl>>>,
     active_sides: Arc<Mutex<HashMap<String, SideControl>>>,
+    stopping_agents: Arc<Mutex<HashSet<String>>>,
     operations: Arc<Mutex<()>>,
     stall_notified: Arc<Mutex<HashMap<String, chrono::DateTime<Utc>>>>,
 }
@@ -51,6 +52,7 @@ impl AgentManager {
             store,
             active: Default::default(),
             active_sides: Default::default(),
+            stopping_agents: Default::default(),
             operations: Default::default(),
             stall_notified: Default::default(),
         }
@@ -239,6 +241,14 @@ impl AgentManager {
 
     pub fn send(&self, id: &str, message: String, wall_time_minutes: Option<u64>) -> Result<Value> {
         let _operation = self.operations.lock().unwrap();
+        if self.stopping_agents.lock().unwrap().contains(id) {
+            return Err(coded_error(
+                "conflict",
+                "agent is stopping; retry after the stop completes",
+                json!({"agent_id":id,"status":"stopping"}),
+                true,
+            ));
+        }
         validate_message(&message)?;
         deadline_from_minutes(wall_time_minutes)?;
         let current = self.store.load_metadata(id)?;
@@ -478,6 +488,14 @@ impl AgentManager {
     pub async fn stop(&self, id: &str, reason: &str) -> Result<AgentMetadata> {
         let control = {
             let _operation = self.operations.lock().unwrap();
+            if self.stopping_agents.lock().unwrap().contains(id) {
+                return Err(coded_error(
+                    "conflict",
+                    "agent is already stopping",
+                    json!({"agent_id":id,"status":"stopping"}),
+                    true,
+                ));
+            }
             let control = self
                 .active
                 .lock()
@@ -492,13 +510,17 @@ impl AgentManager {
                         false,
                     )
                 })?;
+            self.stopping_agents.lock().unwrap().insert(id.to_string());
+            if let Err(error) = self.store.cancel_pending_messages(id) {
+                self.stopping_agents.lock().unwrap().remove(id);
+                return Err(error);
+            }
             control.stop.send(true).ok();
-            self.store.cancel_pending_messages(id)?;
             control
         };
         control.terminals.terminate_all().await;
         let mut completed = control.completed.clone();
-        if !*completed.borrow() {
+        let cleanup = if !*completed.borrow() {
             completed.changed().await.map_err(|_| {
                 coded_error(
                     "internal_error",
@@ -506,10 +528,18 @@ impl AgentManager {
                     json!({"agent_id":id}),
                     true,
                 )
-            })?;
-        }
-        mark_stopped(&self.store, id, reason)?;
-        self.store.load_metadata(id)
+            })
+        } else {
+            Ok(())
+        };
+        let _operation = self.operations.lock().unwrap();
+        let result = cleanup.and_then(|()| {
+            self.store.cancel_pending_messages(id)?;
+            mark_stopped(&self.store, id, reason)?;
+            self.store.load_metadata(id)
+        });
+        self.stopping_agents.lock().unwrap().remove(id);
+        result
     }
 
     pub fn cancel_message(&self, id: &str, message_id: &str) -> Result<MessageRecord> {
@@ -578,9 +608,10 @@ impl AgentManager {
         make_side_snapshot_valid(&mut context);
         compact_context(&mut context, self.cfg.file.context_token_budget);
         let inherited_context_messages = context.messages.len();
+        let side_system_prompt = "You are a persistent, strictly non-modifying side agent branching from a parent coding-agent conversation. Your only goal is to answer the new side question using the inherited context. If the answer is not already established, inspect files, search with glob or grep, run non-mutating Bash commands such as rg or grep, poll terminals, read stored output, or view images. Do not create, edit, delete, rename, or otherwise modify files, repositories, processes, configuration, or external state. Work independently: your messages and tool activity are recorded in the Side run but are not added to the parent's transcript. Use notify for meaningful progress, milestones, questions requiring input, or blockers; do not notify for every tool call. Return a focused answer as soon as the question is resolved.";
         context.messages.push(json!({
             "role":"system",
-            "content":"You are a persistent, strictly non-modifying side agent branching from a parent coding-agent conversation. Your only goal is to answer the new side question using the inherited context. If the answer is not already established, inspect files, search with glob or grep, run non-mutating Bash commands such as rg or grep, poll terminals, read stored output, or view images. Do not create, edit, delete, rename, or otherwise modify files, repositories, processes, configuration, or external state. Work independently: your messages and tool activity are recorded in the Side run but are not added to the parent's transcript. Use notify for meaningful progress, milestones, questions requiring input, or blockers; do not notify for every tool call. Return a focused answer as soon as the question is resolved."
+            "content":side_system_prompt
         }));
         context
             .messages
@@ -616,6 +647,11 @@ impl AgentManager {
             activity: crate::store::ActivityTelemetry::new(now),
         };
         self.store.create_side(&side, &context)?;
+        self.store.append_side_event(
+            &side_id,
+            "system_message",
+            json!({"content":side_system_prompt}),
+        )?;
         self.store.append_side_event(
             &side_id,
             "user_message",
@@ -670,18 +706,15 @@ impl AgentManager {
         statuses: &[String],
         limit: usize,
         offset: usize,
-    ) -> Result<Vec<SideListItem>> {
-        Ok(self
+        after_cursor: Option<&str>,
+    ) -> Result<Page<SideListItem>> {
+        let page = self
             .store
-            .list_sides(agent_id)?
-            .into_iter()
-            .filter(|side| {
-                statuses.is_empty() || statuses.iter().any(|status| status == side.status.as_str())
-            })
-            .skip(offset)
-            .take(limit)
-            .map(SideListItem::from)
-            .collect())
+            .list_sides_page(agent_id, statuses, limit, offset, after_cursor)?;
+        Ok(Page {
+            items: page.items.into_iter().map(SideListItem::from).collect(),
+            next_cursor: page.next_cursor,
+        })
     }
 
     pub async fn stop_side(&self, id: &str, reason: &str) -> Result<SideMetadata> {

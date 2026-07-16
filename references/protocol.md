@@ -1,4 +1,4 @@
-# Subagent v0.1.6 Protocol Reference
+# Subagent v0.1.7 Protocol Reference
 
 This file specifies the current binary. Backward compatibility is not promised. The
 release binary, SKILL.md, this reference, and cli.schema.json must change together.
@@ -24,7 +24,9 @@ LF. Strings encode embedded newlines. Commands never emit tables, ANSI escapes,
 progress, or arrays around multiple results. Agent, Side, and Message list commands
 always finish with one list_summary line, including count zero. Non-streaming Inbox
 queries always finish with one inbox_summary line, including count zero.
-Streaming output is flushed after each object.
+Finite logs always finish with one logs_summary line; follow streams Events only.
+Streaming output is flushed after each object. An early stdout consumer disconnect is
+treated as successful completion rather than a panic.
 
 Help and version are plain text. Local parsing, configuration, startup, and daemon
 connection failures write one Error to stderr and exit 2. Errors returned by the
@@ -78,8 +80,9 @@ Messages, and Events also receive installation-local `a_N`, `s_N`, `m_N`, and `e
 references. Each type has its own persistent monotonic counter. References survive
 restart and lifecycle changes and are never reused after deletion; gaps are valid.
 
-Local CLI commands accept a short reference or full ULID. Agent arguments also accept
-an exact name when it resolves uniquely. JSON exposes both forms. Use ULIDs for
+Local CLI commands accept a short reference or full durable prefixed ID. Agent arguments
+also accept an exact name. Durable IDs and short refs are authoritative before names.
+JSON exposes both forms. Use durable IDs for
 exports, backups, APIs, cross-machine communication, and merged stores; a destination
 import must preserve the ULID and allocate a new local reference.
 
@@ -117,7 +120,9 @@ message-file is read by the CLI before IPC; message-file - reads stdin.
 
 NAME is mandatory. The daemon trims both ends, then requires 4 through 40 Unicode
 scalar values and rejects control characters. Names are case-sensitive and unique
-across all stored Agents. Deleting an Agent releases its name.
+across all stored Agents. Canonical system IDs and short refs are reserved, while
+prefix-like names such as a_team and agt_team remain valid. Deleting an Agent releases
+its name. Legacy collisions remain stored, but the authoritative ID/ref wins lookup.
 
 ## 3. Core objects and lifecycle
 
@@ -296,7 +301,8 @@ It never waits for model delivery.
 If working, a memory notification wakes the worker at the next model-loop boundary.
 It does not interrupt an API request or tool turn. If terminal and capacity exists,
 the Agent resumes immediately. If capacity is full, the Message remains durable and
-the scheduler resumes it when another Agent exits.
+the scheduler resumes it when another Agent exits. While stop cleanup is active, send
+returns retryable conflict and creates no Message.
 
 ### agents time
 
@@ -348,12 +354,14 @@ Empty API key is rejected. Credentials are not validated until a model request.
 
 `subagent inbox` reads unread records from the durable global notification journal. It emits compact
 Notification JSONL newest-first followed by exactly one
-`{"type":"inbox_summary","count":N,"acknowledged_through":SEQUENCE}` record.
+`{"type":"inbox_summary","count":N,"acknowledged_through":SEQUENCE,"next_cursor":CURSOR_OR_NULL}` record.
 Defaults are limit 20, offset zero, and minimum
 priority 2. Limit is 1 through 100. `--priority N` includes N and higher. `--agent`
 accepts an Agent ref, durable ID, or exact name and includes that Agent's Side
-notifications. `--all` also includes acknowledged records. Offset applies after
-priority, acknowledgement, and Agent filtering.
+notifications. `--all` also includes acknowledged records. A cursor continues toward
+older records and binds Agent, priority, and acknowledgement filters. Offset remains
+for compatibility and must be zero in cursor mode. Global `--agent` and `--priority`
+work identically before or after `follow`.
 
 `subagent inbox ack <SEQUENCE|NOTIFICATION_ID>` advances one installation-local,
 durable acknowledgement watermark to that record; it never moves backward.
@@ -398,7 +406,9 @@ Messages are stored in each Agent directory. Shape:
 {"type":"message","id":"msg_...","ref":"m_1","agent_id":"agt_...","agent_ref":"a_1","content":"text","status":"pending|delivered|cancelled","sent_at":"RFC3339","delivered_at":"RFC3339|null","cancelled_at":"RFC3339|null"}
 ~~~
 
-list emits all or OR-filtered status matches in acceptance order. status emits one.
+list emits newest-first or OR-filtered status matches. Limit defaults to 100 and is
+bounded 1 through 1000. A nullable next_cursor continues toward older Messages and is
+bound to the Agent and status filters. status emits one.
 cancel changes pending to cancelled; delivered/cancelled returns conflict.
 
 Delivery is FIFO. Before marking delivered, the worker atomically saves the user model
@@ -433,6 +443,7 @@ Data variants:
 
 - system_message: content string.
 - user_message spawn: content, source spawn.
+- user_message create: Side question content, source create.
 - user_message send: content, source send, message_id.
 - assistant_message: content string, usage null or provider object.
 - reasoning: content string.
@@ -445,8 +456,10 @@ Data variants:
 
 logs applies cursor first, type filter second, and limit last. It selects newest N
 matches after the exclusive cursor and emits that selection oldest-first. Unknown or
-cross-Agent cursors return event_not_found. Default types are system/user/assistant
-and default limit 20. Explicit types replace defaults. all selects every type.
+cross-Agent cursors return event_not_found. Agent defaults are system/user/assistant;
+Side defaults are user/assistant. Default limit is 20. Explicit types replace defaults.
+all selects every type. Every finite query ends with logs_summary, including count
+zero. Follow emits Events only.
 
 follow emits the historical selection, polls about every 500 ms, flushes every new
 match, and exits 0 after terminal status. Socket loss after output can terminate
@@ -477,16 +490,19 @@ nothing.
 Optional `--model` overrides the parent model for that Side only. Without it, the Side
 inherits the parent model. The selected value is stored in Side metadata.
 
-`sides list AGENT` supports repeatable OR status filters plus limit/offset and emits
+Side creation persists lifecycle created, system_message, then user_message source
+create Events. `sides list AGENT` supports repeatable OR status filters plus limit,
+cursor, and compatibility offset and emits
 newest-first side_list_item JSONL followed by list_summary. Limit defaults to 100 and
-accepts 1 through 1000. question_preview is the first 200 Unicode scalar
+accepts 1 through 1000. Compact records include model and current_phase. A cursor is
+bound to the parent and status filters. question_preview is the first 200 Unicode scalar
 values. `sides status SIDE` emits complete Side metadata including full question,
 nullable answer, lifecycle timestamps, inherited_context_messages, tool_calls,
 stop_reason, and last_error.
 
 `sides logs SIDE` uses the same type, cursor, limit, follow, ordering, and flushing
 rules as agents logs. Side Events add side_id while agent_id remains the parent ID.
-Every Side persists its user question, reasoning, assistant answer, tool calls, tool
+Every new Side persists its system prompt, user question, reasoning, assistant answer, tool calls, tool
 results, lifecycle/error Events, context snapshot, and complete tool outputs. Default
 logs are user/assistant; use --all or --type for tools and reasoning.
 

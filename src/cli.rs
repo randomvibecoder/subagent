@@ -15,6 +15,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde_json::{Value, json};
 use std::{
     fs,
+    io::{self, Write},
     os::unix::process::CommandExt,
     process::{Command, Stdio},
     time::Duration,
@@ -81,11 +82,23 @@ enum DaemonCommand {
         #[arg(long, value_name = "PORT", value_parser = parse_port)]
         web_ui_port: Option<u16>,
     },
+    #[command(
+        about = "Report running daemon configuration and capacity.",
+        after_help = "JSONL output: one daemon object with version, protocol_version, PID, socket, capacity, effective model/base URL, and optional Web UI details."
+    )]
     Status,
+    #[command(
+        about = "Request graceful daemon shutdown.",
+        after_help = "JSONL output: one daemon object with status stopping and the number of working Agents being stopped. The command returns before process exit."
+    )]
     Stop,
 }
 #[derive(Subcommand)]
 enum ConfigCommand {
+    #[command(
+        about = "List persisted, caller-local, and active daemon configuration.",
+        after_help = "JSONL output: one config_value per supported key. active_differs_from_local reports any mismatch; restart_required is true only for an unmasked persisted/default change."
+    )]
     List,
     Get {
         /// Configuration key; run `config set --help` for the complete key contract.
@@ -106,13 +119,22 @@ enum ConfigCommand {
 
 #[derive(Subcommand)]
 enum MessagesCommand {
-    #[command(about = "List durable messages for an agent.")]
+    #[command(
+        about = "List durable messages newest-first for an Agent.",
+        after_help = "Repeated --status filters use OR. JSONL output is zero or more Message records followed by one Agent-scoped list_summary with a nullable next_cursor.\n\nExample:\n  subagent messages list a_7 --status pending --status delivered --limit 100"
+    )]
     List {
         /// Agent a_N ref, agt_<ULID>, or exact name.
         #[arg(value_name = "AGENT", value_parser = parse_agent_id)]
         agent_id: String,
         #[arg(long = "status", value_parser = ["pending", "delivered", "cancelled"])]
         statuses: Vec<String>,
+        /// Maximum Message records to emit, from 1 through 1000.
+        #[arg(long, default_value_t = 100, value_parser = parse_list_limit)]
+        limit: usize,
+        /// Continue toward older Messages from a previous list_summary.
+        #[arg(long)]
+        after_cursor: Option<String>,
     },
     #[command(about = "Get one durable message.")]
     Status {
@@ -139,10 +161,10 @@ enum SidesCommand {
     #[command(
         about = "Start a one-shot Side run and return its short ref plus durable Side ID immediately."
     )]
-    Create(SideArgs),
+    Create(CreateSideArgs),
     #[command(
         about = "List persisted Side runs for one parent Agent.",
-        after_help = "JSONL output: zero or more side_list_item records followed by one list_summary.\n\nExample:\n  subagent sides list a_7 --status working --limit 20"
+        after_help = "JSONL output: zero or more side_list_item records followed by one list_summary with nullable next_cursor.\n\nExample:\n  subagent sides list a_7 --status working --limit 20"
     )]
     List {
         /// Parent Agent a_N ref, agt_<ULID>, or exact name.
@@ -157,6 +179,9 @@ enum SidesCommand {
         /// Number of matching Side records to skip; zero starts at the first match.
         #[arg(long, default_value_t = 0)]
         offset: usize,
+        /// Continue toward older Sides from a previous list_summary.
+        #[arg(long)]
+        after_cursor: Option<String>,
     },
     #[command(about = "Get complete Side metadata.")]
     Status {
@@ -186,7 +211,9 @@ enum AgentsCommand {
         about = "Spawn a named agent and return its preferred short ref plus durable ID immediately."
     )]
     Spawn(SpawnArgs),
-    #[command(about = "List agents, newest first. Each JSONL line is one compact list item.")]
+    #[command(
+        about = "List Agents with configurable sort and order. Each JSONL line is one compact list item."
+    )]
     List(ListArgs),
     #[command(about = "Get one agent metadata object.")]
     Status {
@@ -223,7 +250,7 @@ enum AgentsCommand {
     #[command(
         about = "Answer a question with a readonly side agent over a snapshot of the parent context."
     )]
-    Side(SideArgs),
+    Side(AgentSideArgs),
     #[command(
         about = "Set a working agent deadline in minutes from now.",
         after_help = "JSONL output: one complete Agent object with the updated deadline.\n\nExample:\n  subagent agents time a_7 90"
@@ -360,7 +387,7 @@ struct ListArgs {
 
 #[derive(Args)]
 #[command(
-    after_help = "Event JSONL schema: {event_id,ref,agent_id,agent_ref,sequence,timestamp,type,data}. Types: system_message,user_message,assistant_message,reasoning,tool_call,tool_result,lifecycle,error."
+    after_help = "Finite JSONL output ends with logs_summary. Event schema: {event_id,ref,agent_id,agent_ref,sequence,timestamp,type,data}. Types: system_message,user_message,assistant_message,reasoning,tool_call,tool_result,lifecycle,error. Follow mode streams Events only."
 )]
 struct AgentLogsArgs {
     /// Agent a_N ref, agt_<ULID>, or exact name.
@@ -385,7 +412,7 @@ struct AgentLogsArgs {
 
 #[derive(Args)]
 #[command(
-    after_help = "Event JSONL schema: {event_id,ref,agent_id,agent_ref,side_id,side_ref,sequence,timestamp,type,data}. Types: user_message,assistant_message,reasoning,tool_call,tool_result,lifecycle,error."
+    after_help = "Finite JSONL output ends with logs_summary. Event schema: {event_id,ref,agent_id,agent_ref,side_id,side_ref,sequence,timestamp,type,data}. Types: system_message,user_message,assistant_message,reasoning,tool_call,tool_result,lifecycle,error. Follow mode streams Events only."
 )]
 struct SideLogsArgs {
     /// Side short ref (s_N) or durable ID (side_<ULID>).
@@ -442,7 +469,7 @@ struct SendArgs {
     group(clap::ArgGroup::new("input").required(true).multiple(false).args(["message", "message_file"])),
     after_help="JSONL output: one side_created receipt immediately. Inspect progress with `subagent sides status SIDE` or `subagent sides logs SIDE`. The Side trace never enters the parent transcript.\n\nExample:\n  subagent agents side a_7 --message \"Which database does this project use?\""
 )]
-struct SideArgs {
+struct AgentSideArgs {
     /// Parent Agent a_N ref, agt_<ULID>, or exact name.
     #[arg(value_name = "AGENT", value_parser = parse_agent_id)]
     id: String,
@@ -462,7 +489,30 @@ struct SideArgs {
 
 #[derive(Args)]
 #[command(
-    after_help = "JSONL output: zero or more Notifications newest-first followed by one inbox_summary. --priority N includes N and higher. Follow mode streams Notifications without a summary.\n\nExamples:\n  subagent inbox --priority 3 --limit 20\n  subagent inbox follow --after 42 --priority 2"
+    group(clap::ArgGroup::new("input").required(true).multiple(false).args(["message", "message_file"])),
+    after_help="JSONL output: one side_created receipt immediately. Inspect progress with `subagent sides status SIDE` or `subagent sides logs SIDE`. The Side trace never enters the parent transcript.\n\nExample:\n  subagent sides create a_7 --message \"Which database does this project use?\""
+)]
+struct CreateSideArgs {
+    /// Parent Agent a_N ref, agt_<ULID>, or exact name.
+    #[arg(value_name = "AGENT", value_parser = parse_agent_id)]
+    id: String,
+    /// Inline side question. Conflicts with --message-file.
+    #[arg(long)]
+    message: Option<String>,
+    /// Read UTF-8 input from PATH; use - for stdin.
+    #[arg(long, value_name = "PATH")]
+    message_file: Option<String>,
+    /// Override the parent agent's model for this Side run.
+    #[arg(long)]
+    model: Option<String>,
+    /// Optional side-agent deadline in integer minutes; 1 through 6000.
+    #[arg(long, value_name = "MINUTES", value_parser = parse_minutes)]
+    wall_time_minutes: Option<u64>,
+}
+
+#[derive(Args)]
+#[command(
+    after_help = "JSONL output: zero or more Notifications newest-first followed by one inbox_summary with nullable next_cursor. --priority N includes N and higher. Follow mode streams Notifications without a summary.\n\nExamples:\n  subagent inbox --priority 3 --limit 20\n  subagent inbox follow --after 42 --priority 2"
 )]
 struct InboxArgs {
     /// Maximum notifications to emit, from 1 through 100.
@@ -471,11 +521,14 @@ struct InboxArgs {
     /// Number of matching notifications to skip.
     #[arg(long, default_value_t = 0)]
     offset: usize,
+    /// Continue toward older notifications from a previous inbox_summary.
+    #[arg(long)]
+    after_cursor: Option<String>,
     /// Minimum priority to include, from 1 through 5.
-    #[arg(long, default_value_t = 2, value_parser = parse_priority)]
+    #[arg(long, global = true, default_value_t = 2, value_parser = parse_priority)]
     priority: u8,
     /// Include notifications for only this Agent ref, durable ID, or exact name.
-    #[arg(long, value_name = "AGENT")]
+    #[arg(long, global = true, value_name = "AGENT")]
     agent: Option<String>,
     /// Include acknowledged notifications; plain inbox shows unread records only.
     #[arg(long)]
@@ -497,12 +550,6 @@ enum InboxCommand {
         /// Resume strictly after this notification sequence.
         #[arg(long)]
         after: Option<u64>,
-        /// Minimum priority to include, from 1 through 5.
-        #[arg(long, default_value_t = 2, value_parser = parse_priority)]
-        priority: u8,
-        /// Include notifications for only this Agent ref, durable ID, or exact name.
-        #[arg(long, value_name = "AGENT")]
-        agent: Option<String>,
     },
 }
 
@@ -526,7 +573,7 @@ async fn run_inner() -> Result<()> {
                 clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
             ) =>
         {
-            print!("{error}");
+            write_stdout(error.to_string().as_bytes())?;
             return Ok(());
         }
         Err(error) => bail!(error.to_string()),
@@ -542,18 +589,15 @@ async fn run_inner() -> Result<()> {
         TopCommand::Inbox(args) => {
             let request_value = match args.command {
                 Some(InboxCommand::Ack { identifier }) => Request::InboxAck { identifier },
-                Some(InboxCommand::Follow {
-                    after,
-                    priority,
-                    agent,
-                }) => Request::InboxFollow {
+                Some(InboxCommand::Follow { after }) => Request::InboxFollow {
                     after_sequence: after,
-                    minimum_priority: priority,
-                    agent_id: agent,
+                    minimum_priority: args.priority,
+                    agent_id: args.agent,
                 },
                 None => Request::Inbox {
                     limit: args.limit,
                     offset: args.offset,
+                    after_cursor: args.after_cursor,
                     minimum_priority: args.priority,
                     agent_id: args.agent,
                     include_acknowledged: args.all,
@@ -563,9 +607,17 @@ async fn run_inner() -> Result<()> {
         }
         TopCommand::Messages(command) => {
             let req = match command {
-                MessagesCommand::List { agent_id, statuses } => {
-                    Request::MessageList { agent_id, statuses }
-                }
+                MessagesCommand::List {
+                    agent_id,
+                    statuses,
+                    limit,
+                    after_cursor,
+                } => Request::MessageList {
+                    agent_id,
+                    statuses,
+                    limit,
+                    after_cursor,
+                },
                 MessagesCommand::Status {
                     agent_id,
                     message_id,
@@ -596,6 +648,7 @@ async fn run_inner() -> Result<()> {
                     statuses,
                     limit,
                     offset,
+                    after_cursor,
                 } => Request::SideList {
                     agent_id,
                     statuses: statuses
@@ -604,6 +657,7 @@ async fn run_inner() -> Result<()> {
                         .collect(),
                     limit,
                     offset,
+                    after_cursor,
                 },
                 SidesCommand::Status { id } => Request::SideStatus { id },
                 SidesCommand::Logs(args) => Request::SideLogs {
@@ -746,7 +800,11 @@ async fn config_command(command: ConfigCommand) -> Result<()> {
             .as_deref()
             .is_none_or(|key| value.get("key").and_then(Value::as_str) == Some(key))
         {
-            println!("{}", serde_json::to_string(&value)?);
+            let mut line = serde_json::to_vec(&value)?;
+            line.push(b'\n');
+            if !write_stdout(&line)? {
+                break;
+            }
         }
     }
     Ok(())
@@ -866,14 +924,23 @@ async fn request_unchecked(req: Request) -> Result<()> {
         if value.get("type").and_then(Value::as_str) == Some("error") {
             eprintln!("{line}");
             failed = true;
-        } else {
-            println!("{line}");
+        } else if !write_stdout(format!("{line}\n").as_bytes())? {
+            return Ok(());
         }
     }
     if failed {
         std::process::exit(4)
     }
     Ok(())
+}
+
+fn write_stdout(bytes: &[u8]) -> Result<bool> {
+    let mut stdout = io::stdout().lock();
+    match stdout.write_all(bytes).and_then(|()| stdout.flush()) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(false),
+        Err(error) => Err(error.into()),
+    }
 }
 
 async fn exchange(req: Request) -> Result<Vec<Value>> {
@@ -1063,19 +1130,10 @@ fn parse_typed_id(value: &str, prefix: &str, label: &str) -> std::result::Result
 }
 
 fn parse_agent_id(value: &str) -> std::result::Result<String, String> {
-    if value.starts_with("agt_") {
-        parse_typed_id(value, "agt_", "AGENT")
-    } else if valid_local_ref(value, "a_")
-        || (!value.trim().is_empty()
-            && !["a_", "s_", "m_", "e_", "side_", "msg_", "evt_"]
-                .iter()
-                .any(|prefix| value.starts_with(prefix)))
-    {
+    if !value.trim().is_empty() {
         Ok(value.to_string())
     } else {
-        Err(format!(
-            "expected AGENT, a local a_<number> reference, or an exact agent name; received {value}"
-        ))
+        Err("AGENT must not be empty".into())
     }
 }
 fn parse_side_id(value: &str) -> std::result::Result<String, String> {
