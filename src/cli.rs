@@ -4,7 +4,10 @@ use crate::{
         read_daemon_lifecycle,
     },
     daemon,
-    ipc::{AgentMode, ListFilter, PROTOCOL_VERSION, Request, coded_error, error_json_for},
+    ipc::{
+        AgentMode, ListFilter, MAX_LIST_LIMIT, PROTOCOL_VERSION, Request, coded_error,
+        error_json_for,
+    },
     store::{canonical_dir, canonical_filter_dir},
 };
 use anyhow::{Context, Result, bail};
@@ -30,7 +33,7 @@ const MAX_DAEMON_LOG_BYTES: u64 = 10 * 1024 * 1024;
     color=clap::ColorChoice::Never,
     about="JSONL-only background coding-agent manager",
     long_about=None,
-    after_help="All command data is JSONL. Configure the daemon with OPENAI_API_KEY, OPENAI_BASE_URL, and OPENAI_MODEL. No human/table output mode is provided. Agent shell commands are unsandboxed; readonly mode is advisory."
+    after_help="Operational output is always plain JSONL; help and version are plain text. Use `subagent NOUN VERB --help` for argument ranges, output shapes, and examples. Configure the daemon with OPENAI_API_KEY, OPENAI_BASE_URL, and OPENAI_MODEL. No table or non-plain mode is provided. Agent shell commands are unsandboxed; readonly mode is advisory."
 )]
 struct Cli {
     #[command(subcommand)]
@@ -89,11 +92,13 @@ enum ConfigCommand {
         key: String,
     },
     #[command(
-        after_help = "Keys:\n  base-url STRING (nonempty; OPENAI_BASE_URL overrides)\n  model STRING (nonempty; OPENAI_MODEL overrides)\n  max-agents INTEGER (0 means unlimited; SUBAGENT_MAX_AGENTS overrides)\n  context-token-budget INTEGER (>0)\n  tool-output-preview-bytes INTEGER (>0)\n  stall-notification-seconds INTEGER (0..=86400; 0 disables; SUBAGENT_STALL_NOTIFICATION_SECONDS overrides)\n\nAll changes are persisted atomically. Restart a running daemon when restart_required is true."
+        after_help = "Keys:\n  base-url STRING (nonempty; OPENAI_BASE_URL overrides)\n  model STRING (nonempty; OPENAI_MODEL overrides)\n  max-agents INTEGER (0 means unlimited; SUBAGENT_MAX_AGENTS overrides)\n  context-token-budget INTEGER (>0)\n  tool-output-preview-bytes INTEGER (>0)\n  stall-notification-seconds INTEGER (0..=86400; 0 disables; SUBAGENT_STALL_NOTIFICATION_SECONDS overrides)\n\nJSONL output: one config_value. Changes are persisted atomically. Restart only when restart_required is true; active_differs_from_local may be true for harmless environment divergence.\n\nExample:\n  subagent config set model gpt-5.4-mini"
     )]
     Set {
+        /// Configuration key listed in the contract below.
         #[arg(value_name = "KEY")]
         key: String,
+        /// New persisted value using the selected key's documented format.
         #[arg(value_name = "VALUE")]
         value: String,
     },
@@ -135,34 +140,42 @@ enum SidesCommand {
         about = "Start a one-shot Side run and return its short ref plus durable Side ID immediately."
     )]
     Create(SideArgs),
-    #[command(about = "List persisted Side runs for one parent Agent.")]
+    #[command(
+        about = "List persisted Side runs for one parent Agent.",
+        after_help = "JSONL output: zero or more side_list_item records followed by one list_summary.\n\nExample:\n  subagent sides list a_7 --status working --limit 20"
+    )]
     List {
         /// Parent Agent a_N ref, agt_<ULID>, or exact name.
         #[arg(value_name = "AGENT", value_parser = parse_agent_id)]
         agent_id: String,
+        /// Filter by status; repeat for working, finished, stopped, or failed.
         #[arg(long = "status")]
         statuses: Vec<StatusArg>,
-        #[arg(long, default_value_t = 100)]
+        /// Maximum Side records to emit, from 1 through 1000.
+        #[arg(long, default_value_t = 100, value_parser = parse_list_limit)]
         limit: usize,
+        /// Number of matching Side records to skip; zero starts at the first match.
         #[arg(long, default_value_t = 0)]
         offset: usize,
     },
     #[command(about = "Get complete Side metadata.")]
     Status {
-        /// Durable Side-run s_N ref or side_<ULID>.
-        #[arg(value_name = "SIDE_ID", value_parser = parse_side_id)]
+        /// Side short ref (s_N) or durable ID (side_<ULID>).
+        #[arg(value_name = "SIDE", value_parser = parse_side_id)]
         id: String,
     },
     #[command(about = "Read Side Event JSONL.")]
     Logs(SideLogsArgs),
     #[command(about = "Stop a working Side run.")]
     Stop {
-        #[arg(value_name = "SIDE_ID", value_parser = parse_side_id)]
+        /// Side short ref (s_N) or durable ID (side_<ULID>).
+        #[arg(value_name = "SIDE", value_parser = parse_side_id)]
         id: String,
     },
     #[command(about = "Delete a terminal Side history.")]
     Delete {
-        #[arg(value_name = "SIDE_ID", value_parser = parse_side_id)]
+        /// Side short ref (s_N) or durable ID (side_<ULID>).
+        #[arg(value_name = "SIDE", value_parser = parse_side_id)]
         id: String,
     },
 }
@@ -181,12 +194,15 @@ enum AgentsCommand {
         #[arg(value_name = "AGENT", value_parser = parse_agent_id)]
         id: String,
     },
-    #[command(about = "Wait until one Agent reaches a terminal state and emit its final metadata.")]
+    #[command(
+        about = "Wait until one Agent reaches a terminal state and emit its final metadata.",
+        after_help = "JSONL output: one complete terminal Agent object, or a retryable timeout Error.\n\nExample:\n  subagent agents wait a_7 --timeout-seconds 300"
+    )]
     Wait {
         /// Agent a_N ref, agt_<ULID>, or exact name.
         #[arg(value_name = "AGENT", value_parser = parse_agent_id)]
         id: String,
-        /// Optional bounded wait; timeout is a retryable daemon error.
+        /// Optional bounded wait in seconds, from 1 through 86400; timeout is retryable.
         #[arg(long, value_name = "SECONDS", value_parser = parse_wait_timeout)]
         timeout_seconds: Option<u64>,
     },
@@ -205,16 +221,19 @@ enum AgentsCommand {
     #[command(about = "Send input at the next safe boundary, or resume a non-working agent.")]
     Send(SendArgs),
     #[command(
-        visible_alias = "btw",
         about = "Answer a question with a readonly side agent over a snapshot of the parent context."
     )]
     Side(SideArgs),
-    #[command(about = "Set a working agent deadline to MINUTES from now (1..=6000).")]
+    #[command(
+        about = "Set a working agent deadline in minutes from now.",
+        after_help = "JSONL output: one complete Agent object with the updated deadline.\n\nExample:\n  subagent agents time a_7 90"
+    )]
     Time {
         /// Agent a_N ref, agt_<ULID>, or exact name.
         #[arg(value_name = "AGENT", value_parser = parse_agent_id)]
         id: String,
-        #[arg(value_parser = parse_minutes)]
+        /// New deadline from now in integer minutes, from 1 through 6000.
+        #[arg(value_name = "MINUTES", value_parser = parse_minutes)]
         minutes: u64,
     },
     #[command(about = "Stop a working agent and all its terminal process groups.")]
@@ -267,7 +286,7 @@ impl From<ModeArg> for AgentMode {
 #[derive(Args)]
 #[command(
     group(clap::ArgGroup::new("input").required(true).multiple(false).args(["message", "message_file"])),
-    after_help="JSONL output: one Agent object with a stable agt_<ULID>. The tracking name appears in agents list and rename receipts."
+    after_help="JSONL output: one complete Agent object containing its preferred a_N ref and stable agt_<ULID>.\n\nExample:\n  subagent agents spawn --name \"API tests\" --dir /home/me/project --mode write --message \"Add API regression tests\""
 )]
 struct SpawnArgs {
     /// Existing working directory for the agent.
@@ -298,7 +317,7 @@ struct SpawnArgs {
 
 #[derive(Args)]
 #[command(
-    after_help = "Compact items are {type,id,ref,name,status,dir,mode,model,spawned_at,last_message_at,updated_at,current_phase,last_event_at,run_number,working_sides}. --verbose emits full telemetry. A final list_summary is always emitted."
+    after_help = "JSONL output: zero or more compact Agent records followed by one list_summary. Compact records contain {type,id,ref,name,status,dir,mode,model,spawned_at,last_message_at,updated_at,current_phase,last_event_at,run_number,working_sides}; --verbose emits full telemetry.\n\nExamples:\n  subagent agents list --status working --limit 20\n  subagent agents list --limit 100 --after-cursor CURSOR\n  subagent agents list --after-cursor CURSOR --offset 0"
 )]
 struct ListArgs {
     /// Filter by status; repeat for working, finished, stopped, or failed.
@@ -325,14 +344,14 @@ struct ListArgs {
     /// Sort direction.
     #[arg(long,default_value="desc",value_parser=["asc","desc"])]
     order: String,
-    /// Maximum emitted agent objects.
-    #[arg(long, default_value_t = 100)]
+    /// Maximum Agent records to emit, from 1 through 1000.
+    #[arg(long, default_value_t = 100, value_parser = parse_list_limit)]
     limit: usize,
-    /// Number of matching objects to skip.
+    /// Number of matching Agent records to skip; must be zero with --after-cursor.
     #[arg(long, default_value_t = 0)]
     offset: usize,
     /// Continue after an opaque cursor from a previous list_summary.
-    #[arg(long, conflicts_with = "offset")]
+    #[arg(long)]
     after_cursor: Option<String>,
     /// Emit complete lifecycle, deadline, error, and activity diagnostics.
     #[arg(long)]
@@ -369,8 +388,8 @@ struct AgentLogsArgs {
     after_help = "Event JSONL schema: {event_id,ref,agent_id,agent_ref,side_id,side_ref,sequence,timestamp,type,data}. Types: user_message,assistant_message,reasoning,tool_call,tool_result,lifecycle,error."
 )]
 struct SideLogsArgs {
-    /// Durable Side-run s_N ref or side_<ULID>.
-    #[arg(value_name = "SIDE_ID", value_parser = parse_side_id)]
+    /// Side short ref (s_N) or durable ID (side_<ULID>).
+    #[arg(value_name = "SIDE", value_parser = parse_side_id)]
     id: String,
     /// Exact Event type to include; repeatable. Empty selects user/assistant messages.
     #[arg(long = "type", value_name = "EVENT_TYPE", value_parser = ["system_message", "user_message", "assistant_message", "reasoning", "tool_call", "tool_result", "lifecycle", "error"])]
@@ -401,7 +420,7 @@ struct ContextArgs {
 #[derive(Args)]
 #[command(
     group(clap::ArgGroup::new("input").required(true).multiple(false).args(["message", "message_file"])),
-    after_help="Durably store the message and return one message_sent receipt immediately. Delivery continues in the daemon."
+    after_help="JSONL output: one message_sent acceptance receipt immediately; model delivery continues in the daemon.\n\nExample:\n  subagent agents send a_7 --message \"Run the full test suite too\""
 )]
 struct SendArgs {
     /// Agent a_N ref, agt_<ULID>, or exact name.
@@ -413,7 +432,7 @@ struct SendArgs {
     /// Read UTF-8 input from PATH; use - for stdin.
     #[arg(long, value_name = "PATH")]
     message_file: Option<String>,
-    /// Optional new-run deadline, or reset the active deadline from now.
+    /// Optional deadline in integer minutes, from 1 through 6000; resets an active deadline.
     #[arg(long, value_name = "MINUTES", value_parser = parse_minutes)]
     wall_time_minutes: Option<u64>,
 }
@@ -421,7 +440,7 @@ struct SendArgs {
 #[derive(Args)]
 #[command(
     group(clap::ArgGroup::new("input").required(true).multiple(false).args(["message", "message_file"])),
-    after_help="Start a durable one-shot readonly Side run and return side_created immediately. `subagent agents btw` is an exact alias for `subagent agents side`. Inspect progress with sides status or sides logs. The Side trace never enters the parent transcript."
+    after_help="JSONL output: one side_created receipt immediately. Inspect progress with `subagent sides status SIDE` or `subagent sides logs SIDE`. The Side trace never enters the parent transcript.\n\nExample:\n  subagent agents side a_7 --message \"Which database does this project use?\""
 )]
 struct SideArgs {
     /// Parent Agent a_N ref, agt_<ULID>, or exact name.
@@ -443,7 +462,7 @@ struct SideArgs {
 
 #[derive(Args)]
 #[command(
-    after_help = "Each line is one notification, newest first. --priority N includes priority N and higher."
+    after_help = "JSONL output: zero or more Notifications newest-first followed by one inbox_summary. --priority N includes N and higher. Follow mode streams Notifications without a summary.\n\nExamples:\n  subagent inbox --priority 3 --limit 20\n  subagent inbox follow --after 42 --priority 2"
 )]
 struct InboxArgs {
     /// Maximum notifications to emit, from 1 through 100.
@@ -610,26 +629,29 @@ async fn run_inner() -> Result<()> {
                     model: a.model,
                     wall_time_minutes: a.wall_time_minutes,
                 },
-                AgentsCommand::List(a) => Request::AgentList {
-                    filter: ListFilter {
-                        statuses: a
-                            .statuses
-                            .into_iter()
-                            .map(|status| status.as_str().to_string())
-                            .collect(),
-                        dir: a.dir.as_deref().map(canonical_filter_dir).transpose()?,
-                        spawned_after: a.spawned_after,
-                        spawned_before: a.spawned_before,
-                        finished_after: a.finished_after,
-                        finished_before: a.finished_before,
-                        sort: a.sort,
-                        order: a.order,
-                        limit: a.limit,
-                        offset: a.offset,
-                        after_cursor: a.after_cursor,
-                        verbose: a.verbose,
-                    },
-                },
+                AgentsCommand::List(a) => {
+                    validate_cursor_offset(a.after_cursor.as_deref(), a.offset)?;
+                    Request::AgentList {
+                        filter: ListFilter {
+                            statuses: a
+                                .statuses
+                                .into_iter()
+                                .map(|status| status.as_str().to_string())
+                                .collect(),
+                            dir: a.dir.as_deref().map(canonical_filter_dir).transpose()?,
+                            spawned_after: a.spawned_after,
+                            spawned_before: a.spawned_before,
+                            finished_after: a.finished_after,
+                            finished_before: a.finished_before,
+                            sort: a.sort,
+                            order: a.order,
+                            limit: a.limit,
+                            offset: a.offset,
+                            after_cursor: a.after_cursor,
+                            verbose: a.verbose,
+                        },
+                    }
+                }
                 AgentsCommand::Status { id } => Request::AgentStatus { id },
                 AgentsCommand::Wait {
                     id,
@@ -708,8 +730,14 @@ async fn config_command(command: ConfigCommand) -> Result<()> {
                 value["active_value"] = active.get("active_value").cloned().unwrap_or(Value::Null);
                 value["active_source"] =
                     active.get("active_source").cloned().unwrap_or(Value::Null);
-                value["restart_required"] =
-                    Value::Bool(value["local_effective_value"] != value["active_value"]);
+                let (differs, restart_required) = config_change_state(
+                    &value["local_effective_value"],
+                    &value["active_value"],
+                    value["local_source"].as_str(),
+                    value["active_source"].as_str(),
+                );
+                value["active_differs_from_local"] = Value::Bool(differs);
+                value["restart_required"] = Value::Bool(restart_required);
             }
         }
     }
@@ -722,6 +750,21 @@ async fn config_command(command: ConfigCommand) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn config_change_state(
+    local_value: &Value,
+    active_value: &Value,
+    local_source: Option<&str>,
+    active_source: Option<&str>,
+) -> (bool, bool) {
+    let differs = local_value != active_value;
+    let configuration_layer =
+        |source: Option<&str>| matches!(source, Some("default" | "persisted"));
+    (
+        differs,
+        differs && configuration_layer(local_source) && configuration_layer(active_source),
+    )
 }
 
 async fn start_daemon(web_ui_port: Option<u16>) -> Result<()> {
@@ -939,6 +982,28 @@ fn parse_log_limit(value: &str) -> std::result::Result<usize, String> {
     Ok(limit)
 }
 
+fn parse_list_limit(value: &str) -> std::result::Result<usize, String> {
+    let limit = value
+        .parse::<usize>()
+        .map_err(|_| "limit must be an integer from 1 through 1000".to_string())?;
+    if !(1..=MAX_LIST_LIMIT).contains(&limit) {
+        return Err("limit must be an integer from 1 through 1000".into());
+    }
+    Ok(limit)
+}
+
+fn validate_cursor_offset(after_cursor: Option<&str>, offset: usize) -> Result<()> {
+    if after_cursor.is_some() && offset != 0 {
+        return Err(coded_error(
+            "invalid_argument",
+            "--after-cursor may only be combined with --offset 0; remove --offset or set it to 0",
+            json!({"fields":["after_cursor","offset"],"offset":offset}),
+            false,
+        ));
+    }
+    Ok(())
+}
+
 fn parse_inbox_limit(value: &str) -> std::result::Result<usize, String> {
     let limit = value
         .parse::<usize>()
@@ -1017,7 +1082,7 @@ fn parse_side_id(value: &str) -> std::result::Result<String, String> {
     if valid_local_ref(value, "s_") {
         Ok(value.to_string())
     } else {
-        parse_typed_id(value, "side_", "SIDE_ID")
+        parse_typed_id(value, "side_", "SIDE")
     }
 }
 fn parse_message_id(value: &str) -> std::result::Result<String, String> {
@@ -1073,6 +1138,65 @@ mod tests {
         assert_eq!(parse_log_limit("10000").unwrap(), 10_000);
         assert!(parse_log_limit("0").is_err());
         assert!(parse_log_limit("10001").is_err());
+    }
+
+    #[test]
+    fn list_limit_is_positive_and_bounded() {
+        assert_eq!(parse_list_limit("1").unwrap(), 1);
+        assert_eq!(parse_list_limit("1000").unwrap(), 1_000);
+        for value in ["0", "1001", "18446744073709551615"] {
+            assert!(parse_list_limit(value).is_err(), "{value}");
+        }
+    }
+
+    #[test]
+    fn cursor_accepts_only_zero_offset() {
+        assert!(validate_cursor_offset(None, 12).is_ok());
+        assert!(validate_cursor_offset(Some("cursor"), 0).is_ok());
+        let error = validate_cursor_offset(Some("cursor"), 1).unwrap_err();
+        let value = error_json_for(&error, "cli_error");
+        assert_eq!(value["code"], "invalid_argument");
+        assert!(value["message"].as_str().unwrap().contains("--offset 0"));
+    }
+
+    #[test]
+    fn btw_alias_is_not_accepted() {
+        let error = match Cli::try_parse_from(["subagent", "agents", "btw", "--help"]) {
+            Ok(_) => panic!("btw must remain removed"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("unrecognized subcommand 'btw'"));
+    }
+
+    #[test]
+    fn restart_required_ignores_environment_divergence() {
+        assert_eq!(
+            config_change_state(
+                &json!("local"),
+                &json!("active"),
+                Some("default"),
+                Some("OPENAI_MODEL"),
+            ),
+            (true, false)
+        );
+        assert_eq!(
+            config_change_state(
+                &json!(65_000),
+                &json!(64_000),
+                Some("persisted"),
+                Some("default"),
+            ),
+            (true, true)
+        );
+        assert_eq!(
+            config_change_state(
+                &json!("same"),
+                &json!("same"),
+                Some("persisted"),
+                Some("persisted"),
+            ),
+            (false, false)
+        );
     }
 
     #[test]

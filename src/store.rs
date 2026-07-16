@@ -544,7 +544,9 @@ impl Store {
             let delivered = messages
                 .iter()
                 .filter_map(|message| message.delivered_at)
-                .max();
+                .max()
+                .map_or(meta.spawned_at, |timestamp| timestamp.max(meta.spawned_at));
+            let delivered = Some(delivered);
             if meta.last_message_delivered_at != delivered || needs_migration {
                 meta.last_message_delivered_at = delivered;
                 migrate_event_activity(&self.events_path(&meta.id), &mut meta.activity)?;
@@ -715,7 +717,7 @@ impl Store {
         }
         Err(coded_error(
             "side_not_found",
-            format!("Side run not found: {identifier}"),
+            format!("side not found: {identifier}"),
             json!({"side":identifier}),
             false,
         ))
@@ -1944,6 +1946,18 @@ mod name_tests {
                 })
                 .unwrap()
                 .is_empty()
+        );
+        let mut legacy = store.load_metadata(&agent.id).unwrap();
+        legacy.last_message_delivered_at = None;
+        store.save_metadata(&legacy).unwrap();
+        drop(store);
+        let reopened = Store::new(&paths).unwrap();
+        assert_eq!(
+            reopened
+                .load_metadata(&agent.id)
+                .unwrap()
+                .last_message_delivered_at,
+            Some(agent.spawned_at)
         );
         let _ = fs::remove_dir_all(root);
     }

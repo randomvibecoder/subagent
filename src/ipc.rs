@@ -1,7 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
+pub const MAX_LIST_LIMIT: usize = 1_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]

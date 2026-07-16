@@ -200,7 +200,7 @@ impl AgentManager {
             spawned_at: now,
             last_message_at: now,
             last_message_sent_at: Some(now),
-            last_message_delivered_at: None,
+            last_message_delivered_at: Some(now),
             run_started_at: now,
             updated_at: now,
             finished_at: None,

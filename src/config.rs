@@ -353,6 +353,7 @@ pub fn local_config_values(paths: &Paths) -> Result<Vec<Value>> {
                 "local_source":sources.get(*key),
                 "active_value":Value::Null,
                 "active_source":Value::Null,
+                "active_differs_from_local":Value::Null,
                 "restart_required":Value::Null,
             }))
         })

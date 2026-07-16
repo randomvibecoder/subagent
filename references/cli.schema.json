@@ -64,6 +64,9 @@
     },
     {
       "$ref": "#/$defs/InboxAcknowledged"
+    },
+    {
+      "$ref": "#/$defs/InboxSummary"
     }
   ],
   "$defs": {
@@ -273,10 +276,10 @@
           "$ref": "#/$defs/Timestamp"
         },
         "last_message_sent_at": {
-          "$ref": "#/$defs/NullableTimestamp"
+          "$ref": "#/$defs/Timestamp"
         },
         "last_message_delivered_at": {
-          "$ref": "#/$defs/NullableTimestamp"
+          "$ref": "#/$defs/Timestamp"
         },
         "run_started_at": {
           "$ref": "#/$defs/Timestamp"
@@ -538,10 +541,10 @@
           "$ref": "#/$defs/Timestamp"
         },
         "last_message_sent_at": {
-          "$ref": "#/$defs/NullableTimestamp"
+          "$ref": "#/$defs/Timestamp"
         },
         "last_message_delivered_at": {
-          "$ref": "#/$defs/NullableTimestamp"
+          "$ref": "#/$defs/Timestamp"
         },
         "run_started_at": {
           "$ref": "#/$defs/Timestamp"
@@ -1558,7 +1561,7 @@
             },
             "output_ref": {
               "type": "string",
-              "pattern": "^out_"
+              "pattern": "^out_[0-9A-HJKMNP-TV-Z]{26}$"
             },
             "truncated": {
               "type": "boolean"
@@ -1585,14 +1588,14 @@
             },
             "terminal_id": {
               "type": "string",
-              "pattern": "^term_"
+              "pattern": "^term_[0-9A-HJKMNP-TV-Z]{26}$"
             },
             "output": {
               "$ref": "#/$defs/Preview"
             },
             "output_ref": {
               "type": "string",
-              "pattern": "^out_"
+              "pattern": "^out_[0-9A-HJKMNP-TV-Z]{26}$"
             },
             "truncated": {
               "type": "boolean"
@@ -1618,7 +1621,7 @@
             },
             "terminal_id": {
               "type": "string",
-              "pattern": "^term_"
+              "pattern": "^term_[0-9A-HJKMNP-TV-Z]{26}$"
             },
             "status": {
               "enum": [
@@ -1637,7 +1640,7 @@
             },
             "output_ref": {
               "type": "string",
-              "pattern": "^out_"
+              "pattern": "^out_[0-9A-HJKMNP-TV-Z]{26}$"
             },
             "next_offset": {
               "type": "integer",
@@ -1676,7 +1679,7 @@
                 "properties": {
                   "terminal_id": {
                     "type": "string",
-                    "pattern": "^term_"
+                    "pattern": "^term_[0-9A-HJKMNP-TV-Z]{26}$"
                   },
                   "command": {
                     "type": "string"
@@ -1690,7 +1693,7 @@
                   },
                   "output_ref": {
                     "type": "string",
-                    "pattern": "^out_"
+                    "pattern": "^out_[0-9A-HJKMNP-TV-Z]{26}$"
                   }
                 }
               }
@@ -1750,7 +1753,7 @@
             },
             "output_ref": {
               "type": "string",
-              "pattern": "^out_"
+              "pattern": "^out_[0-9A-HJKMNP-TV-Z]{26}$"
             },
             "offset": {
               "type": "integer",
@@ -1825,7 +1828,7 @@
             },
             "output_ref": {
               "type": "string",
-              "pattern": "^out_"
+              "pattern": "^out_[0-9A-HJKMNP-TV-Z]{26}$"
             },
             "truncated": {
               "type": "boolean"
@@ -1950,7 +1953,7 @@
           "type": "string"
         },
         "protocol_version": {
-          "const": 2
+          "const": 3
         },
         "pid": {
           "type": "integer",
@@ -2408,6 +2411,7 @@
         "local_source",
         "active_value",
         "active_source",
+        "active_differs_from_local",
         "restart_required"
       ],
       "properties": {
@@ -2459,6 +2463,12 @@
             "null"
           ]
         },
+        "active_differs_from_local": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
         "restart_required": {
           "type": [
             "boolean",
@@ -2485,6 +2495,29 @@
           "minimum": 1
         },
         "previous_acknowledged_through": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "InboxSummary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "count",
+        "acknowledged_through"
+      ],
+      "properties": {
+        "type": {
+          "const": "inbox_summary"
+        },
+        "count": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "acknowledged_through": {
           "type": "integer",
           "minimum": 0
         }

@@ -124,7 +124,7 @@ subagent inbox
 subagent inbox --agent a_1 --priority 3 --limit 50 --offset 0
 ~~~
 
-Inbox emits unread durable Notifications newest-first, one per line. The default is
+Inbox emits unread durable Notifications newest-first, then one `inbox_summary`. The default is
 the newest 20 unread entries at priority 2 or higher. Agents publish meaningful progress,
 milestones, requests for input, and blockers; spawn, resume, finish, stop, and failure
 notifications are automatic. This is the recommended master-agent view because it
@@ -160,8 +160,8 @@ subagent sides create a_1 --message "Which framework is it using?"
 ~~~
 
 Output is a side_created receipt with a stable `side_<ULID>` and local `s_` reference. It returns immediately.
-Inspect the saved answer and tool trace with sides status and sides logs. agents side
-and agents btw are creation aliases.
+Inspect the saved answer and tool trace with sides status and sides logs. `agents side`
+is the sole Agent-context Side creation command.
 
 ## Commands
 
@@ -188,7 +188,7 @@ subagent agents list
     [--spawned-after RFC3339] [--spawned-before RFC3339]
     [--finished-after RFC3339] [--finished-before RFC3339]
     [--sort spawned_at|updated_at|finished_at]
-    [--order asc|desc] [--limit N] [--offset N | --after-cursor CURSOR] [--verbose]
+    [--order asc|desc] [--limit N] [--offset N] [--after-cursor CURSOR] [--verbose]
 
 subagent agents status AGENT
 subagent agents wait AGENT [--timeout-seconds SECONDS]
@@ -223,9 +223,11 @@ receipt. MINUTES is an integer from 1 through 6000; omission means no deadline.
 Each agent_list_item also contains working_sides, from zero through two.
 Compact list output includes model, current_phase, and last_event_at. `--verbose`
 emits the full Agent telemetry plus working_sides and seconds_since_last_event.
-The final agent list_summary contains a nullable `next_cursor`; pass a non-null value
-back through `--after-cursor` for keyset pagination. Offset remains available for
-compatibility but is less stable during concurrent updates.
+Agent and Side list limits default to 100 and accept 1 through 1000. The final Agent
+list_summary contains a nullable `next_cursor`; pass a non-null value back through
+`--after-cursor` for keyset pagination. Cursor mode permits omitted `--offset` or
+explicit `--offset 0` and rejects nonzero offset. Offset-only pagination remains
+available for compatibility but is less stable during concurrent updates.
 MODEL overrides the daemon default only for the new Agent and remains attached across
 resumed runs. Omit it to use the daemon default.
 
@@ -237,11 +239,11 @@ subagent sides create AGENT
     [--wall-time-minutes MINUTES]
 subagent sides list AGENT
     [--status working|finished|stopped|failed]... [--limit N] [--offset N]
-subagent sides status SIDE_ID
-subagent sides logs SIDE_ID
+subagent sides status SIDE
+subagent sides logs SIDE
     [--type EVENT_TYPE]... [--all] [--after EVENT_ID] [--limit N] [--follow]
-subagent sides stop SIDE_ID
-subagent sides delete SIDE_ID
+subagent sides stop SIDE
+subagent sides delete SIDE
 ~~~
 
 Side creation is asynchronous and persistent. At most two Side runs may be working
@@ -254,8 +256,10 @@ Sides and removes all its Side histories. Side never appends to parent context.
 Agent timestamps:
 
 - spawned_at: creation time.
-- last_message_at and last_message_sent_at: latest daemon acceptance of a user message.
-- last_message_delivered_at: latest message actually consumed by the model loop.
+- last_message_at and last_message_sent_at: latest daemon acceptance of user input;
+  both begin at spawned_at for the initial task.
+- last_message_delivered_at: latest input placed into model context; the initial task
+  is direct context and therefore begins at spawned_at even though it is not a durable Message.
 - run_started_at: start of the current run.
 - updated_at: latest consumed message, model/tool activity, deadline change, or state
 transition.
@@ -281,7 +285,9 @@ subagent inbox follow [--after SEQUENCE] [--priority 1|2|3|4|5]
     [--agent AGENT]
 ~~~
 
-Plain output is unread Notification JSONL, newest first. limit defaults 20 and accepts 1–100;
+Plain output is unread Notification JSONL, newest first, followed by exactly one
+`inbox_summary` containing the emitted count and global acknowledgement watermark.
+limit defaults 20 and accepts 1–100;
 offset defaults zero. priority is a minimum threshold, defaults 2, and therefore
 `--priority 3` includes priorities 3, 4, and 5. agent accepts a ref, durable ID, or
 exact name and also includes its Side notifications. `--all` includes acknowledged
@@ -360,13 +366,16 @@ subagent config set KEY VALUE
 Keys: base-url, model, max-agents, context-token-budget,
 tool-output-preview-bytes, and stall-notification-seconds. Base URL/model must be
 nonempty; context and preview budgets must be positive. max-agents defaults to 8; set it to 0 only when unlimited
-concurrency is intentional. Restart the daemon after setting.
+concurrency is intentional. Restart the daemon after setting only when the returned
+`restart_required` field is true.
 
 Precedence is compiled defaults, persisted config, then environment overrides.
 List emits one `config_value` per key; get emits one. Each record separates default,
 persisted, caller-local effective, and running-daemon active values and their sources.
-`restart_required` reports whether the active daemon differs. Set changes persisted
-values without copying overrides.
+`active_differs_from_local` reports any difference between the running daemon and the
+calling shell's effective value. `restart_required` is true only for an unmasked
+persisted/default change that the running daemon has not loaded; both are null when no
+daemon is reachable. Set changes persisted values without copying overrides.
 
 ## Modes and safety
 
@@ -393,7 +402,7 @@ reverts the working directory, project files, Git state, commits, or branches.
 - End active work: agents stop.
 - Remove daemon history: agents delete only with explicit authorization.
 
-The v0.1.5 contract uses `protocol_version:2`. The binary reports `version` and
+The v0.1.6 contract uses `protocol_version:3`. The binary reports `version` and
 `protocol_version` in daemon status. Operational CLI
 commands reject an incompatible running daemon with `protocol_mismatch`; restart the
 daemon after replacing the binary. The latest binary, this skill, the protocol

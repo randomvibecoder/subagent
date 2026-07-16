@@ -281,7 +281,7 @@ async fn inbox(
         .filter(|value| !value.is_empty())
         .map(|value| state.store.resolve_agent_id(&value))
         .transpose()?;
-    let values = state
+    let mut values = state
         .store
         .list_notifications(&InboxFilter {
             limit,
@@ -293,6 +293,11 @@ async fn inbox(
         .into_iter()
         .map(serde_json::to_value)
         .collect::<std::result::Result<Vec<_>, _>>()?;
+    values.push(json!({
+        "type":"inbox_summary",
+        "count":values.len(),
+        "acknowledged_through":state.store.notification_acknowledged_through()?,
+    }));
     Ok(ndjson(values))
 }
 
@@ -616,14 +621,18 @@ async fn list_sides(
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
         .collect::<Vec<_>>();
+    let limit = query.limit.unwrap_or(100);
+    if !(1..=crate::ipc::MAX_LIST_LIMIT).contains(&limit) {
+        return Err(ApiError(coded_error(
+            "invalid_argument",
+            "side list limit must be from 1 through 1000",
+            json!({"field":"limit","minimum":1,"maximum":crate::ipc::MAX_LIST_LIMIT,"value":limit}),
+            false,
+        )));
+    }
     let values = state
         .manager
-        .list_sides(
-            &id,
-            &statuses,
-            query.limit.unwrap_or(100).clamp(1, 1000),
-            query.offset.unwrap_or(0),
-        )?
+        .list_sides(&id, &statuses, limit, query.offset.unwrap_or(0))?
         .into_iter()
         .map(serde_json::to_value)
         .collect::<std::result::Result<Vec<_>, _>>()?;

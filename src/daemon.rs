@@ -1,7 +1,7 @@
 use crate::{
     agent::AgentManager,
     config::{RuntimeConfig, ensure_private_dir, write_daemon_lifecycle},
-    ipc::{PROTOCOL_VERSION, Request, coded_error, error_json_for},
+    ipc::{MAX_LIST_LIMIT, PROTOCOL_VERSION, Request, coded_error, error_json_for},
     store::{AgentStatus, EventRecord, InboxFilter, Store, canonical_filter_dir},
 };
 use anyhow::{Context, Result};
@@ -204,8 +204,13 @@ async fn dispatch(
             wall_time_minutes,
         )?)?],
         Request::AgentList { mut filter } => {
-            if filter.limit == 0 {
-                filter.limit = 100
+            if !(1..=MAX_LIST_LIMIT).contains(&filter.limit) {
+                return Err(coded_error(
+                    "invalid_argument",
+                    "agent list limit must be from 1 through 1000",
+                    json!({"field":"limit","minimum":1,"maximum":MAX_LIST_LIMIT,"value":filter.limit}),
+                    false,
+                ));
             }
             if filter.sort.is_empty() {
                 filter.sort = "spawned_at".into()
@@ -216,8 +221,8 @@ async fn dispatch(
             if filter.after_cursor.is_some() && filter.offset != 0 {
                 return Err(coded_error(
                     "invalid_argument",
-                    "after_cursor and offset cannot be used together",
-                    json!({"fields":["after_cursor","offset"]}),
+                    "after_cursor may only be combined with offset 0",
+                    json!({"fields":["after_cursor","offset"],"offset":filter.offset}),
                     false,
                 ));
             }
@@ -317,7 +322,7 @@ async fn dispatch(
                     false,
                 ));
             }
-            store
+            let mut values = store
                 .list_notifications(&InboxFilter {
                     limit,
                     offset,
@@ -327,7 +332,13 @@ async fn dispatch(
                 })?
                 .into_iter()
                 .map(serde_json::to_value)
-                .collect::<Result<_, _>>()?
+                .collect::<Result<Vec<_>, _>>()?;
+            values.push(json!({
+                "type":"inbox_summary",
+                "count":values.len(),
+                "acknowledged_through":store.notification_acknowledged_through()?,
+            }));
+            values
         }
         Request::InboxAck { identifier } => {
             vec![store.acknowledge_notifications(&identifier)?]
@@ -355,11 +366,16 @@ async fn dispatch(
         Request::SideList {
             agent_id,
             statuses,
-            mut limit,
+            limit,
             offset,
         } => {
-            if limit == 0 {
-                limit = 100;
+            if !(1..=MAX_LIST_LIMIT).contains(&limit) {
+                return Err(coded_error(
+                    "invalid_argument",
+                    "side list limit must be from 1 through 1000",
+                    json!({"field":"limit","minimum":1,"maximum":MAX_LIST_LIMIT,"value":limit}),
+                    false,
+                ));
             }
             let mut values = manager
                 .list_sides(&agent_id, &statuses, limit, offset)?

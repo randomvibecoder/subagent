@@ -40,11 +40,11 @@ jobs:
           binary=target/x86_64-unknown-linux-musl/release/subagent
           file "$binary" | grep -Eq 'statically linked|static-pie linked'
           ! readelf -d "$binary" 2>/dev/null | grep -q NEEDED
-          test "$($binary --version)" = "subagent 0.1.5"
+          test "$($binary --version)" = "subagent 0.1.6"
       - name: End-to-end tests
         run: SUBAGENT_BIN="$PWD/target/x86_64-unknown-linux-musl/release/subagent" bash tests/e2e.sh
       - name: Verify tracked release artifact
         run: |
           (cd dist && sha256sum -c subagent-linux-x86_64.sha256)
           file dist/subagent-linux-x86_64 | grep -Eq 'statically linked|static-pie linked'
-          test "$(dist/subagent-linux-x86_64 --version)" = "subagent 0.1.5"
+          test "$(dist/subagent-linux-x86_64 --version)" = "subagent 0.1.6"

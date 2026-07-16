@@ -139,12 +139,18 @@
     if (agent) params.set("agent", agent);
     if (values.get("all")) params.set("all", "true");
     try {
-      var notifications = await lines("/api/inbox?" + params.toString());
+      var records = await lines("/api/inbox?" + params.toString()),
+        summary = records.find(function (record) {
+          return record.type === "inbox_summary";
+        }),
+        notifications = records.filter(function (record) {
+          return record.type === "notification";
+        });
       $("#inbox").innerHTML = notifications.length
         ? notifications.map(notificationHtml).join("")
         : '<div class="empty-state">No matching notifications.</div>';
       $("#inbox-previous").disabled = inboxOffset === 0;
-      $("#inbox-next").disabled = notifications.length < limit;
+      $("#inbox-next").disabled = (summary ? summary.count : notifications.length) < limit;
       $("#inbox-page").textContent =
         "Page " + (Math.floor(inboxOffset / limit) + 1);
     } catch (error) {

@@ -135,8 +135,9 @@ debugging escape hatch; redirect it to a file or filter it narrowly rather than
 printing an entire model context into another agent's conversation.
 
 Agent lists retain offset compatibility and also emit an opaque `next_cursor` for
-safer keyset pagination. Inbox records are unread by default; acknowledgement uses a
-durable installation-local watermark, and follow streams JSONL without polling.
+safer keyset pagination. Agent and Side list limits are 1 through 1000. Inbox records
+are unread by default; each finite query ends with an `inbox_summary`, acknowledgement
+uses a durable installation-local watermark, and follow streams JSONL without polling.
 
 ## Optional Web UI
 

@@ -1,4 +1,4 @@
-# Subagent v0.1.5 Protocol Reference
+# Subagent v0.1.6 Protocol Reference
 
 This file specifies the current binary. Backward compatibility is not promised. The
 release binary, SKILL.md, this reference, and cli.schema.json must change together.
@@ -22,7 +22,8 @@ release binary, SKILL.md, this reference, and cli.schema.json must change togeth
 Operational stdout is UTF-8 JSONL. Every line is one compact JSON object followed by
 LF. Strings encode embedded newlines. Commands never emit tables, ANSI escapes,
 progress, or arrays around multiple results. Agent, Side, and Message list commands
-always finish with one list_summary line, including count zero.
+always finish with one list_summary line, including count zero. Non-streaming Inbox
+queries always finish with one inbox_summary line, including count zero.
 Streaming output is flushed after each object.
 
 Help and version are plain text. Local parsing, configuration, startup, and daemon
@@ -42,15 +43,21 @@ object. Current semantic codes:
 - daemon_crashed: a daemon recorded as starting/running disappeared; details include
   its last PID, timestamps, daemon log path, and a bounded last-log-line summary.
 - daemon_already_running: start found a reachable daemon.
-- agent_not_found, event_not_found, message_not_found, notification_not_found.
+- agent_not_found, side_not_found, event_not_found, message_not_found,
+  notification_not_found.
 - invalid_argument, file_too_large.
 - capacity_exceeded: spawn rejected; retryable true.
 - conflict: current entity state forbids the command.
 - timeout: reserved for synchronous bounded operations; retryable true. Side deadline
   expiry is persisted as stopped wall_time instead of returning this Error.
 - api_error: endpoint/network/status failure; retryable reflects status.
+- protocol_mismatch: CLI and daemon protocol versions differ; restart after upgrading.
 - internal_error: unclassified I/O, persistence, decoding, or invariant failure.
 - cli_error: local clap/config/file-input failure not assigned a narrower code.
+
+The Web HTTP surface additionally uses unauthorized for missing/incorrect Basic Auth
+and invalid_origin for rejected state-changing browser origins. These are HTTP API
+errors, not Unix-socket CLI semantic codes.
 
 A tool failure is not a CLI Error. It becomes:
 
@@ -87,7 +94,8 @@ many whole minutes after daemon receipt. Omission means no deadline.
 Integer CLI/config values use unsigned base-10 Rust usize parsing on the supported
 x86-64 build. Negative values, fractions, underscores, and overflow are rejected.
 Leading plus and leading zero behavior follows Rust FromStr; do not emit either.
-Log limit is explicitly 1 through 10000. Tool-specific limits are below.
+Agent and Side list limits are 1 through 1000 and default to 100. Log limit is
+explicitly 1 through 10000. Tool-specific limits are below.
 Inbox limit is 1 through 100 and priority is 1 through 5.
 
 ### RFC3339
@@ -119,8 +127,10 @@ Agent timestamps:
 
 - spawned_at never changes.
 - last_message_at begins at spawned_at and changes when send is durably accepted.
-- last_message_sent_at has the same acceptance meaning; last_message_delivered_at
-  is null at spawn and changes only when the worker consumes a durable Message.
+- last_message_sent_at begins at spawned_at because the initial task is accepted with
+  creation. last_message_delivered_at also begins at spawned_at because that task is
+  placed directly into model context; it is not a durable Message record. Later sends
+  update sent at acceptance and delivered when the worker consumes the Message.
 - updated_at changes for consumed user messages, reasoning/assistant/tool Events,
   deadline changes, and lifecycle/error Events. Queue acceptance alone does not change
   it.
@@ -230,8 +240,9 @@ stopped and failed Agents are excluded. Sort defaults spawned_at descending; val
 keys are spawned_at, updated_at, finished_at. ID is the deterministic secondary key.
 Null finished_at sorts first ascending and last descending.
 
-Default limit 100 and offset 0. `--after-cursor` accepts the opaque `next_cursor` from
-a prior list_summary and conflicts with nonzero offset. The cursor binds the requested
+Default limit 100, maximum 1000, and offset 0. Zero and values above 1000 are rejected.
+`--after-cursor` accepts the opaque `next_cursor` from a prior list_summary and may be
+combined only with omitted offset or explicit offset zero. The cursor binds the requested
 sort/order and continues after the last `(sort value, durable ID)` pair. It avoids
 offset shifts and duplicate ties, though records whose mutable sort key changes can
 still move between pages. Offset remains for compatibility. Output is one compact
@@ -321,8 +332,10 @@ stall-notification-seconds 180.
 Precedence is compiled defaults, persisted TOML, then OPENAI_BASE_URL, OPENAI_MODEL,
 SUBAGENT_MAX_AGENTS, and SUBAGENT_STALL_NOTIFICATION_SECONDS. list/get emit one
 config_value per key, separating default, persisted, caller-local effective, and
-running-daemon active values and sources. restart_required is null without a daemon
-and otherwise reports a mismatch. set loads
+running-daemon active values and sources. active_differs_from_local is null without a
+daemon and otherwise reports any active/local mismatch. restart_required is also null
+without a daemon and is true only when an unmasked persisted/default value changed
+since daemon startup; environment divergence alone does not request a restart. set loads
 persisted values, changes one key, and atomically rewrites the complete file; an
 environment override can mask it. Concurrent config set calls are atomic individually
 but not transactionally merged, so last writer wins.
@@ -334,7 +347,9 @@ Empty API key is rejected. Credentials are not validated until a model request.
 ### inbox
 
 `subagent inbox` reads unread records from the durable global notification journal. It emits compact
-Notification JSONL newest-first. Defaults are limit 20, offset zero, and minimum
+Notification JSONL newest-first followed by exactly one
+`{"type":"inbox_summary","count":N,"acknowledged_through":SEQUENCE}` record.
+Defaults are limit 20, offset zero, and minimum
 priority 2. Limit is 1 through 100. `--priority N` includes N and higher. `--agent`
 accepts an Agent ref, durable ID, or exact name and includes that Agent's Side
 notifications. `--all` also includes acknowledged records. Offset applies after
@@ -454,7 +469,7 @@ system/question messages, durably creates a working Side, and immediately emits:
 {"type":"side_created","id":"side_...","ref":"s_1","agent_id":"agt_...","agent_ref":"a_1","status":"working","created_at":"RFC3339"}
 ~~~
 
-agents side and agents btw are exact creation aliases. Side is one-shot: it accepts no
+`agents side AGENT` is the sole Agent-context creation command. Side is one-shot: it accepts no
 follow-up messages. At most two Side runs may be working for one parent. This limit is
 independent of max-agents; a third creation returns capacity_exceeded and creates
 nothing.
@@ -463,19 +478,20 @@ Optional `--model` overrides the parent model for that Side only. Without it, th
 inherits the parent model. The selected value is stored in Side metadata.
 
 `sides list AGENT` supports repeatable OR status filters plus limit/offset and emits
-newest-first side_list_item JSONL followed by list_summary. question_preview is the first 200 Unicode scalar
-values. `sides status SIDE_ID` emits complete Side metadata including full question,
+newest-first side_list_item JSONL followed by list_summary. Limit defaults to 100 and
+accepts 1 through 1000. question_preview is the first 200 Unicode scalar
+values. `sides status SIDE` emits complete Side metadata including full question,
 nullable answer, lifecycle timestamps, inherited_context_messages, tool_calls,
 stop_reason, and last_error.
 
-`sides logs SIDE_ID` uses the same type, cursor, limit, follow, ordering, and flushing
+`sides logs SIDE` uses the same type, cursor, limit, follow, ordering, and flushing
 rules as agents logs. Side Events add side_id while agent_id remains the parent ID.
 Every Side persists its user question, reasoning, assistant answer, tool calls, tool
 results, lifecycle/error Events, context snapshot, and complete tool outputs. Default
 logs are user/assistant; use --all or --type for tools and reasoning.
 
-`sides stop SIDE_ID` requires working and transitions to stopped user_request.
-`sides delete SIDE_ID` requires terminal and deletes its complete stored history.
+`sides stop SIDE` requires working and transitions to stopped user_request.
+`sides delete SIDE` requires terminal and deletes its complete stored history.
 Deadline expiry is stopped wall_time. Fatal errors are failed. Daemon shutdown stops
 working Sides daemon_shutdown; crash recovery marks them stopped daemon_interrupted
 without resuming. Parent deletion stops working Sides with parent_deleted and removes
