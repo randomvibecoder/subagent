@@ -1,37 +1,28 @@
 # subagent
 
+[![CI](https://github.com/randomvibecoder/subagent/actions/workflows/ci.yml/badge.svg)](https://github.com/randomvibecoder/subagent/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/randomvibecoder/subagent)](https://github.com/randomvibecoder/subagent/releases/latest)
+[![License](https://img.shields.io/github/license/randomvibecoder/subagent)](LICENSE)
+
 **Persistent coding agents for other agents.**
 
-`subagent` is a Linux-first CLI and per-user daemon for starting coding work in the
-background, checking it later, and continuing it without losing context. Every
-operational response is JSONL. There is no table, color, or interactive output mode
-to parse around.
+`subagent` is a small Linux CLI and daemon that lets an agent delegate work, continue
+doing something else, and return when the delegated work is ready. Every operational
+response is compact JSONL: no tables, ANSI formatting, or interactive output to parse.
 
-- Native host execution with one small static binary
-- Persistent agent histories with stable `agt_<ULID>` identifiers
-- Concurrent work across independent project directories
-- OpenAI-compatible chat-completions API
-- Full coding tools, including Bash and eight background terminals per agent
-- Durable, readonly Side runs with saved answers and tool traces
-- Durable high-signal notifications for master-agent coordination
-- Per-Agent and per-Side model overrides
+![Two coding agents running in parallel from the subagent CLI](docs/assets/cli-demo.gif)
 
 ## Install
 
-Supported platform: **Linux x86-64** (`x86_64`/`amd64`). The release binary is
-statically linked, so the same artifact runs across distributions without a system
-runtime dependency.
-
-Install the latest release without root privileges:
+Supported platform: **Linux x86-64**. The release is one statically linked binary and
+does not require root access or a system runtime.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/randomvibecoder/subagent/main/install.sh | sh
 ```
 
-The installer downloads the release binary and checksum, verifies SHA-256, installs
-to `$HOME/.local/bin/subagent`, and runs `subagent --version`.
-
-To inspect the installer before running it:
+The installer downloads the latest release and checksum, verifies SHA-256, installs
+to `$HOME/.local/bin/subagent`, and prints the installed version. To inspect it first:
 
 ```sh
 curl -fsSLO https://raw.githubusercontent.com/randomvibecoder/subagent/main/install.sh
@@ -39,79 +30,57 @@ less install.sh
 sh install.sh
 ```
 
-To use another user-owned destination:
+Set `SUBAGENT_INSTALL_DIR` to use another user-owned destination:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/randomvibecoder/subagent/main/install.sh |
   SUBAGENT_INSTALL_DIR="$HOME/bin" sh
 ```
 
-Alternatively, clone the repository and install its included binary:
-
-```sh
-git clone https://github.com/randomvibecoder/subagent.git
-cd subagent
-install -Dm755 dist/subagent-linux-x86_64 "$HOME/.local/bin/subagent"
-```
-
-Ensure `$HOME/.local/bin` is on `PATH`. To build from source instead, use a current
-stable Rust toolchain:
-
-```sh
-cargo build --release --locked
-install -Dm755 target/release/subagent "$HOME/.local/bin/subagent"
-```
-
-No root privileges, package manager, or system service installation are required.
-
 ## Quick start
 
-Configure an OpenAI-compatible endpoint and start the daemon:
+Start the per-user daemon with an OpenAI API key:
 
 ```sh
 export OPENAI_API_KEY='...'
-export OPENAI_BASE_URL='https://example.com/v1'
-export OPENAI_MODEL='your-model'
-
 subagent daemon start
 ```
 
-Spawn a write-enabled agent:
+The defaults are `https://api.openai.com/v1` and `gpt-5.4-mini`. Any compatible
+Chat Completions endpoint can be selected with `OPENAI_BASE_URL` and `OPENAI_MODEL`.
+
+Spawn independent work and keep the returned ID:
 
 ```sh
 subagent agents spawn \
+  --name "Fix authentication" \
   --dir "$HOME/projects/my-app" \
   --mode write \
-  --name "Fix authentication" \
   --message "Find and fix the login regression, then run the relevant tests."
 ```
-
-The response contains the new ID:
 
 ```json
 {"type":"agent","id":"agt_01...","status":"working"}
 ```
 
-Use that ID to inspect or continue the work:
+Coordinate several workers without importing their raw transcripts:
 
 ```sh
-subagent agents status agt_01...
+subagent agents list --status working
+subagent inbox --priority 2
+subagent agents logs agt_01...
 subagent agents send agt_01... --message "Also check token refresh behavior."
-subagent inbox --agent agt_01...
 ```
 
-`send` returns immediately after the daemon durably stores the message:
-
-```json
-{"type":"message_sent","message_id":"msg_01...","agent_id":"agt_01...","status":"queued","sent_at":"2026-07-10T12:00:00Z"}
-```
+`send` durably queues the message and returns immediately. A finished, stopped, or
+failed agent resumes as a new run; a working agent consumes it at the next model
+boundary.
 
 ## Why a daemon?
 
-The CLI is a thin JSONL client. A manually started, user-owned daemon holds active
-workers and listens on a private Unix socket. Agent metadata, durable messages,
-context, events, and complete command output are persisted on disk, so finished agents
-leave memory and can be resumed later.
+The CLI is a thin JSONL client over a private Unix socket. The daemon owns active
+workers while agent metadata, context, messages, notifications, events, and complete
+terminal output are persisted on disk.
 
 ```text
 calling agent -> subagent CLI -> Unix socket -> daemon -> model + tools
@@ -120,289 +89,99 @@ calling agent -> subagent CLI -> Unix socket -> daemon -> model + tools
                                               `-> agent C
 ```
 
-Stopping the CLI process does not stop the daemon. Use `subagent daemon stop` for an
-orderly shutdown.
+Finished agents leave memory and can be resumed later. Interrupted agents are
+reconciled on restart, and pending messages survive daemon failure. Four main agents
+may work concurrently by default; configure another limit with `max-agents` or
+`SUBAGENT_MAX_AGENTS` (`0` explicitly means unlimited).
 
-## Commands
+## Core commands
 
 | Command | Purpose |
 | --- | --- |
-| `daemon start` | Start the detached per-user daemon |
-| `daemon status` | Report daemon PID, socket, model, and capacity |
-| `daemon stop` | Stop the daemon and its working agents |
-| `inbox` | Read newest-first high-signal Agent and Side notifications |
-| `agents spawn` | Create and immediately start a persistent agent |
-| `agents list` | Filter, sort, and paginate stored agents |
-| `agents status ID` | Read one agent's current metadata |
-| `agents rename ID NAME` | Change the unique display name shown by `agents list` |
-| `agents logs ID` | Read the last 20 transcript Events by default, or select/follow other types |
-| `agents context ID` | Dump the complete current raw model context as debugging JSONL |
-| `agents send ID` | Durably queue input and immediately return a message receipt |
-| `agents side ID` | Alias that starts a durable readonly Side run |
-| `agents btw ID` | Alias for `agents side` |
-| `sides create|list|status|logs|stop|delete` | Manage durable one-shot Side runs |
-| `agents time ID MINUTES` | Reset a working agent's deadline from now |
-| `agents stop ID` | Stop an agent and all of its terminal process groups |
-| `agents delete ID` | Permanently delete a non-working agent history |
-| `messages list|status|cancel` | Inspect or cancel durable Agent messages |
-| `config list|get|set` | Manage non-secret daemon configuration |
+| `daemon start\|status\|stop` | Operate the per-user daemon |
+| `agents spawn\|list\|status\|rename` | Create and inspect persistent agents |
+| `agents logs ID` | Read the newest 20 transcript events or select/follow other types |
+| `agents send ID` | Durably steer or resume an agent |
+| `agents time\|stop\|delete ID` | Manage lifecycle and cleanup |
+| `sides create\|list\|status\|logs\|stop\|delete` | Run saved one-shot Side questions |
+| `messages list\|status\|cancel` | Inspect durable queued messages |
+| `inbox` | Read newest-first high-signal notifications |
+| `config list\|get\|set` | Manage non-secret configuration |
 
-Run any command with `--help` for its exact flags and JSON output schema.
+Run any command with `--help` for exact flags. [`SKILL.md`](SKILL.md) is the compact
+agent-facing operating guide; [`references/protocol.md`](references/protocol.md) and
+[`references/cli.schema.json`](references/cli.schema.json) define exact behavior and
+JSONL shapes.
 
-### Spawn input
+## Agents, Side runs, and tools
 
-Inline and file input are mutually exclusive:
+Main agents have stable `agt_<ULID>` IDs and unique 4–40 character display names.
+Names make lists readable; commands still use IDs. Each agent can select a model and
+work in `readonly` or `write` mode.
 
-```sh
-subagent agents spawn --name "Feature build" --dir /path/to/project --message "Build the feature"
-subagent agents spawn --name "Repository review" --dir /path/to/project --message-file task.md
-printf '%s\n' "Review this repository" | \
-  subagent agents spawn --name "Repository review" --dir /path/to/project --message-file -
-```
+Side runs are durable one-shot questions over a snapshot of a parent's context. They
+inherit its directory and model by default, save their own answer and tool trace, and
+never append to the parent transcript.
 
-Names are mandatory, case-sensitive, unique across stored agents, and 4–40 Unicode
-characters. IDs remain authoritative for every command. Agents start in `readonly`
-mode unless `--mode write` is supplied. Optional `--wall-time-minutes MINUTES` values
-are integers from 1 through 6000. `--model MODEL` overrides the daemon default for
-that Agent and remains selected when the Agent resumes.
+Every agent can read files, glob, grep, run Bash, manage up to eight background
+terminals, read stored output, view images, and publish notifications. Write agents
+also receive `write`, exact `edit`, and OpenAI-style `apply_patch` tools.
 
-### List filters
-
-`agents list` supports repeatable status filters, canonical directory filters,
-spawned/finished time ranges, sorting, ordering, limits, and offsets:
-
-```sh
-subagent agents list \
-  --status working \
-  --dir /path/to/project \
-  --sort updated_at \
-  --order desc \
-  --limit 20
-```
-
-Agent states are `working`, `finished`, `stopped`, and `failed`.
-
-Every list item includes the display `name`, `spawned_at`, `last_message_at`, and
-`updated_at`, so list output
-distinguishes creation, latest accepted user instruction, and latest worker activity.
+`agents logs` intentionally omits tool payloads by default. `agents context` is a raw
+debugging escape hatch; redirect it to a file or filter it narrowly rather than
+printing an entire model context into another agent's conversation.
 
 ## Optional Web UI
 
-Start the daemon with a localhost-only dashboard when a human wants to monitor it:
+When a human is in the loop, start the daemon with the localhost dashboard:
 
 ```sh
 subagent daemon start --web-ui-port 7341
 ```
 
-The embedded dark-only UI binds only `127.0.0.1`. The daemon response includes a plain
-`web_ui_url`; open it in a browser. To require HTTP Basic Auth, set the password only
-in the daemon startup environment (the fixed username is `subagent`):
-
-```sh
-SUBAGENT_WEB_PASSWORD='choose-a-secret' \
-  subagent daemon start --web-ui-port 7341
-```
-
-When the variable is absent, the localhost UI has no authentication. `daemon status`
-reports `web_auth` as `basic`, `none`, or `null` when the UI is disabled, and never
-returns the password. The password is stripped from agent shell environments. The UI
-uses `#000000` for the
-background, `#ffffff` for primary text, and light gray for secondary metadata. It
-supports the human-facing equivalents of spawn, rename, list/status, filtered live
-logs, send, message inspection/cancellation, side questions, time, stop, and confirmed
-delete. Its dashboard notification panel filters by minimum priority, Agent, page
-size, and offset; it refreshes every five seconds and collapses long summaries. The
-dashboard opens each agent on a dedicated routed page. Tool activity is
-rendered as readable collapsed accordions instead of raw JSON; `apply_patch` calls use
-a one-pane Git-style diff with red deletions and green additions. Agent pages have
-Main, Side, and Controls tabs. Main opens at the newest event and loads history while
-scrolling upward, using the full remaining viewport without a conversation card.
-Side is a history index; every Side run opens on its own full-screen page with the
-same Main/Controls layout and saved tool trace. The UI
-intentionally omits config, daemon administration, and raw context.
-
-### Notifications
-
-Use the inbox as the normal coordination surface for a master agent. It returns
-compact JSONL without transcript or tool payloads:
-
-```sh
-subagent inbox
-subagent inbox --priority 3 --agent agt_01... --limit 50 --offset 0
-```
-
-Results are newest-first. Defaults are 20 entries and priority 2 or higher; limit is
-1–100. The retained journal contains the latest 10,000 Notifications. There is no
-follow, wait, acknowledgement, or read/unread state.
-
-### Logs and context
-
-Normal logs omit tool payloads and return the newest 20 system, user, and assistant
-Events in chronological JSONL order:
-
-```sh
-subagent agents logs agt_01...
-```
-
-Select exact Event types with repeatable `--type`, or use `--all`:
-
-```sh
-subagent agents logs agt_01... --type tool_call --type tool_result --limit 100
-subagent agents logs agt_01... --all --follow
-```
-
-`agents context` is a raw debugging escape hatch, not normal transcript output. Never
-print it unfiltered into model-visible terminal output; redirect it or use a narrow
-`jq` selector:
-
-```sh
-subagent agents context agt_01... > /tmp/agent-context.jsonl
-```
-
-### Durable messages
-
-Messages are FIFO and survive daemon failure. Poll or cancel them using stable IDs:
-
-```sh
-subagent messages list agt_01... --status pending
-subagent messages status agt_01... msg_01...
-subagent messages cancel agt_01... msg_01...
-```
-
-After restart, interrupted Agents with pending messages resume automatically as
-capacity becomes available.
-
-## Side questions
-
-Side runs answer focused questions without interrupting the parent or adding anything
-to its transcript:
-
-```sh
-subagent sides create agt_01... \
-  --model optional-side-model \
-  --message "Which module validates refresh tokens, and why?"
-```
-
-Creation returns a side_<ULID> immediately. The Side receives a valid snapshot of the
-parent's model context and working directory. It may read files, search with
-`glob` or `grep`, run non-mutating Bash such as `rg`, poll its own terminals, inspect
-stored output, and view images.
-
-Side runs are always readonly, even when the parent is in write mode. They never
-receive `write`, `edit`, or `apply_patch`. Their question, reasoning, tool calls,
-answer, and command outputs persist until sides delete or parent deletion. At most two
-may work per parent. Bash restrictions remain instruction-based, not a security
-boundary.
-
-## Model tools
-
-All agents can receive these tools:
-
-| Tool | Purpose |
-| --- | --- |
-| `read` | Read bounded UTF-8 file ranges with line numbers |
-| `glob` | Find files while respecting ignore rules |
-| `grep` | Search file contents with regular expressions |
-| `exec_command` | Run Bash and return a terminal ID when still active |
-| `write_stdin` | Write to or poll a live terminal |
-| `list_terminals` | List the agent's live background terminals |
-| `terminate_terminal` | Stop one terminal process group |
-| `terminate_all_terminals` | Stop every terminal owned by the agent |
-| `read_output` | Read bounded chunks from complete stored command output |
-| `view_image` | Attach a local image to the next model request |
-| `notify` | Publish progress, milestone, input-required, or blocked updates to the inbox |
-
-Write-mode agents additionally receive three mutation styles:
-
-| Tool | Purpose |
-| --- | --- |
-| `write` | Create or replace a complete file |
-| `edit` | Replace exact text in an existing file |
-| `apply_patch` | Apply an OpenAI-style add/update/delete patch |
-
-Each agent may own at most eight live background terminals. Terminal process groups
-are cleaned up when an agent finishes, stops, fails, times out, or the daemon exits.
-The API key and optional Web UI password are removed from agent shell environments.
+Set `SUBAGENT_WEB_PASSWORD` at daemon startup to require HTTP Basic Auth with username
+`subagent`. The Web UI is optional and intentionally excludes daemon configuration and
+raw model context.
 
 ## Configuration
 
-Environment variables override stored configuration:
+Environment variables override persisted configuration:
 
 | Variable | Meaning |
 | --- | --- |
-| `OPENAI_API_KEY` | Required daemon credential; never written to configuration |
-| `SUBAGENT_WEB_PASSWORD` | Optional HTTP Basic Auth password for the localhost Web UI; fixed username `subagent` |
-| `OPENAI_BASE_URL` | OpenAI-compatible API base URL |
-| `OPENAI_MODEL` | Model sent to chat completions |
-| `SUBAGENT_MAX_AGENTS` | Maximum simultaneously working agents; `0` is unlimited |
+| `OPENAI_API_KEY` | Required daemon credential; never persisted |
+| `OPENAI_BASE_URL` | Chat Completions base URL |
+| `OPENAI_MODEL` | Default model |
+| `SUBAGENT_MAX_AGENTS` | Concurrent main-agent limit; default `4` |
+| `SUBAGENT_WEB_PASSWORD` | Optional localhost Web UI password |
 
-Non-secret settings can be persisted with the CLI:
+Persist non-secret settings with `subagent config set`. Restart the daemon after a
+configuration or environment change.
 
-```sh
-subagent config set base-url https://example.com/v1
-subagent config set model your-model
-subagent config set max-agents 8
-subagent config list
-```
+State follows XDG directories, normally under `~/.local/state/subagent`. The daemon
+log rotates at 10 MiB with one backup. Agent histories and complete command outputs
+remain until their owning agent is deleted, so long-lived installations should clean
+up obsolete agents.
 
-Restart the daemon after changing stored configuration.
+## Security
 
-## State layout
+`subagent` is host-native automation, **not a sandbox**. Agents run with the daemon
+user's filesystem, process, credential, and network access. Readonly mode removes
+structured write tools and instructs the model not to mutate state, but Bash can still
+change the host.
 
-Defaults follow the XDG base-directory convention:
+Run the daemon as a user that can access only the projects and credentials agents
+should reach. Treat repository content as untrusted instructions. See
+[`SECURITY.md`](SECURITY.md) for reporting and the supported security boundary.
 
-```text
-~/.config/subagent/config.toml
-~/.local/state/subagent/
-├── daemon.log
-├── notifications.jsonl
-├── notification-sequence
-└── agents/
-    └── agt_<ULID>/
-        ├── metadata.json
-        ├── context.json
-        ├── messages.json
-        ├── events.jsonl
-        ├── event-sequence
-        └── outputs/
-```
-
-The socket uses `$XDG_RUNTIME_DIR/subagent.sock` when `XDG_RUNTIME_DIR` is set and
-falls back to the private state directory. State directories are owner-only and
-files are written with owner-only permissions.
-
-## Security model
-
-Agents execute directly with the permissions of the user running the daemon. There
-is no built-in sandbox, command approval layer, or network isolation. Readonly mode
-withholds structured mutation tools and tells the model not to change state, but
-Bash remains available and can technically mutate the host.
-
-Run `subagent` as a user that can access only the projects, credentials, processes,
-and network resources agents should reach. Treat repository instructions and other
-content an agent reads as untrusted input.
-
-## Development
-
-```sh
-cargo fmt --check
-cargo check --locked
-cargo test --locked
-```
-
-The schema contract test requires the Python `jsonschema` package.
-
-The end-to-end suite starts a local mock OpenAI-compatible streaming server:
+## Build and contribute
 
 ```sh
 cargo build --release --locked
-SUBAGENT_BIN="$PWD/target/release/subagent" tests/e2e.sh
+cargo test --locked
 ```
 
-See [`SKILL.md`](SKILL.md) for the agent-facing workflow,
-[`references/protocol.md`](references/protocol.md) for exact behavior, and
-[`references/cli.schema.json`](references/cli.schema.json) for JSONL schemas.
+The portable release uses the `x86_64-unknown-linux-musl` target. See
+[`CONTRIBUTING.md`](CONTRIBUTING.md) for the complete validation and release workflow.
 
-## License
-
-Apache-2.0
+Licensed under [Apache-2.0](LICENSE).

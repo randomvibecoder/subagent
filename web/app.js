@@ -312,6 +312,10 @@
     this.noMore = false;
     this.unseen = 0;
     this.stream = null;
+    this.reconnectTimer = null;
+    this.reconnectAttempt = 0;
+    this.destroyed = false;
+    this.terminal = false;
     var self = this;
     this.onScroll = function () {
       if (self.scroll.scrollTop < 80) self.loadOlder();
@@ -356,6 +360,15 @@
       this.newest = events[events.length - 1].event_id;
       this.container.innerHTML = events.map(eventHtml).join("");
       bindEventControls(this.container, this.fullUrl);
+      var latestLifecycle = events
+        .slice()
+        .reverse()
+        .find(function (event) {
+          return event.type === "lifecycle" && event.data;
+        });
+      this.terminal = Boolean(
+        latestLifecycle && latestLifecycle.data.status !== "working",
+      );
     } else this.container.innerHTML = "";
     this.state.textContent = events.length
       ? "Scroll upward for older history"
@@ -363,7 +376,7 @@
     var self = this;
     requestAnimationFrame(function () {
       self.scrollBottom();
-      self.startStream();
+      if (!self.terminal) self.startStream();
     });
   };
   TimelineController.prototype.loadOlder = async function () {
@@ -404,12 +417,14 @@
     this.loading = false;
   };
   TimelineController.prototype.startStream = function () {
+    if (this.destroyed || this.terminal) return;
     var self = this,
       url = this.streamUrl + "?types=" + encodeURIComponent(visibleTypes);
     if (this.newest) url += "&after=" + encodeURIComponent(this.newest);
     this.stream = new AuthEventStream(url, function (message) {
       var event = JSON.parse(message.data),
         follow = self.nearBottom();
+      self.reconnectAttempt = 0;
       self.newest = event.event_id;
       if (!self.oldest) self.oldest = event.event_id;
       self.container.insertAdjacentHTML("beforeend", eventHtml(event));
@@ -426,12 +441,26 @@
         event.type === "lifecycle" &&
         event.data &&
         event.data.status !== "working"
-      )
+      ) {
+        self.terminal = true;
         self.onTerminal();
+      }
+    }, function (error) {
+      self.stream = null;
+      if (self.destroyed || self.terminal) return;
+      if (error && self.reconnectAttempt === 0)
+        notice("Live timeline disconnected; reconnecting…");
+      var delay = UI.reconnectDelay(self.reconnectAttempt++);
+      self.reconnectTimer = setTimeout(function () {
+        self.reconnectTimer = null;
+        self.startStream();
+      }, delay);
     });
   };
   TimelineController.prototype.destroy = function () {
+    this.destroyed = true;
     this.scroll.removeEventListener("scroll", this.onScroll);
+    if (this.reconnectTimer) clearTimeout(this.reconnectTimer);
     if (this.stream) this.stream.close();
   };
 
@@ -578,8 +607,14 @@
         };
       });
   }
-  function AuthEventStream(url, onMessage) {
-    var controller = new AbortController();
+  function AuthEventStream(url, onMessage, onClose) {
+    var controller = new AbortController(),
+      closed = false;
+    function finish(error) {
+      if (closed) return;
+      closed = true;
+      if (onClose) onClose(error || null);
+    }
     fetch(url, {
       signal: controller.signal,
     })
@@ -607,11 +642,13 @@
             if (data) onMessage({ data: data });
           });
         }
+        finish(null);
       })
       .catch(function (error) {
-        if (error.name !== "AbortError") notice(error.message);
+        if (error.name !== "AbortError") finish(error);
       });
     this.close = function () {
+      closed = true;
       controller.abort();
     };
   }

@@ -1,10 +1,14 @@
-use crate::ipc::coded_error;
+use crate::ipc::{CodedError, coded_error};
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, time::Duration};
+
+const MAX_ATTEMPTS: u32 = 5;
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(60);
+const STREAM_IDLE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolCall {
@@ -58,14 +62,16 @@ impl OpenAiClient {
             "stream": true,
         });
         let mut last_error = None;
-        for attempt in 0..5 {
+        for attempt in 0..MAX_ATTEMPTS {
             match self.complete_once(&body).await {
                 Ok(turn) => return Ok(turn),
                 Err(e) => {
+                    let delay = retry_delay(&e, attempt);
                     last_error = Some(e);
-                    if attempt < 4 {
-                        tokio::time::sleep(Duration::from_secs(1u64 << attempt)).await;
+                    if attempt + 1 >= MAX_ATTEMPTS || delay.is_none() {
+                        break;
                     }
+                    tokio::time::sleep(delay.unwrap()).await;
                 }
             }
         }
@@ -92,11 +98,16 @@ impl OpenAiClient {
             })?;
         let status = response.status();
         if !status.is_success() {
+            let retry_after = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .and_then(parse_retry_after_seconds);
             let text = response.text().await.unwrap_or_default();
             return Err(coded_error(
                 "api_error",
                 format!("OpenAI API returned {status}: {}", truncate(&text, 2000)),
-                json!({"http_status":status.as_u16()}),
+                json!({"http_status":status.as_u16(),"retry_after_seconds":retry_after}),
                 status.is_server_error() || status.as_u16() == 429,
             ));
         }
@@ -118,8 +129,27 @@ impl OpenAiClient {
         let mut reasoning = String::new();
         let mut calls: BTreeMap<usize, ToolBuilder> = BTreeMap::new();
         let mut usage = None;
-        while let Some(chunk) = stream.next().await {
-            buffer.push_str(&String::from_utf8_lossy(&chunk?));
+        loop {
+            let next = tokio::time::timeout(STREAM_IDLE_TIMEOUT, stream.next())
+                .await
+                .map_err(|_| {
+                    coded_error(
+                        "api_error",
+                        "OpenAI stream produced no data for five minutes",
+                        json!({"timeout_seconds":STREAM_IDLE_TIMEOUT.as_secs()}),
+                        true,
+                    )
+                })?;
+            let Some(chunk) = next else { break };
+            let chunk = chunk.map_err(|error| {
+                coded_error(
+                    "api_error",
+                    format!("OpenAI stream failed: {error}"),
+                    json!({}),
+                    true,
+                )
+            })?;
+            buffer.push_str(&String::from_utf8_lossy(&chunk));
             while let Some(pos) = buffer.find('\n') {
                 let line = buffer[..pos].trim_end_matches('\r').to_string();
                 buffer.drain(..=pos);
@@ -188,6 +218,32 @@ impl OpenAiClient {
     }
 }
 
+fn retry_delay(error: &anyhow::Error, attempt: u32) -> Option<Duration> {
+    let coded = error.downcast_ref::<CodedError>()?;
+    if !coded.retryable {
+        return None;
+    }
+    let seconds = coded
+        .details
+        .get("retry_after_seconds")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(|| 1u64 << attempt.min(6));
+    Some(Duration::from_secs(
+        seconds.clamp(1, MAX_RETRY_DELAY.as_secs()),
+    ))
+}
+
+fn parse_retry_after_seconds(value: &str) -> Option<u64> {
+    if let Ok(seconds) = value.trim().parse::<u64>() {
+        return Some(seconds.clamp(1, MAX_RETRY_DELAY.as_secs()));
+    }
+    let retry_at = chrono::DateTime::parse_from_rfc2822(value.trim()).ok()?;
+    let seconds = (retry_at.with_timezone(&chrono::Utc) - chrono::Utc::now())
+        .num_seconds()
+        .max(1) as u64;
+    Some(seconds.min(MAX_RETRY_DELAY.as_secs()))
+}
+
 #[derive(Default)]
 struct ToolBuilder {
     id: String,
@@ -241,5 +297,35 @@ pub fn assistant_message(turn: &ModelTurn) -> Value {
         json!({"role":"assistant","content":turn.content})
     } else {
         json!({"role":"assistant","content": if turn.content.is_empty() { Value::Null } else { Value::String(turn.content.clone()) }, "tool_calls":calls})
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retry_delay_respects_retryability_and_bounds() {
+        let fatal = coded_error("api_error", "bad request", json!({}), false);
+        assert_eq!(retry_delay(&fatal, 0), None);
+
+        let throttled = coded_error(
+            "api_error",
+            "rate limited",
+            json!({"retry_after_seconds":120}),
+            true,
+        );
+        assert_eq!(retry_delay(&throttled, 0), Some(MAX_RETRY_DELAY));
+
+        let network = coded_error("api_error", "network", json!({}), true);
+        assert_eq!(retry_delay(&network, 3), Some(Duration::from_secs(8)));
+    }
+
+    #[test]
+    fn retry_after_accepts_seconds_and_http_dates() {
+        assert_eq!(parse_retry_after_seconds("7"), Some(7));
+        assert_eq!(parse_retry_after_seconds("999"), Some(60));
+        assert!(parse_retry_after_seconds("Wed, 21 Oct 2099 07:28:00 GMT").is_some());
+        assert_eq!(parse_retry_after_seconds("not-a-delay"), None);
     }
 }

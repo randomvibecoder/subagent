@@ -18,6 +18,8 @@ use tokio::{
     net::UnixStream,
 };
 
+const MAX_DAEMON_LOG_BYTES: u64 = 10 * 1024 * 1024;
+
 #[derive(Parser)]
 #[command(
     name="subagent",
@@ -572,6 +574,7 @@ async fn start_daemon(web_ui_port: Option<u16>) -> Result<()> {
     }
     ensure_private_dir(&cfg.paths.state_dir)?;
     ensure_private_dir(&cfg.paths.runtime_dir)?;
+    rotate_daemon_log(&cfg.paths)?;
     #[cfg(unix)]
     use std::os::unix::fs::OpenOptionsExt;
     let mut log_options = fs::OpenOptions::new();
@@ -609,6 +612,23 @@ async fn start_daemon(web_ui_port: Option<u16>) -> Result<()> {
         child.id(),
         cfg.paths.daemon_log().display()
     )
+}
+
+fn rotate_daemon_log(paths: &Paths) -> Result<()> {
+    let path = paths.daemon_log();
+    let Ok(metadata) = fs::metadata(&path) else {
+        return Ok(());
+    };
+    if metadata.len() < MAX_DAEMON_LOG_BYTES {
+        return Ok(());
+    }
+    let backup = path.with_extension("log.1");
+    if backup.exists() {
+        fs::remove_file(&backup)
+            .with_context(|| format!("remove old daemon log backup {}", backup.display()))?;
+    }
+    fs::rename(&path, &backup).with_context(|| format!("rotate daemon log {}", path.display()))?;
+    Ok(())
 }
 
 async fn request(req: Request) -> Result<()> {
@@ -731,5 +751,27 @@ mod tests {
         assert_eq!(parse_log_limit("10000").unwrap(), 10_000);
         assert!(parse_log_limit("0").is_err());
         assert!(parse_log_limit("10001").is_err());
+    }
+
+    #[test]
+    fn daemon_log_rotates_at_ten_mebibytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths {
+            config_dir: temp.path().join("config"),
+            state_dir: temp.path().join("state"),
+            runtime_dir: temp.path().join("run"),
+        };
+        fs::create_dir_all(&paths.state_dir).unwrap();
+        let log = paths.daemon_log();
+        let file = fs::File::create(&log).unwrap();
+        file.set_len(MAX_DAEMON_LOG_BYTES).unwrap();
+
+        rotate_daemon_log(&paths).unwrap();
+
+        assert!(!log.exists());
+        assert_eq!(
+            fs::metadata(log.with_extension("log.1")).unwrap().len(),
+            MAX_DAEMON_LOG_BYTES
+        );
     }
 }

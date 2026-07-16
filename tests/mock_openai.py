@@ -76,8 +76,37 @@ class Handler(BaseHTTPRequestHandler):
             time.sleep(10)
         if latest_user == "SIDE_DELAY" and not has_tool_result:
             time.sleep(10)
+        if latest_user.startswith("DEMO_") and not has_tool_result:
+            time.sleep(12)
 
-        if "MODEL_ECHO" in latest_user:
+        if latest_user.startswith("DEMO_AUTH") and not has_tool_result:
+            deltas = fragment_calls(
+                [
+                    function_call(
+                        0,
+                        "grep",
+                        {"pattern": "auth|token", "path": "src"},
+                    )
+                ]
+            )
+        elif latest_user.startswith("DEMO_AUTH"):
+            deltas = [{"content": "Authentication review complete; token handling is covered."}]
+        elif latest_user.startswith("DEMO_TEST") and not has_tool_result:
+            deltas = fragment_calls(
+                [
+                    function_call(
+                        0,
+                        "exec_command",
+                        {
+                            "command": "test -f src/lib.rs && printf 'test result: ok. 1 passed; 0 failed\\n'",
+                            "yield_time_ms": 250,
+                        },
+                    )
+                ]
+            )
+        elif latest_user.startswith("DEMO_TEST"):
+            deltas = [{"content": "Test suite passes; no regressions found."}]
+        elif "MODEL_ECHO" in latest_user:
             deltas = [{"content": model}]
         elif "NOTIFY_TOOL" in latest_user and not has_tool_result:
             deltas = fragment_calls(

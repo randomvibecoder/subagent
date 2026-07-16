@@ -152,6 +152,10 @@ runtime directories, starts a detached process, and waits up to five seconds for
 Unix socket. Output is one daemon object. Already running returns
 daemon_already_running.
 
+Before opening daemon.log for append, startup rotates it to daemon.log.1 when its size
+is at least 10 MiB, replacing the previous backup. Rotation occurs at startup rather
+than while the detached daemon is running.
+
 Running means the store opened, interrupted Agent reconciliation completed, pending
 message scheduling ran, and the socket accepts requests. It does not test API
 credentials or make a model request.
@@ -185,9 +189,10 @@ directory fails before IPC.
 
 Mode defaults readonly. Omitted wall time has no deadline. Name is required as
 specified above. Optional `--model` must be nonempty after trimming and overrides the
-daemon default for this Agent. max-agents zero is unlimited; otherwise spawn rejects at working capacity and
-does not create an Agent. Success saves metadata/context/Events, registers the worker,
-and returns one working Agent without waiting for a model call.
+daemon default for this Agent. max-agents defaults to 4; zero explicitly selects
+unlimited capacity. Otherwise spawn rejects at working capacity and does not create an
+Agent. Success saves metadata/context/Events, registers the worker, and returns one
+working Agent without waiting for a model call.
 
 The initial Event order is lifecycle spawned, system_message, user_message source
 spawn.
@@ -257,6 +262,9 @@ never changes workspace/Git files or escaped processes.
 Keys are base-url, model, max-agents, context-token-budget, and
 tool-output-preview-bytes. base-url/model must be nonempty. The two budgets must be
 positive. max-agents may be zero for unlimited.
+
+Compiled defaults are base-url https://api.openai.com/v1, model gpt-5.4-mini,
+max-agents 4, context-token-budget 64000, and tool-output-preview-bytes 16384.
 
 Precedence is compiled defaults, persisted TOML, then OPENAI_BASE_URL, OPENAI_MODEL,
 and SUBAGENT_MAX_AGENTS. list/get load the caller's current environment. set loads
@@ -418,8 +426,13 @@ text/event-stream, JSON messages/tools, tool_choice auto, and stream true.
 
 It accepts SSE data lines ending with [DONE] and also a non-streaming JSON response
 when content-type is not text/event-stream. Tool calls use Chat Completions function
-objects with string JSON arguments. It retries a failed completion up to five total
-attempts with exponential one, two, four, and eight-second delays.
+objects with string JSON arguments. A stream that produces no data for five minutes
+fails as a retryable api_error.
+
+Network failures, HTTP 429, HTTP 5xx, and stream I/O/idle failures retry up to five
+total attempts. Default delays are one, two, four, and eight seconds. A numeric or
+HTTP-date Retry-After overrides the delay and is clamped to 1 through 60 seconds.
+Authentication and other HTTP 4xx failures do not retry.
 
 Assistant content is accumulated from delta.content. Reasoning is accumulated from
 delta.reasoning or delta.reasoning_content. usage is retained as a provider-defined
@@ -571,6 +584,10 @@ temporarily contain up to 10,999 lines.
 One daemon is supported per user/runtime directory. IDs survive daemon restarts and
 binary replacement while state remains. The daemon is detached but not installed as a
 boot service and may be affected by host logout policy.
+
+daemon.log rotates at startup when it reaches 10 MiB, retaining daemon.log.1. Agent
+Events and complete terminal outputs have no automatic age or byte retention; delete
+obsolete Agents to reclaim their daemon-managed history and output files.
 
 Readonly removes structured write/edit/apply_patch definitions but does not constrain
 Bash, absolute paths, network, credentials, or other Agents. It is not a security

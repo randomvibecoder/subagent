@@ -62,5 +62,8 @@ assert.equal(
 assert.equal(ui.isNearBottom(1000, 780, 100, 120), true);
 assert.equal(ui.isNearBottom(1000, 700, 100, 120), false);
 assert.equal(ui.anchoredScrollTop(40, 1000, 1450), 490);
+assert.equal(ui.reconnectDelay(0), 1000);
+assert.equal(ui.reconnectDelay(2), 4000);
+assert.equal(ui.reconnectDelay(20), 5000);
 
 console.log("ui_core tests passed");

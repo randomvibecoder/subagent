@@ -20,7 +20,7 @@ impl Default for FileConfig {
         Self {
             base_url: DEFAULT_BASE_URL.into(),
             model: DEFAULT_MODEL.into(),
-            max_agents: 0,
+            max_agents: 4,
             context_token_budget: 64_000,
             tool_output_preview_bytes: 16 * 1024,
         }
@@ -254,6 +254,7 @@ mod tests {
     #[test]
     fn strict_config_rejects_empty_and_zero_values() {
         let mut config = FileConfig::default();
+        assert_eq!(config.max_agents, 4);
         assert!(config.set("base-url", "").is_err());
         assert!(config.set("model", " ").is_err());
         assert!(config.set("context-token-budget", "0").is_err());

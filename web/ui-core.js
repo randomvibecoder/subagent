@@ -273,6 +273,10 @@
     return oldTop + Math.max(0, newHeight - oldHeight);
   }
 
+  function reconnectDelay(attempt) {
+    return Math.min(5000, 1000 * Math.pow(2, Math.max(0, attempt || 0)));
+  }
+
   return {
     escapeHtml: escapeHtml,
     humanTime: humanTime,
@@ -286,5 +290,6 @@
     noticeText: noticeText,
     isNearBottom: isNearBottom,
     anchoredScrollTop: anchoredScrollTop,
+    reconnectDelay: reconnectDelay,
   };
 });

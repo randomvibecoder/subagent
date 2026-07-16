@@ -16,7 +16,7 @@ using an unfamiliar command, also read
 
 ## Install
 
-Linux x86-64 only. This always installs the latest release:
+Linux x86-64 only. This always installs the latest statically linked release:
 
 ~~~sh
 curl -fsSL https://raw.githubusercontent.com/randomvibecoder/subagent/main/install.sh | sh
@@ -338,7 +338,8 @@ subagent config set KEY VALUE
 
 Keys: base-url, model, max-agents, context-token-budget, and
 tool-output-preview-bytes. Base URL/model must be nonempty; context and preview budgets
-must be positive; max-agents 0 means unlimited. Restart the daemon after setting.
+must be positive. max-agents defaults to 4; set it to 0 only when unlimited
+concurrency is intentional. Restart the daemon after setting.
 
 Precedence is compiled defaults, persisted config, then environment overrides.
 List/get show effective values; set changes persisted values without copying overrides.
