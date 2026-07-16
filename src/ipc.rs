@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case")]
@@ -56,6 +56,15 @@ pub enum Request {
     Inbox {
         limit: usize,
         offset: usize,
+        minimum_priority: u8,
+        agent_id: Option<String>,
+        include_acknowledged: bool,
+    },
+    InboxAck {
+        identifier: String,
+    },
+    InboxFollow {
+        after_sequence: Option<u64>,
         minimum_priority: u8,
         agent_id: Option<String>,
     },
@@ -134,6 +143,8 @@ pub struct ListFilter {
     pub order: String,
     pub limit: usize,
     pub offset: usize,
+    #[serde(default)]
+    pub after_cursor: Option<String>,
     #[serde(default)]
     pub verbose: bool,
 }

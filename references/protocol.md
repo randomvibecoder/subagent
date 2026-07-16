@@ -1,4 +1,4 @@
-# Subagent Latest Protocol Reference
+# Subagent v0.1.5 Protocol Reference
 
 This file specifies the current binary. Backward compatibility is not promised. The
 release binary, SKILL.md, this reference, and cli.schema.json must change together.
@@ -37,9 +37,12 @@ including Ctrl+C, follows the invoking shell and operating system.
 Every Error contains type, code, message, details, and retryable. Details is always an
 object. Current semantic codes:
 
-- daemon_unavailable: no reachable socket; retryable true.
+- daemon_unavailable: no reachable socket and no conclusive lifecycle record.
+- daemon_stopped: the last daemon shut down cleanly.
+- daemon_crashed: a daemon recorded as starting/running disappeared; details include
+  its last PID, timestamps, daemon log path, and a bounded last-log-line summary.
 - daemon_already_running: start found a reachable daemon.
-- agent_not_found, event_not_found, message_not_found.
+- agent_not_found, event_not_found, message_not_found, notification_not_found.
 - invalid_argument, file_too_large.
 - capacity_exceeded: spawn rejected; retryable true.
 - conflict: current entity state forbids the command.
@@ -117,7 +120,7 @@ Agent timestamps:
 - spawned_at never changes.
 - last_message_at begins at spawned_at and changes when send is durably accepted.
 - last_message_sent_at has the same acceptance meaning; last_message_delivered_at
-  changes only when the worker consumes a Message.
+  is null at spawn and changes only when the worker consumes a durable Message.
 - updated_at changes for consumed user messages, reasoning/assistant/tool Events,
   deadline changes, and lifecycle/error Events. Queue acceptance alone does not change
   it.
@@ -145,6 +148,13 @@ Transitions:
 
 Resume increments run_number, sets run_started_at, and clears all terminal timestamps,
 deadline unless supplied by send, stop_reason, and last_error.
+
+Agent objects include the unique human-readable name. `request_started_at` and
+`provider_request_id` describe only an active provider request and are null in all
+other phases. `last_provider_request_id` retains the most recently observed provider
+ID. `last_progress_at` advances for provider output, model output, delivered input,
+new terminal output, and meaningful lifecycle/tool activity. An empty terminal poll
+does not advance it.
 
 A refusal or empty final model turn with no tool calls is finished. A nonzero shell
 exit is offered to the model and does not fail the Agent. Failure saves Agent status
@@ -180,17 +190,17 @@ surface.
 
 ### daemon status
 
-With a daemon, emits one daemon object. Without one, daemon_unavailable is a normal
-local Error; there is no stopped object. The object includes binary version and
+With a daemon, emits one daemon object. Without one, it returns a structured local
+daemon_stopped, daemon_crashed, or daemon_unavailable Error. Crashed diagnostics use
+the persisted daemon lifecycle record and never dump the full log. The object includes binary version and
 protocol_version. Except status and stop, a CLI first checks protocol compatibility
 and returns protocol_mismatch instead of sending a request to an older daemon.
 
 ### daemon stop
 
 Emits status stopping immediately. The daemon then stops active Agents, terminates
-their owned process groups, and removes socket/lock. Poll status until
-daemon_unavailable to observe completion; that code can also mean other connection
-failures.
+their owned process groups, records a clean shutdown, and removes socket/lock. Poll
+status until daemon_stopped to observe completion.
 
 ### agents spawn
 
@@ -220,20 +230,36 @@ stopped and failed Agents are excluded. Sort defaults spawned_at descending; val
 keys are spawned_at, updated_at, finished_at. ID is the deterministic secondary key.
 Null finished_at sorts first ascending and last descending.
 
-Default limit 100 and offset 0. Offset pagination is not snapshot-isolated and can
-skip/duplicate under concurrent updates. Output is one compact agent_list_item per
-line followed by list_summary. Compact items include type, id, ref, name, status, dir,
+Default limit 100 and offset 0. `--after-cursor` accepts the opaque `next_cursor` from
+a prior list_summary and conflicts with nonzero offset. The cursor binds the requested
+sort/order and continues after the last `(sort value, durable ID)` pair. It avoids
+offset shifts and duplicate ties, though records whose mutable sort key changes can
+still move between pages. Offset remains for compatibility. Output is one compact
+agent_list_item per line followed by list_summary; agent summaries include nullable
+next_cursor. Compact items include type, id, ref, name, status, dir,
 mode, model, spawned_at, last_message_at, updated_at, current_phase, last_event_at,
 run_number, and working_sides. `--verbose` emits full Agent telemetry plus
 working_sides and seconds_since_last_event.
 
 ### agents status
 
-Emits one full Agent or agent_not_found. Telemetry separates current_phase,
+Emits one full Agent, including name, or agent_not_found. Telemetry separates current_phase,
 phase_started_at, request_started_at, last_provider_activity_at, provider_request_id,
-retry_count, last_event_at, last_model_event_at, last_tool_event_at, and
-last_state_change_at. Phases are starting, processing_messages, requesting_model,
+last_provider_request_id, retry_count, last_event_at, last_model_event_at,
+last_tool_event_at, last_state_change_at, and last_progress_at. Phases are starting, processing_messages, requesting_model,
 retrying_model, executing_tool, waiting_terminal, finished, stopped, and failed.
+
+Active telemetry invariants:
+
+| Phase | request_started_at | provider_request_id |
+| --- | --- | --- |
+| requesting_model, retrying_model | non-null after request begins | nullable until provider supplies one |
+| every other phase | null | null |
+
+`phase_started_at` is the current phase entry time. `last_state_change_at` is the most
+recent lifecycle status transition. The `last_*` provider/model/tool/progress fields
+are historical and may remain populated in terminal states. Terminal phases always
+have no active request or deadline.
 
 ### agents wait
 
@@ -243,11 +269,11 @@ stops the Agent.
 
 ### agents rename
 
-Accepts AGENT_ID and NEW_NAME, applies the same validation/uniqueness rules as spawn,
+Accepts AGENT and NEW_NAME, applies the same validation/uniqueness rules as spawn,
 and is valid in every lifecycle state. It changes no Agent activity timestamp. Output:
 
 ~~~json
-{"type":"agent_renamed","id":"agt_...","name":"New name","renamed_at":"2026-07-10T12:00:00Z"}
+{"type":"agent_renamed","id":"agt_...","ref":"a_17","name":"New name","renamed_at":"2026-07-10T12:00:00Z"}
 ~~~
 
 ### agents send
@@ -269,7 +295,9 @@ Agent. It may shorten or extend the run.
 ### agents stop
 
 Requires working. Cancels pending Messages, signals the worker, terminates owned
-terminal process groups, marks stopped user_request, and emits the Agent. Process
+terminal process groups, waits for the worker cleanup boundary, marks stopped
+user_request, and emits the Agent. A successful response means the stopped run can no
+longer resume an in-flight tool task. Process
 termination sends TERM, waits about 500 ms, then sends KILL for each owned group.
 Escaped/daemonized descendants may survive.
 
@@ -305,20 +333,26 @@ Empty API key is rejected. Credentials are not validated until a model request.
 
 ### inbox
 
-`subagent inbox` reads the durable global notification journal. It emits compact
+`subagent inbox` reads unread records from the durable global notification journal. It emits compact
 Notification JSONL newest-first. Defaults are limit 20, offset zero, and minimum
 priority 2. Limit is 1 through 100. `--priority N` includes N and higher. `--agent`
-matches the main Agent ID and includes that Agent's Side notifications. Unknown Agent
-IDs match no records. Offset applies after priority and Agent filtering.
+accepts an Agent ref, durable ID, or exact name and includes that Agent's Side
+notifications. `--all` also includes acknowledged records. Offset applies after
+priority, acknowledgement, and Agent filtering.
 
-The visible journal is capped to the newest 10,000 global records. It has no follow,
-wait, read/unread, acknowledgement, or deletion command. Deleting an Agent or Side
-does not delete its existing Notifications.
+`subagent inbox ack <SEQUENCE|NOTIFICATION_ID>` advances one installation-local,
+durable acknowledgement watermark to that record; it never moves backward.
+`subagent inbox follow [--after SEQUENCE]` emits matching unread history oldest-first,
+then flushes new matching Notifications as JSONL until disconnected. Without after,
+follow begins after the acknowledgement watermark.
+
+The visible journal is capped to the newest 10,000 global records. Deleting an Agent
+or Side does not delete its existing Notifications.
 
 ## 5. Notifications
 
 ~~~json
-{"type":"notification","id":"ntf_...","sequence":42,"agent_id":"agt_...","agent_ref":"a_1","agent_name":"Website","side_id":null,"side_ref":null,"timestamp":"RFC3339","event_type":"milestone","priority":2,"status":"working","summary":"Homepage complete"}
+{"type":"notification","id":"ntf_...","sequence":42,"agent_id":"agt_...","agent_ref":"a_1","agent_name":"Website","side_id":null,"side_ref":null,"timestamp":"RFC3339","event_type":"milestone","priority":2,"status":"working","summary":"Homepage complete","acknowledged":false}
 ~~~
 
 IDs are ntf_ plus ULID and sequence is globally increasing; gaps are permitted after
@@ -404,14 +438,15 @@ match, and exits 0 after terminal status. Socket loss after output can terminate
 without a final stdout Error; clients must inspect process status/stderr. Ctrl+C uses
 normal signal behavior. Deleting while following causes stream termination.
 
-context emits context_meta then every raw stored model message. It does not expose
+context emits context_meta containing agent_id, agent_ref, agent_name, message_count,
+and compacted_at, then every raw stored model message. It does not expose
 internal delivery markers. Context can already be compacted: older tool payloads may
 be replaced by output references and older turns summarized/removed. Events are the
 lifetime journal. Context output can contain large strings and image data URLs.
 
 ## 8. Side runs
 
-`sides create AGENT_ID` copies the parent's current persisted model messages, drops an
+`sides create AGENT` copies the parent's current persisted model messages, drops an
 incomplete trailing tool turn, compacts to the daemon budget, adds the Side
 system/question messages, durably creates a working Side, and immediately emits:
 
@@ -427,7 +462,7 @@ nothing.
 Optional `--model` overrides the parent model for that Side only. Without it, the Side
 inherits the parent model. The selected value is stored in Side metadata.
 
-`sides list AGENT_ID` supports repeatable OR status filters plus limit/offset and emits
+`sides list AGENT` supports repeatable OR status filters plus limit/offset and emits
 newest-first side_list_item JSONL followed by list_summary. question_preview is the first 200 Unicode scalar
 values. `sides status SIDE_ID` emits complete Side metadata including full question,
 nullable answer, lifecycle timestamps, inherited_context_messages, tool_calls,
@@ -546,6 +581,9 @@ Completed:
 ~~~
 
 Running includes the same output/output_ref/truncated plus terminal_id and ok true.
+If Agent/Side stop cancels the session during the yield, it wakes immediately and
+returns ok false with status cancelled, terminal_id, nullable exit_code, and the same
+output fields. Cancellation never panics the daemon.
 
 ### Preview
 
@@ -609,8 +647,8 @@ Events append and flush each JSONL line. Per-owner sequence counters avoid resca
 complete Event files on append. Event/log queries scan incrementally and retain only
 their bounded result window in memory.
 
-The global notifications.jsonl journal and notification-sequence counter live in the
-state directory. Queries expose only the latest 10,000 global records. The physical
+The global notifications.jsonl journal, notification-sequence counter, and durable
+acknowledgement watermark live in the state directory. Queries expose only the latest 10,000 global records. The physical
 journal is compacted in 1,000-entry batches, retaining those latest 10,000, so it may
 temporarily contain up to 10,999 lines.
 
@@ -618,7 +656,8 @@ One daemon is supported per user/runtime directory. IDs survive daemon restarts 
 binary replacement while state remains. The daemon is detached but not installed as a
 boot service and may be affected by host logout policy.
 
-daemon.log rotates at startup when it reaches 10 MiB, retaining daemon.log.1. Agent
+daemon-state.json records starting, running, and cleanly stopped lifecycle state so
+an absent socket can distinguish a prior crash. daemon.log rotates at startup when it reaches 10 MiB, retaining daemon.log.1. Agent
 Events and complete terminal outputs have no automatic age or byte retention; delete
 obsolete Agents to reclaim their daemon-managed history and output files.
 

@@ -220,6 +220,21 @@ class Handler(BaseHTTPRequestHandler):
             )
         elif "TERMINAL_POLL" in user_text:
             deltas = [{"content": "terminal completed"}]
+        elif "STOP_DURING_TERMINAL" in user_text and not tool_results:
+            deltas = fragment_calls(
+                [
+                    function_call(
+                        0,
+                        "exec_command",
+                        {
+                            "command": "sleep 30",
+                            "yield_time_ms": 30000,
+                        },
+                    )
+                ]
+            )
+        elif "STOP_DURING_TERMINAL" in user_text:
+            deltas = [{"content": "terminal cancellation observed"}]
         elif "WRITE_EDIT_PATCH" in user_text and not has_tool_result:
             calls = [
                 function_call(0, "write", {"path": "generated.txt", "content": "alpha\n"}),

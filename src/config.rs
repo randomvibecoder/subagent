@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::BTreeMap, env, fs, path::PathBuf};
@@ -89,12 +90,63 @@ impl Paths {
     pub fn daemon_lock(&self) -> PathBuf {
         self.runtime_dir.join("subagent.lock")
     }
+    pub fn daemon_state(&self) -> PathBuf {
+        self.state_dir.join("daemon-state.json")
+    }
     pub fn agents_dir(&self) -> PathBuf {
         self.state_dir.join("agents")
     }
     pub fn sides_dir(&self) -> PathBuf {
         self.state_dir.join("sides")
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DaemonLifecycle {
+    pub status: String,
+    pub pid: u32,
+    pub started_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    pub version: String,
+}
+
+pub fn read_daemon_lifecycle(paths: &Paths) -> Result<Option<DaemonLifecycle>> {
+    let path = paths.daemon_state();
+    if !path.exists() {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::from_slice(&fs::read(path)?)?))
+}
+
+pub fn write_daemon_lifecycle(
+    paths: &Paths,
+    status: &str,
+    pid: u32,
+    started_at: DateTime<Utc>,
+) -> Result<()> {
+    ensure_private_dir(&paths.state_dir)?;
+    let state = DaemonLifecycle {
+        status: status.into(),
+        pid,
+        started_at,
+        updated_at: Utc::now(),
+        version: env!("CARGO_PKG_VERSION").into(),
+    };
+    let path = paths.daemon_state();
+    let temporary = path.with_extension("json.tmp");
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut options = fs::OpenOptions::new();
+    options.create(true).truncate(true).write(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    use std::io::Write;
+    let mut file = options.open(&temporary)?;
+    serde_json::to_writer(&mut file, &state)?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    fs::rename(temporary, path)?;
+    Ok(())
 }
 
 impl FileConfig {

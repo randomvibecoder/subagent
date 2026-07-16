@@ -1,6 +1,6 @@
 use crate::{
     agent::AgentManager,
-    config::{RuntimeConfig, ensure_private_dir},
+    config::{RuntimeConfig, ensure_private_dir, write_daemon_lifecycle},
     ipc::{PROTOCOL_VERSION, Request, coded_error, error_json_for},
     store::{AgentStatus, EventRecord, InboxFilter, Store, canonical_filter_dir},
 };
@@ -15,6 +15,13 @@ use tokio::{
 
 pub async fn serve(cfg: RuntimeConfig, web_ui_port: Option<u16>) -> Result<()> {
     ensure_private_dir(&cfg.paths.runtime_dir)?;
+    let daemon_started_at = chrono::Utc::now();
+    write_daemon_lifecycle(
+        &cfg.paths,
+        "starting",
+        std::process::id(),
+        daemon_started_at,
+    )?;
     let lock_path = cfg.paths.daemon_lock();
     let _lock = acquire_daemon_lock(&lock_path)?;
     let store = Store::new(&cfg.paths)?;
@@ -42,6 +49,7 @@ pub async fn serve(cfg: RuntimeConfig, web_ui_port: Option<u16>) -> Result<()> {
     let listener =
         UnixListener::bind(&socket).with_context(|| format!("bind {}", socket.display()))?;
     set_socket_permissions(&socket)?;
+    write_daemon_lifecycle(&cfg.paths, "running", std::process::id(), daemon_started_at)?;
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     if recovered > 0 || recovered_sides > 0 {
         eprintln!(
@@ -61,6 +69,7 @@ pub async fn serve(cfg: RuntimeConfig, web_ui_port: Option<u16>) -> Result<()> {
         }
     }
     manager.stop_all("daemon_shutdown").await;
+    write_daemon_lifecycle(&cfg.paths, "stopped", std::process::id(), daemon_started_at)?;
     let _ = std::fs::remove_file(socket);
     let _ = std::fs::remove_file(lock_path);
     Ok(())
@@ -113,6 +122,20 @@ async fn handle_connection(
             )
             .await?
         }
+        Ok(Output::NotificationFollow {
+            after_sequence,
+            minimum_priority,
+            agent_id,
+        }) => {
+            follow_notifications(
+                &mut write_half,
+                &store,
+                after_sequence,
+                minimum_priority,
+                agent_id.as_deref(),
+            )
+            .await?
+        }
         Err(e) => write_json_line(&mut write_half, &error_json_for(&e, "internal_error")).await?,
     }
     Ok(())
@@ -126,6 +149,11 @@ enum Output {
         after: Option<String>,
         limit: usize,
         side: bool,
+    },
+    NotificationFollow {
+        after_sequence: u64,
+        minimum_priority: u8,
+        agent_id: Option<String>,
     },
 }
 
@@ -185,6 +213,16 @@ async fn dispatch(
             if filter.order.is_empty() {
                 filter.order = "desc".into()
             }
+            if filter.after_cursor.is_some() && filter.offset != 0 {
+                return Err(coded_error(
+                    "invalid_argument",
+                    "after_cursor and offset cannot be used together",
+                    json!({"fields":["after_cursor","offset"]}),
+                    false,
+                ));
+            }
+            let requested_limit = filter.limit;
+            filter.limit = filter.limit.saturating_add(1);
             if let Some(dir) = filter.dir.take() {
                 filter.dir = Some(canonical_filter_dir(&dir)?);
             }
@@ -197,7 +235,21 @@ async fn dispatch(
                     .map(serde_json::to_value)
                     .collect::<Result<Vec<_>, _>>()?
             };
-            values.push(json!({"type":"list_summary","resource":"agents","count":values.len()}));
+            let has_more = values.len() > requested_limit;
+            values.truncate(requested_limit);
+            let next_cursor = if has_more {
+                values
+                    .last()
+                    .and_then(|value| value.get("id"))
+                    .and_then(Value::as_str)
+                    .map(|id| {
+                        store.list_cursor(&store.load_metadata(id)?, &filter.sort, &filter.order)
+                    })
+                    .transpose()?
+            } else {
+                None
+            };
+            values.push(json!({"type":"list_summary","resource":"agents","count":values.len(),"next_cursor":next_cursor}));
             values
         }
         Request::AgentStatus { id } => vec![agent_value(store.load_metadata(&id)?)?],
@@ -238,7 +290,7 @@ async fn dispatch(
                 .map(serde_json::to_value)
                 .collect::<Result<_, _>>()?
         }
-        Request::AgentContext { id } => context_lines(&id, store.load_context(&id)?)?,
+        Request::AgentContext { id } => context_lines(store, &id, store.load_context(&id)?)?,
         Request::AgentSend {
             id,
             message,
@@ -255,6 +307,7 @@ async fn dispatch(
             offset,
             minimum_priority,
             agent_id,
+            include_acknowledged,
         } => {
             if !(1..=100).contains(&limit) || !(1..=5).contains(&minimum_priority) {
                 return Err(coded_error(
@@ -270,10 +323,34 @@ async fn dispatch(
                     offset,
                     minimum_priority,
                     agent_id,
+                    include_acknowledged,
                 })?
                 .into_iter()
                 .map(serde_json::to_value)
                 .collect::<Result<_, _>>()?
+        }
+        Request::InboxAck { identifier } => {
+            vec![store.acknowledge_notifications(&identifier)?]
+        }
+        Request::InboxFollow {
+            after_sequence,
+            minimum_priority,
+            agent_id,
+        } => {
+            if !(1..=5).contains(&minimum_priority) {
+                return Err(coded_error(
+                    "invalid_argument",
+                    "inbox priority must be 1..=5",
+                    json!({"priority":minimum_priority}),
+                    false,
+                ));
+            }
+            return Ok(Output::NotificationFollow {
+                after_sequence: after_sequence
+                    .unwrap_or(store.notification_acknowledged_through()?),
+                minimum_priority,
+                agent_id,
+            });
         }
         Request::SideList {
             agent_id,
@@ -515,9 +592,20 @@ fn resolve_local_references(req: Request, store: &Store) -> Result<Request> {
             offset,
             minimum_priority,
             agent_id,
+            include_acknowledged,
         } => Request::Inbox {
             limit,
             offset,
+            minimum_priority,
+            agent_id: agent_id.map(|id| store.resolve_agent_id(&id)).transpose()?,
+            include_acknowledged,
+        },
+        Request::InboxFollow {
+            after_sequence,
+            minimum_priority,
+            agent_id,
+        } => Request::InboxFollow {
+            after_sequence,
             minimum_priority,
             agent_id: agent_id.map(|id| store.resolve_agent_id(&id)).transpose()?,
         },
@@ -549,9 +637,7 @@ async fn wait_for_agent(
 }
 
 fn agent_value(meta: crate::store::AgentMetadata) -> Result<Value> {
-    let mut value = serde_json::to_value(meta)?;
-    value.as_object_mut().unwrap().remove("name");
-    Ok(value)
+    Ok(serde_json::to_value(meta)?)
 }
 
 fn query_logs(
@@ -580,10 +666,17 @@ fn query_logs(
         })
 }
 
-fn context_lines(id: &str, context: crate::store::ContextSnapshot) -> Result<Vec<Value>> {
+fn context_lines(
+    store: &Store,
+    id: &str,
+    context: crate::store::ContextSnapshot,
+) -> Result<Vec<Value>> {
+    let agent = store.load_metadata(id)?;
     let mut out = vec![json!({
         "type":"context_meta",
         "agent_id":id,
+        "agent_ref":agent.local_ref,
+        "agent_name":agent.name,
         "message_count":context.messages.len(),
         "compacted_at":context.compacted_at,
     })];
@@ -626,6 +719,22 @@ async fn follow_logs<W: tokio::io::AsyncWrite + Unpin>(
         if status != AgentStatus::Working {
             return Ok(());
         }
+    }
+}
+
+async fn follow_notifications<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    store: &Store,
+    mut after_sequence: u64,
+    minimum_priority: u8,
+    agent_id: Option<&str>,
+) -> Result<()> {
+    loop {
+        for notification in store.notifications_after(after_sequence, minimum_priority, agent_id)? {
+            after_sequence = after_sequence.max(notification.sequence);
+            write_json_line(writer, &serde_json::to_value(notification)?).await?;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     }
 }
 

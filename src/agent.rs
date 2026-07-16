@@ -34,12 +34,14 @@ struct AgentControl {
     stop: watch::Sender<bool>,
     deadline: Arc<Mutex<Option<chrono::DateTime<Utc>>>>,
     terminals: TerminalManager,
+    completed: watch::Receiver<bool>,
 }
 
 #[derive(Clone)]
 struct SideControl {
     stop: watch::Sender<bool>,
     terminals: TerminalManager,
+    completed: watch::Receiver<bool>,
 }
 
 impl AgentManager {
@@ -69,23 +71,9 @@ impl AgentManager {
             .collect::<Vec<_>>();
         for id in agent_ids {
             let meta = self.store.load_metadata(&id)?;
-            let mut candidates = vec![
-                meta.activity.last_provider_activity_at,
-                meta.activity.last_model_event_at,
-                meta.activity.last_tool_event_at,
-                meta.last_message_delivered_at,
-                meta.activity.request_started_at,
-            ];
-            if !matches!(
-                meta.activity.current_phase,
-                crate::store::AgentPhase::RequestingModel | crate::store::AgentPhase::RetryingModel
-            ) {
-                candidates.push(meta.activity.phase_started_at);
-            }
-            let baseline = candidates
-                .into_iter()
-                .flatten()
-                .max()
+            let baseline = meta
+                .activity
+                .last_progress_at
                 .unwrap_or(meta.run_started_at);
             self.maybe_publish_stall(
                 &id,
@@ -106,22 +94,9 @@ impl AgentManager {
             .collect::<Vec<_>>();
         for id in side_ids {
             let meta = self.store.load_side_metadata(&id)?;
-            let mut candidates = vec![
-                meta.activity.last_provider_activity_at,
-                meta.activity.last_model_event_at,
-                meta.activity.last_tool_event_at,
-                meta.activity.request_started_at,
-            ];
-            if !matches!(
-                meta.activity.current_phase,
-                crate::store::AgentPhase::RequestingModel | crate::store::AgentPhase::RetryingModel
-            ) {
-                candidates.push(meta.activity.phase_started_at);
-            }
-            let baseline = candidates
-                .into_iter()
-                .flatten()
-                .max()
+            let baseline = meta
+                .activity
+                .last_progress_at
                 .unwrap_or(meta.run_started_at);
             self.maybe_publish_stall(
                 &id,
@@ -225,7 +200,7 @@ impl AgentManager {
             spawned_at: now,
             last_message_at: now,
             last_message_sent_at: Some(now),
-            last_message_delivered_at: Some(now),
+            last_message_delivered_at: None,
             run_started_at: now,
             updated_at: now,
             finished_at: None,
@@ -309,6 +284,8 @@ impl AgentManager {
         meta.activity.current_phase = crate::store::AgentPhase::ProcessingMessages;
         meta.activity.phase_started_at = Some(now);
         meta.activity.last_state_change_at = Some(now);
+        meta.activity.last_progress_at = Some(now);
+        clear_active_request(&mut meta.activity);
         self.store.save_metadata(&meta)?;
         self.store.append_event(
             id,
@@ -449,6 +426,7 @@ impl AgentManager {
     fn start_worker(&self, meta: AgentMetadata, context: ContextSnapshot) -> Result<()> {
         let (message_tx, message_rx) = mpsc::unbounded_channel();
         let (stop_tx, stop_rx) = watch::channel(false);
+        let (completed_tx, completed_rx) = watch::channel(false);
         let terminals = TerminalManager::default();
         let deadline = Arc::new(Mutex::new(meta.deadline_at));
         self.active.lock().unwrap().insert(
@@ -459,6 +437,7 @@ impl AgentManager {
                 stop: stop_tx,
                 deadline: deadline.clone(),
                 terminals: terminals.clone(),
+                completed: completed_rx,
             },
         );
         let manager = self.clone();
@@ -490,6 +469,7 @@ impl AgentManager {
             if let Err(e) = outcome {
                 let _ = mark_failed(&manager.store, &id, format!("{e:#}"));
             }
+            completed_tx.send(true).ok();
             let _ = manager.schedule_pending();
         });
         Ok(())
@@ -517,6 +497,17 @@ impl AgentManager {
             control
         };
         control.terminals.terminate_all().await;
+        let mut completed = control.completed.clone();
+        if !*completed.borrow() {
+            completed.changed().await.map_err(|_| {
+                coded_error(
+                    "internal_error",
+                    "agent worker ended without completing stop cleanup",
+                    json!({"agent_id":id}),
+                    true,
+                )
+            })?;
+        }
         mark_stopped(&self.store, id, reason)?;
         self.store.load_metadata(id)
     }
@@ -639,11 +630,13 @@ impl AgentManager {
         )?;
         let terminals = TerminalManager::default();
         let (stop_tx, stop_rx) = watch::channel(false);
+        let (completed_tx, completed_rx) = watch::channel(false);
         self.active_sides.lock().unwrap().insert(
             side_id.clone(),
             SideControl {
                 stop: stop_tx,
                 terminals: terminals.clone(),
+                completed: completed_rx,
             },
         );
         let manager = self.clone();
@@ -664,6 +657,7 @@ impl AgentManager {
                 let _ = mark_side_failed(&manager.store, &run_id, format!("{error:#}"));
             }
             manager.active_sides.lock().unwrap().remove(&run_id);
+            completed_tx.send(true).ok();
         });
         Ok(
             json!({"type":"side_created","id":side_id,"ref":side_ref,"agent_id":id,"agent_ref":agent_ref,"status":"working","created_at":now}),
@@ -707,6 +701,17 @@ impl AgentManager {
             })?;
         control.stop.send(true).ok();
         control.terminals.terminate_all().await;
+        let mut completed = control.completed.clone();
+        if !*completed.borrow() {
+            completed.changed().await.map_err(|_| {
+                coded_error(
+                    "internal_error",
+                    "Side worker ended without completing stop cleanup",
+                    json!({"side_id":id}),
+                    true,
+                )
+            })?;
+        }
         mark_side_stopped(&self.store, id, reason)?;
         self.store.load_side_metadata(id)
     }
@@ -829,6 +834,7 @@ async fn run_side(
             side.activity.current_phase = crate::store::AgentPhase::Finished;
             side.activity.phase_started_at = Some(now);
             side.activity.last_state_change_at = Some(now);
+            clear_active_request(&mut side.activity);
             store.save_side_metadata(&side)?;
             store.append_side_event(&side.id, "lifecycle", json!({"status":"finished"}))?;
             store.append_notification(
@@ -855,7 +861,16 @@ async fn run_side(
             side.tool_calls += 1;
             store.save_side_metadata(&side)?;
             store.append_side_event(&side.id, "tool_call", json!({"tool_call_id":call.id,"name":call.function.name,"arguments":call.function.arguments}))?;
-            let result = runtime.execute(&call).await;
+            let result = tokio::select! {
+                result = runtime.execute(&call) => result,
+                changed = stop.changed() => {
+                    if changed.is_ok() && *stop.borrow() {
+                        runtime.terminals.terminate_all().await;
+                        return Ok(());
+                    }
+                    runtime.execute(&call).await
+                }
+            };
             store.append_side_event(
                 &side.id,
                 "tool_result",
@@ -1002,7 +1017,16 @@ async fn run_worker(
             };
             set_agent_phase(&store, &meta.id, phase)?;
             store.append_event(&meta.id,"tool_call",json!({"tool_call_id":call.id,"name":call.function.name,"arguments":call.function.arguments}))?;
-            let result = runtime.execute(&call).await;
+            let result = tokio::select! {
+                result = runtime.execute(&call) => result,
+                changed = stop_rx.changed() => {
+                    if changed.is_ok() && *stop_rx.borrow() {
+                        terminals.terminate_all().await;
+                        return Ok(());
+                    }
+                    runtime.execute(&call).await
+                }
+            };
             let content = serde_json::to_string(&result.content)?;
             store.append_event(
                 &meta.id,
@@ -1059,6 +1083,8 @@ fn set_agent_phase(store: &Store, id: &str, phase: crate::store::AgentPhase) -> 
     store.update_agent_activity(id, |activity| {
         activity.current_phase = phase;
         activity.phase_started_at = Some(now);
+        activity.request_started_at = None;
+        activity.provider_request_id = None;
     })?;
     Ok(())
 }
@@ -1068,6 +1094,8 @@ fn set_side_phase(store: &Store, id: &str, phase: crate::store::AgentPhase) -> R
     store.update_side_activity(id, |activity| {
         activity.current_phase = phase;
         activity.phase_started_at = Some(now);
+        activity.request_started_at = None;
+        activity.provider_request_id = None;
     })?;
     Ok(())
 }
@@ -1105,6 +1133,9 @@ fn complete_agent_model_request(store: &Store, id: &str) -> Result<()> {
         activity.phase_started_at = Some(now);
         activity.last_model_event_at = Some(now);
         activity.last_provider_activity_at = Some(now);
+        activity.last_provider_request_id = activity.provider_request_id.take();
+        activity.request_started_at = None;
+        activity.last_progress_at = Some(now);
     })?;
     Ok(())
 }
@@ -1116,6 +1147,9 @@ fn complete_side_model_request(store: &Store, id: &str) -> Result<()> {
         activity.phase_started_at = Some(now);
         activity.last_model_event_at = Some(now);
         activity.last_provider_activity_at = Some(now);
+        activity.last_provider_request_id = activity.provider_request_id.take();
+        activity.request_started_at = None;
+        activity.last_progress_at = Some(now);
     })?;
     Ok(())
 }
@@ -1159,21 +1193,28 @@ fn record_model_progress(
         ModelProgress::AttemptStarted { retry_count } => {
             activity.current_phase = crate::store::AgentPhase::RequestingModel;
             activity.phase_started_at = Some(now);
+            activity.request_started_at = Some(now);
+            activity.provider_request_id = None;
             activity.retry_count = *retry_count;
+            activity.last_progress_at = Some(now);
         }
         ModelProgress::ResponseStarted {
             provider_request_id,
         } => {
             activity.provider_request_id = provider_request_id.clone();
+            activity.last_provider_request_id = provider_request_id.clone();
             activity.last_provider_activity_at = Some(now);
+            activity.last_progress_at = Some(now);
         }
         ModelProgress::ProviderActivity => {
             activity.last_provider_activity_at = Some(now);
+            activity.last_progress_at = Some(now);
         }
         ModelProgress::RetryScheduled { retry_count } => {
             activity.current_phase = crate::store::AgentPhase::RetryingModel;
             activity.phase_started_at = Some(now);
             activity.retry_count = *retry_count;
+            activity.last_progress_at = Some(now);
         }
     };
     if side {
@@ -1346,6 +1387,7 @@ fn mark_finished(store: &Store, id: &str, final_message: &str) -> Result<()> {
     m.activity.current_phase = crate::store::AgentPhase::Finished;
     m.activity.phase_started_at = Some(now);
     m.activity.last_state_change_at = Some(now);
+    clear_active_request(&mut m.activity);
     store.save_metadata(&m)?;
     store.append_event(id, "lifecycle", json!({"status":"finished"}))?;
     store.append_notification(
@@ -1372,6 +1414,7 @@ fn mark_stopped(store: &Store, id: &str, reason: &str) -> Result<()> {
     m.activity.current_phase = crate::store::AgentPhase::Stopped;
     m.activity.phase_started_at = Some(now);
     m.activity.last_state_change_at = Some(now);
+    clear_active_request(&mut m.activity);
     store.save_metadata(&m)?;
     store.append_event(id, "lifecycle", json!({"status":"stopped","reason":reason}))?;
     store.append_notification(
@@ -1397,6 +1440,7 @@ fn mark_failed(store: &Store, id: &str, error: String) -> Result<()> {
     m.activity.current_phase = crate::store::AgentPhase::Failed;
     m.activity.phase_started_at = Some(now);
     m.activity.last_state_change_at = Some(now);
+    clear_active_request(&mut m.activity);
     store.save_metadata(&m)?;
     store.append_event(id, "error", json!({"status":"failed","error":error}))?;
     store.append_notification(id, "failed", 4, AgentStatus::Failed, &error)?;
@@ -1417,6 +1461,7 @@ fn mark_side_stopped(store: &Store, id: &str, reason: &str) -> Result<()> {
     meta.activity.current_phase = crate::store::AgentPhase::Stopped;
     meta.activity.phase_started_at = Some(now);
     meta.activity.last_state_change_at = Some(now);
+    clear_active_request(&mut meta.activity);
     store.save_side_metadata(&meta)?;
     store.append_side_event(id, "lifecycle", json!({"status":"stopped","reason":reason}))?;
     store.append_notification(
@@ -1443,10 +1488,19 @@ fn mark_side_failed(store: &Store, id: &str, error: String) -> Result<()> {
     meta.activity.current_phase = crate::store::AgentPhase::Failed;
     meta.activity.phase_started_at = Some(now);
     meta.activity.last_state_change_at = Some(now);
+    clear_active_request(&mut meta.activity);
     store.save_side_metadata(&meta)?;
     store.append_side_event(id, "error", json!({"status":"failed","error":error}))?;
     store.append_notification(id, "failed", 4, AgentStatus::Failed, &error)?;
     Ok(())
+}
+
+fn clear_active_request(activity: &mut crate::store::ActivityTelemetry) {
+    if activity.last_provider_request_id.is_none() {
+        activity.last_provider_request_id = activity.provider_request_id.clone();
+    }
+    activity.request_started_at = None;
+    activity.provider_request_id = None;
 }
 
 fn normalize_model(value: &str) -> Result<String> {

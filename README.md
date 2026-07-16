@@ -105,7 +105,7 @@ may work concurrently by default; configure another limit with `max-agents` or
 | `agents time\|stop\|delete ID` | Manage lifecycle and cleanup |
 | `sides create\|list\|status\|logs\|stop\|delete` | Run saved one-shot Side questions |
 | `messages list\|status\|cancel` | Inspect durable queued messages |
-| `inbox` | Read newest-first high-signal notifications |
+| `inbox`, `inbox ack`, `inbox follow` | Read, acknowledge, or stream high-signal notifications |
 | `config list\|get\|set` | Manage non-secret configuration |
 
 Run any command with `--help` for exact flags. [`SKILL.md`](SKILL.md) is the compact
@@ -133,6 +133,10 @@ also receive `write`, exact `edit`, and OpenAI-style `apply_patch` tools.
 `agents logs` intentionally omits tool payloads by default. `agents context` is a raw
 debugging escape hatch; redirect it to a file or filter it narrowly rather than
 printing an entire model context into another agent's conversation.
+
+Agent lists retain offset compatibility and also emit an opaque `next_cursor` for
+safer keyset pagination. Inbox records are unread by default; acknowledgement uses a
+durable installation-local watermark, and follow streams JSONL without polling.
 
 ## Optional Web UI
 
@@ -162,7 +166,9 @@ Environment variables override persisted configuration:
 Persist non-secret settings with `subagent config set`. Restart the daemon after a
 configuration or environment change.
 
-State follows XDG directories, normally under `~/.local/state/subagent`. The daemon
+State follows XDG directories, normally under `~/.local/state/subagent`. Persisted
+daemon lifecycle state lets `daemon status` distinguish a clean stop from an
+unexpected crash and points callers to the bounded diagnostic/log location. The daemon
 log rotates at 10 MiB with one backup. Agent histories and complete command outputs
 remain until their owning agent is deleted, so long-lived installations should clean
 up obsolete agents.

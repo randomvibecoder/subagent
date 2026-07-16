@@ -137,6 +137,7 @@
       }),
       agent = values.get("agent");
     if (agent) params.set("agent", agent);
+    if (values.get("all")) params.set("all", "true");
     try {
       var notifications = await lines("/api/inbox?" + params.toString());
       $("#inbox").innerHTML = notifications.length
@@ -187,6 +188,11 @@
       UI.escapeHtml(notification.event_type) +
       "</div>" +
       body +
+      (notification.acknowledged
+        ? '<span class="meta">Acknowledged</span>'
+        : '<button class="ack-notification text-button" type="button" data-notification="' +
+          UI.escapeHtml(notification.id) +
+          '">Acknowledge through here</button>') +
       "</article>"
     );
   }
@@ -1000,6 +1006,16 @@
     loadInbox();
   };
   $("#inbox").onclick = function (event) {
+    var acknowledge = event.target.closest(".ack-notification");
+    if (acknowledge) {
+      api("/api/inbox/ack/" + encodeURIComponent(acknowledge.dataset.notification), {
+        method: "POST",
+      }).then(function () {
+        inboxOffset = 0;
+        loadInbox();
+      }).catch(function (error) { notice(error.message); });
+      return;
+    }
     var button = event.target.closest(".notification-agent");
     if (button) route(["agents", encodeURIComponent(button.dataset.agent), "main"]);
   };

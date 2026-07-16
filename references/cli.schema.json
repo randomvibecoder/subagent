@@ -2,241 +2,915 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Subagent latest JSONL line",
   "oneOf": [
-    {"$ref": "#/$defs/Agent"},
-    {"$ref": "#/$defs/AgentListItem"},
-    {"$ref": "#/$defs/AgentListItemVerbose"},
-    {"$ref": "#/$defs/ListSummary"},
-    {"$ref": "#/$defs/AgentRenamed"},
-    {"$ref": "#/$defs/Message"},
-    {"$ref": "#/$defs/MessageSent"},
-    {"$ref": "#/$defs/Notification"},
-    {"$ref": "#/$defs/Event"},
-    {"$ref": "#/$defs/Error"},
-    {"$ref": "#/$defs/DaemonRunning"},
-    {"$ref": "#/$defs/DaemonStopping"},
-    {"$ref": "#/$defs/SideCreated"},
-    {"$ref": "#/$defs/Side"},
-    {"$ref": "#/$defs/SideListItem"},
-    {"$ref": "#/$defs/SideDeleted"},
-    {"$ref": "#/$defs/ContextMeta"},
-    {"$ref": "#/$defs/ModelMessage"},
-    {"$ref": "#/$defs/AgentDeleted"},
-    {"$ref": "#/$defs/ConfigValue"}
+    {
+      "$ref": "#/$defs/Agent"
+    },
+    {
+      "$ref": "#/$defs/AgentListItem"
+    },
+    {
+      "$ref": "#/$defs/AgentListItemVerbose"
+    },
+    {
+      "$ref": "#/$defs/ListSummary"
+    },
+    {
+      "$ref": "#/$defs/AgentRenamed"
+    },
+    {
+      "$ref": "#/$defs/Message"
+    },
+    {
+      "$ref": "#/$defs/MessageSent"
+    },
+    {
+      "$ref": "#/$defs/Notification"
+    },
+    {
+      "$ref": "#/$defs/Event"
+    },
+    {
+      "$ref": "#/$defs/Error"
+    },
+    {
+      "$ref": "#/$defs/DaemonRunning"
+    },
+    {
+      "$ref": "#/$defs/DaemonStopping"
+    },
+    {
+      "$ref": "#/$defs/SideCreated"
+    },
+    {
+      "$ref": "#/$defs/Side"
+    },
+    {
+      "$ref": "#/$defs/SideListItem"
+    },
+    {
+      "$ref": "#/$defs/SideDeleted"
+    },
+    {
+      "$ref": "#/$defs/ContextMeta"
+    },
+    {
+      "$ref": "#/$defs/ModelMessage"
+    },
+    {
+      "$ref": "#/$defs/AgentDeleted"
+    },
+    {
+      "$ref": "#/$defs/ConfigValue"
+    },
+    {
+      "$ref": "#/$defs/InboxAcknowledged"
+    }
   ],
   "$defs": {
-    "Timestamp": {"type": "string", "format": "date-time"},
+    "Timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
     "NullableTimestamp": {
-      "oneOf": [{"$ref": "#/$defs/Timestamp"}, {"type": "null"}]
+      "oneOf": [
+        {
+          "$ref": "#/$defs/Timestamp"
+        },
+        {
+          "type": "null"
+        }
+      ]
     },
     "AgentPhase": {
-      "enum": ["starting", "processing_messages", "requesting_model", "retrying_model", "executing_tool", "waiting_terminal", "finished", "stopped", "failed"]
+      "enum": [
+        "starting",
+        "processing_messages",
+        "requesting_model",
+        "retrying_model",
+        "executing_tool",
+        "waiting_terminal",
+        "finished",
+        "stopped",
+        "failed"
+      ]
     },
     "Notification": {
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "type", "id", "sequence", "agent_id", "agent_ref", "agent_name", "side_id", "side_ref",
-        "timestamp", "event_type", "priority", "status", "summary"
+        "type",
+        "id",
+        "sequence",
+        "agent_id",
+        "agent_ref",
+        "agent_name",
+        "side_id",
+        "side_ref",
+        "timestamp",
+        "event_type",
+        "priority",
+        "status",
+        "summary",
+        "acknowledged"
       ],
       "properties": {
-        "type": {"const": "notification"},
-        "id": {"type": "string", "pattern": "^ntf_[0-9A-HJKMNP-TV-Z]{26}$"},
-        "sequence": {"type": "integer", "minimum": 1},
-        "agent_id": {"type": "string", "pattern": "^agt_[0-9A-HJKMNP-TV-Z]{26}$"},
-        "agent_ref": {"type": "string", "pattern": "^a_[1-9][0-9]*$"},
-        "agent_name": {"type": "string", "minLength": 4, "maxLength": 40},
-        "side_id": {"type": ["string", "null"], "pattern": "^side_"},
-        "side_ref": {"type": ["string", "null"], "pattern": "^s_[1-9][0-9]*$"},
-        "timestamp": {"$ref": "#/$defs/Timestamp"},
-        "event_type": {"enum": ["spawned", "resumed", "progress", "milestone", "input_required", "blocked", "possible_stall", "finished", "stopped", "failed"]},
-        "priority": {"type": "integer", "minimum": 1, "maximum": 5},
-        "status": {"enum": ["working", "finished", "stopped", "failed"]},
-        "summary": {"type": "string", "maxLength": 5000}
+        "type": {
+          "const": "notification"
+        },
+        "id": {
+          "type": "string",
+          "pattern": "^ntf_[0-9A-HJKMNP-TV-Z]{26}$"
+        },
+        "sequence": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "agent_id": {
+          "type": "string",
+          "pattern": "^agt_[0-9A-HJKMNP-TV-Z]{26}$"
+        },
+        "agent_ref": {
+          "type": "string",
+          "pattern": "^a_[1-9][0-9]*$"
+        },
+        "agent_name": {
+          "type": "string",
+          "minLength": 4,
+          "maxLength": 40
+        },
+        "side_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^side_[0-9A-HJKMNP-TV-Z]{26}$"
+        },
+        "side_ref": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^s_[1-9][0-9]*$"
+        },
+        "timestamp": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "event_type": {
+          "enum": [
+            "spawned",
+            "resumed",
+            "progress",
+            "milestone",
+            "input_required",
+            "blocked",
+            "possible_stall",
+            "finished",
+            "stopped",
+            "failed"
+          ]
+        },
+        "priority": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 5
+        },
+        "status": {
+          "enum": [
+            "working",
+            "finished",
+            "stopped",
+            "failed"
+          ]
+        },
+        "summary": {
+          "type": "string",
+          "maxLength": 5000
+        },
+        "acknowledged": {
+          "type": "boolean"
+        }
       }
     },
     "Agent": {
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "type", "id", "ref", "dir", "mode", "advisory_readonly", "model",
-        "status", "spawned_at", "last_message_at", "last_message_sent_at",
-        "last_message_delivered_at", "run_started_at", "updated_at",
-        "finished_at", "stopped_at", "failed_at", "deadline_at", "run_number",
-        "stop_reason", "last_error", "current_phase", "phase_started_at",
-        "request_started_at", "last_provider_activity_at", "provider_request_id",
-        "retry_count", "last_event_at", "last_model_event_at", "last_tool_event_at",
-        "last_state_change_at"
+        "type",
+        "id",
+        "ref",
+        "dir",
+        "mode",
+        "advisory_readonly",
+        "model",
+        "status",
+        "spawned_at",
+        "last_message_at",
+        "last_message_sent_at",
+        "last_message_delivered_at",
+        "run_started_at",
+        "updated_at",
+        "finished_at",
+        "stopped_at",
+        "failed_at",
+        "deadline_at",
+        "run_number",
+        "stop_reason",
+        "last_error",
+        "current_phase",
+        "phase_started_at",
+        "request_started_at",
+        "last_provider_activity_at",
+        "provider_request_id",
+        "retry_count",
+        "last_event_at",
+        "last_model_event_at",
+        "last_tool_event_at",
+        "last_state_change_at",
+        "name",
+        "last_provider_request_id",
+        "last_progress_at"
       ],
       "properties": {
-        "type": {"const": "agent"},
-        "id": {"type": "string", "pattern": "^agt_[0-9A-HJKMNP-TV-Z]{26}$"},
-        "ref": {"type": "string", "pattern": "^a_[1-9][0-9]*$"},
-        "dir": {"type": "string"},
-        "mode": {"enum": ["readonly", "write"]},
-        "advisory_readonly": {"type": "boolean"},
-        "model": {"type": "string", "minLength": 1},
-        "status": {"enum": ["working", "finished", "stopped", "failed"]},
-        "spawned_at": {"$ref": "#/$defs/Timestamp"},
-        "last_message_at": {"$ref": "#/$defs/Timestamp"},
-        "last_message_sent_at": {"$ref": "#/$defs/NullableTimestamp"},
-        "last_message_delivered_at": {"$ref": "#/$defs/NullableTimestamp"},
-        "run_started_at": {"$ref": "#/$defs/Timestamp"},
-        "updated_at": {"$ref": "#/$defs/Timestamp"},
-        "finished_at": {"$ref": "#/$defs/NullableTimestamp"},
-        "stopped_at": {"$ref": "#/$defs/NullableTimestamp"},
-        "failed_at": {"$ref": "#/$defs/NullableTimestamp"},
-        "deadline_at": {"$ref": "#/$defs/NullableTimestamp"},
-        "run_number": {"type": "integer", "minimum": 1},
-        "stop_reason": {
-          "oneOf": [
-            {"enum": ["user_request", "wall_time", "daemon_shutdown", "daemon_interrupted"]},
-            {"type": "null"}
+        "type": {
+          "const": "agent"
+        },
+        "id": {
+          "type": "string",
+          "pattern": "^agt_[0-9A-HJKMNP-TV-Z]{26}$"
+        },
+        "ref": {
+          "type": "string",
+          "pattern": "^a_[1-9][0-9]*$"
+        },
+        "dir": {
+          "type": "string"
+        },
+        "mode": {
+          "enum": [
+            "readonly",
+            "write"
           ]
         },
-        "last_error": {"type": ["string", "null"]},
-        "current_phase": {"$ref": "#/$defs/AgentPhase"},
-        "phase_started_at": {"$ref": "#/$defs/NullableTimestamp"},
-        "request_started_at": {"$ref": "#/$defs/NullableTimestamp"},
-        "last_provider_activity_at": {"$ref": "#/$defs/NullableTimestamp"},
-        "provider_request_id": {"type": ["string", "null"]},
-        "retry_count": {"type": "integer", "minimum": 0},
-        "last_event_at": {"$ref": "#/$defs/NullableTimestamp"},
-        "last_model_event_at": {"$ref": "#/$defs/NullableTimestamp"},
-        "last_tool_event_at": {"$ref": "#/$defs/NullableTimestamp"},
-        "last_state_change_at": {"$ref": "#/$defs/NullableTimestamp"}
+        "advisory_readonly": {
+          "type": "boolean"
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1
+        },
+        "status": {
+          "enum": [
+            "working",
+            "finished",
+            "stopped",
+            "failed"
+          ]
+        },
+        "spawned_at": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "last_message_at": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "last_message_sent_at": {
+          "$ref": "#/$defs/NullableTimestamp"
+        },
+        "last_message_delivered_at": {
+          "$ref": "#/$defs/NullableTimestamp"
+        },
+        "run_started_at": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "updated_at": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "finished_at": {
+          "$ref": "#/$defs/NullableTimestamp"
+        },
+        "stopped_at": {
+          "$ref": "#/$defs/NullableTimestamp"
+        },
+        "failed_at": {
+          "$ref": "#/$defs/NullableTimestamp"
+        },
+        "deadline_at": {
+          "$ref": "#/$defs/NullableTimestamp"
+        },
+        "run_number": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "stop_reason": {
+          "oneOf": [
+            {
+              "enum": [
+                "user_request",
+                "wall_time",
+                "daemon_shutdown",
+                "daemon_interrupted"
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "last_error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "current_phase": {
+          "$ref": "#/$defs/AgentPhase"
+        },
+        "phase_started_at": {
+          "$ref": "#/$defs/NullableTimestamp"
+        },
+        "request_started_at": {
+          "$ref": "#/$defs/NullableTimestamp"
+        },
+        "last_provider_activity_at": {
+          "$ref": "#/$defs/NullableTimestamp"
+        },
+        "provider_request_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "retry_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "last_event_at": {
+          "$ref": "#/$defs/NullableTimestamp"
+        },
+        "last_model_event_at": {
+          "$ref": "#/$defs/NullableTimestamp"
+        },
+        "last_tool_event_at": {
+          "$ref": "#/$defs/NullableTimestamp"
+        },
+        "last_state_change_at": {
+          "$ref": "#/$defs/NullableTimestamp"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 4,
+          "maxLength": 40
+        },
+        "last_provider_request_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "last_progress_at": {
+          "$ref": "#/$defs/NullableTimestamp"
+        }
       }
     },
     "AgentListItem": {
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "type", "id", "ref", "name", "status", "dir", "mode", "spawned_at",
-        "last_message_at", "updated_at", "model", "current_phase",
-        "last_event_at", "run_number", "working_sides"
+        "type",
+        "id",
+        "ref",
+        "name",
+        "status",
+        "dir",
+        "mode",
+        "spawned_at",
+        "last_message_at",
+        "updated_at",
+        "model",
+        "current_phase",
+        "last_event_at",
+        "run_number",
+        "working_sides"
       ],
       "properties": {
-        "type": {"const": "agent_list_item"},
-        "id": {"type": "string", "pattern": "^agt_[0-9A-HJKMNP-TV-Z]{26}$"},
-        "ref": {"type": "string", "pattern": "^a_[1-9][0-9]*$"},
-        "name": {"type": "string", "minLength": 4, "maxLength": 40},
-        "status": {"enum": ["working", "finished", "stopped", "failed"]},
-        "dir": {"type": "string"},
-        "mode": {"enum": ["readonly", "write"]},
-        "model": {"type": "string", "minLength": 1},
-        "spawned_at": {"$ref": "#/$defs/Timestamp"},
-        "last_message_at": {"$ref": "#/$defs/Timestamp"},
-        "updated_at": {"$ref": "#/$defs/Timestamp"},
-        "current_phase": {"$ref": "#/$defs/AgentPhase"},
-        "last_event_at": {"$ref": "#/$defs/NullableTimestamp"},
-        "run_number": {"type": "integer", "minimum": 1},
-        "working_sides": {"type": "integer", "minimum": 0, "maximum": 2}
+        "type": {
+          "const": "agent_list_item"
+        },
+        "id": {
+          "type": "string",
+          "pattern": "^agt_[0-9A-HJKMNP-TV-Z]{26}$"
+        },
+        "ref": {
+          "type": "string",
+          "pattern": "^a_[1-9][0-9]*$"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 4,
+          "maxLength": 40
+        },
+        "status": {
+          "enum": [
+            "working",
+            "finished",
+            "stopped",
+            "failed"
+          ]
+        },
+        "dir": {
+          "type": "string"
+        },
+        "mode": {
+          "enum": [
+            "readonly",
+            "write"
+          ]
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1
+        },
+        "spawned_at": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "last_message_at": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "updated_at": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "current_phase": {
+          "$ref": "#/$defs/AgentPhase"
+        },
+        "last_event_at": {
+          "$ref": "#/$defs/NullableTimestamp"
+        },
+        "run_number": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "working_sides": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2
+        }
       }
     },
     "AgentListItemVerbose": {
       "type": "object",
-      "required": ["type", "id", "ref", "name", "status", "model", "current_phase", "working_sides", "seconds_since_last_event"],
+      "required": [
+        "id",
+        "ref",
+        "dir",
+        "mode",
+        "advisory_readonly",
+        "model",
+        "status",
+        "spawned_at",
+        "last_message_at",
+        "last_message_sent_at",
+        "last_message_delivered_at",
+        "run_started_at",
+        "updated_at",
+        "finished_at",
+        "stopped_at",
+        "failed_at",
+        "deadline_at",
+        "run_number",
+        "stop_reason",
+        "last_error",
+        "current_phase",
+        "phase_started_at",
+        "request_started_at",
+        "last_provider_activity_at",
+        "provider_request_id",
+        "retry_count",
+        "last_event_at",
+        "last_model_event_at",
+        "last_tool_event_at",
+        "last_state_change_at",
+        "name",
+        "last_provider_request_id",
+        "last_progress_at",
+        "type",
+        "working_sides",
+        "seconds_since_last_event"
+      ],
       "properties": {
-        "type": {"const": "agent_list_item_verbose"},
-        "id": {"type": "string", "pattern": "^agt_"},
-        "ref": {"type": "string", "pattern": "^a_[1-9][0-9]*$"},
-        "name": {"type": "string"},
-        "status": {"enum": ["working", "finished", "stopped", "failed"]},
-        "model": {"type": "string"},
-        "current_phase": {"$ref": "#/$defs/AgentPhase"},
-        "working_sides": {"type": "integer", "minimum": 0},
-        "seconds_since_last_event": {"type": ["integer", "null"], "minimum": 0}
+        "type": {
+          "const": "agent_list_item_verbose"
+        },
+        "id": {
+          "type": "string",
+          "pattern": "^agt_[0-9A-HJKMNP-TV-Z]{26}$"
+        },
+        "ref": {
+          "type": "string",
+          "pattern": "^a_[1-9][0-9]*$"
+        },
+        "dir": {
+          "type": "string"
+        },
+        "mode": {
+          "enum": [
+            "readonly",
+            "write"
+          ]
+        },
+        "advisory_readonly": {
+          "type": "boolean"
+        },
+        "model": {
+          "type": "string",
+          "minLength": 1
+        },
+        "status": {
+          "enum": [
+            "working",
+            "finished",
+            "stopped",
+            "failed"
+          ]
+        },
+        "spawned_at": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "last_message_at": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "last_message_sent_at": {
+          "$ref": "#/$defs/NullableTimestamp"
+        },
+        "last_message_delivered_at": {
+          "$ref": "#/$defs/NullableTimestamp"
+        },
+        "run_started_at": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "updated_at": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "finished_at": {
+          "$ref": "#/$defs/NullableTimestamp"
+        },
+        "stopped_at": {
+          "$ref": "#/$defs/NullableTimestamp"
+        },
+        "failed_at": {
+          "$ref": "#/$defs/NullableTimestamp"
+        },
+        "deadline_at": {
+          "$ref": "#/$defs/NullableTimestamp"
+        },
+        "run_number": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "stop_reason": {
+          "oneOf": [
+            {
+              "enum": [
+                "user_request",
+                "wall_time",
+                "daemon_shutdown",
+                "daemon_interrupted"
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "last_error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "current_phase": {
+          "$ref": "#/$defs/AgentPhase"
+        },
+        "phase_started_at": {
+          "$ref": "#/$defs/NullableTimestamp"
+        },
+        "request_started_at": {
+          "$ref": "#/$defs/NullableTimestamp"
+        },
+        "last_provider_activity_at": {
+          "$ref": "#/$defs/NullableTimestamp"
+        },
+        "provider_request_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "retry_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "last_event_at": {
+          "$ref": "#/$defs/NullableTimestamp"
+        },
+        "last_model_event_at": {
+          "$ref": "#/$defs/NullableTimestamp"
+        },
+        "last_tool_event_at": {
+          "$ref": "#/$defs/NullableTimestamp"
+        },
+        "last_state_change_at": {
+          "$ref": "#/$defs/NullableTimestamp"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 4,
+          "maxLength": 40
+        },
+        "last_provider_request_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "last_progress_at": {
+          "$ref": "#/$defs/NullableTimestamp"
+        },
+        "working_sides": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 2
+        },
+        "seconds_since_last_event": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        }
       },
-      "additionalProperties": true
+      "additionalProperties": false
     },
     "ListSummary": {
       "type": "object",
-      "required": ["type", "resource", "count"],
+      "required": [
+        "type",
+        "resource",
+        "count"
+      ],
       "properties": {
-        "type": {"const": "list_summary"},
-        "resource": {"enum": ["agents", "messages", "sides"]},
-        "agent_id": {"type": "string", "pattern": "^agt_"},
-        "agent_ref": {"type": "string", "pattern": "^a_[1-9][0-9]*$"},
-        "count": {"type": "integer", "minimum": 0}
+        "type": {
+          "const": "list_summary"
+        },
+        "resource": {
+          "enum": [
+            "agents",
+            "messages",
+            "sides"
+          ]
+        },
+        "agent_id": {
+          "type": "string",
+          "pattern": "^agt_[0-9A-HJKMNP-TV-Z]{26}$"
+        },
+        "agent_ref": {
+          "type": "string",
+          "pattern": "^a_[1-9][0-9]*$"
+        },
+        "count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "next_cursor": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
       },
       "additionalProperties": false
     },
     "AgentRenamed": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["type", "id", "ref", "name", "renamed_at"],
+      "required": [
+        "type",
+        "id",
+        "ref",
+        "name",
+        "renamed_at"
+      ],
       "properties": {
-        "type": {"const": "agent_renamed"},
-        "id": {"type": "string", "pattern": "^agt_"},
-        "ref": {"type": "string", "pattern": "^a_[1-9][0-9]*$"},
-        "name": {"type": "string", "minLength": 4, "maxLength": 40},
-        "renamed_at": {"$ref": "#/$defs/Timestamp"}
+        "type": {
+          "const": "agent_renamed"
+        },
+        "id": {
+          "type": "string",
+          "pattern": "^agt_[0-9A-HJKMNP-TV-Z]{26}$"
+        },
+        "ref": {
+          "type": "string",
+          "pattern": "^a_[1-9][0-9]*$"
+        },
+        "name": {
+          "type": "string",
+          "minLength": 4,
+          "maxLength": 40
+        },
+        "renamed_at": {
+          "$ref": "#/$defs/Timestamp"
+        }
       }
     },
     "Message": {
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "type", "id", "ref", "agent_id", "agent_ref", "content", "status", "sent_at",
-        "delivered_at", "cancelled_at"
+        "type",
+        "id",
+        "ref",
+        "agent_id",
+        "agent_ref",
+        "content",
+        "status",
+        "sent_at",
+        "delivered_at",
+        "cancelled_at"
       ],
       "properties": {
-        "type": {"const": "message"},
-        "id": {"type": "string", "pattern": "^msg_[0-9A-HJKMNP-TV-Z]{26}$"},
-        "ref": {"type": "string", "pattern": "^m_[1-9][0-9]*$"},
-        "agent_id": {"type": "string", "pattern": "^agt_"},
-        "agent_ref": {"type": "string", "pattern": "^a_[1-9][0-9]*$"},
-        "content": {"type": "string"},
-        "status": {"enum": ["pending", "delivered", "cancelled"]},
-        "sent_at": {"$ref": "#/$defs/Timestamp"},
-        "delivered_at": {"$ref": "#/$defs/NullableTimestamp"},
-        "cancelled_at": {"$ref": "#/$defs/NullableTimestamp"}
+        "type": {
+          "const": "message"
+        },
+        "id": {
+          "type": "string",
+          "pattern": "^msg_[0-9A-HJKMNP-TV-Z]{26}$"
+        },
+        "ref": {
+          "type": "string",
+          "pattern": "^m_[1-9][0-9]*$"
+        },
+        "agent_id": {
+          "type": "string",
+          "pattern": "^agt_[0-9A-HJKMNP-TV-Z]{26}$"
+        },
+        "agent_ref": {
+          "type": "string",
+          "pattern": "^a_[1-9][0-9]*$"
+        },
+        "content": {
+          "type": "string"
+        },
+        "status": {
+          "enum": [
+            "pending",
+            "delivered",
+            "cancelled"
+          ]
+        },
+        "sent_at": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "delivered_at": {
+          "$ref": "#/$defs/NullableTimestamp"
+        },
+        "cancelled_at": {
+          "$ref": "#/$defs/NullableTimestamp"
+        }
       }
     },
     "MessageSent": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["type", "message_id", "message_ref", "agent_id", "agent_ref", "status", "sent_at", "agent_resumed", "run_number", "agent_status", "resume_state"],
+      "required": [
+        "type",
+        "message_id",
+        "message_ref",
+        "agent_id",
+        "agent_ref",
+        "status",
+        "sent_at",
+        "agent_resumed",
+        "run_number",
+        "agent_status",
+        "resume_state"
+      ],
       "properties": {
-        "type": {"const": "message_sent"},
-        "message_id": {"type": "string", "pattern": "^msg_"},
-        "message_ref": {"type": "string", "pattern": "^m_[1-9][0-9]*$"},
-        "agent_id": {"type": "string", "pattern": "^agt_"},
-        "agent_ref": {"type": "string", "pattern": "^a_[1-9][0-9]*$"},
-        "status": {"const": "queued"},
-        "sent_at": {"$ref": "#/$defs/Timestamp"},
-        "agent_resumed": {"type": "boolean"},
-        "run_number": {"type": "integer", "minimum": 1},
-        "agent_status": {"enum": ["working", "finished", "stopped", "failed"]},
-        "resume_state": {"enum": ["not_needed", "started", "waiting_for_capacity"]}
+        "type": {
+          "const": "message_sent"
+        },
+        "message_id": {
+          "type": "string",
+          "pattern": "^msg_[0-9A-HJKMNP-TV-Z]{26}$"
+        },
+        "message_ref": {
+          "type": "string",
+          "pattern": "^m_[1-9][0-9]*$"
+        },
+        "agent_id": {
+          "type": "string",
+          "pattern": "^agt_[0-9A-HJKMNP-TV-Z]{26}$"
+        },
+        "agent_ref": {
+          "type": "string",
+          "pattern": "^a_[1-9][0-9]*$"
+        },
+        "status": {
+          "const": "queued"
+        },
+        "sent_at": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "agent_resumed": {
+          "type": "boolean"
+        },
+        "run_number": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "agent_status": {
+          "enum": [
+            "working",
+            "finished",
+            "stopped",
+            "failed"
+          ]
+        },
+        "resume_state": {
+          "enum": [
+            "not_needed",
+            "started",
+            "waiting_for_capacity"
+          ]
+        }
       }
     },
     "EventBase": {
       "type": "object",
-      "required": ["event_id", "ref", "agent_id", "agent_ref", "sequence", "timestamp", "type", "data"],
+      "required": [
+        "event_id",
+        "ref",
+        "agent_id",
+        "agent_ref",
+        "sequence",
+        "timestamp",
+        "type",
+        "data"
+      ],
       "properties": {
-        "event_id": {"type": "string", "pattern": "^evt_"},
-        "ref": {"type": "string", "pattern": "^e_[1-9][0-9]*$"},
-        "agent_id": {"type": "string", "pattern": "^agt_"},
-        "agent_ref": {"type": "string", "pattern": "^a_[1-9][0-9]*$"},
-        "side_id": {"type": "string", "pattern": "^side_"},
-        "side_ref": {"type": "string", "pattern": "^s_[1-9][0-9]*$"},
-        "sequence": {"type": "integer", "minimum": 1},
-        "timestamp": {"$ref": "#/$defs/Timestamp"}
+        "event_id": {
+          "type": "string",
+          "pattern": "^evt_[0-9A-HJKMNP-TV-Z]{26}$"
+        },
+        "ref": {
+          "type": "string",
+          "pattern": "^e_[1-9][0-9]*$"
+        },
+        "agent_id": {
+          "type": "string",
+          "pattern": "^agt_[0-9A-HJKMNP-TV-Z]{26}$"
+        },
+        "agent_ref": {
+          "type": "string",
+          "pattern": "^a_[1-9][0-9]*$"
+        },
+        "side_id": {
+          "type": "string",
+          "pattern": "^side_[0-9A-HJKMNP-TV-Z]{26}$"
+        },
+        "side_ref": {
+          "type": "string",
+          "pattern": "^s_[1-9][0-9]*$"
+        },
+        "sequence": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "timestamp": {
+          "$ref": "#/$defs/Timestamp"
+        }
       }
     },
     "Event": {
       "oneOf": [
         {
           "allOf": [
-            {"$ref": "#/$defs/EventBase"},
+            {
+              "$ref": "#/$defs/EventBase"
+            },
             {
               "properties": {
-                "type": {"const": "system_message"},
+                "type": {
+                  "const": "system_message"
+                },
                 "data": {
                   "type": "object",
                   "additionalProperties": false,
-                  "required": ["content"],
-                  "properties": {"content": {"type": "string"}}
+                  "required": [
+                    "content"
+                  ],
+                  "properties": {
+                    "content": {
+                      "type": "string"
+                    }
+                  }
                 }
               }
             }
@@ -245,38 +919,67 @@
         },
         {
           "allOf": [
-            {"$ref": "#/$defs/EventBase"},
+            {
+              "$ref": "#/$defs/EventBase"
+            },
             {
               "properties": {
-                "type": {"const": "user_message"},
+                "type": {
+                  "const": "user_message"
+                },
                 "data": {
                   "oneOf": [
                     {
                       "type": "object",
                       "additionalProperties": false,
-                      "required": ["content", "source"],
+                      "required": [
+                        "content",
+                        "source"
+                      ],
                       "properties": {
-                        "content": {"type": "string"},
-                        "source": {"const": "spawn"}
+                        "content": {
+                          "type": "string"
+                        },
+                        "source": {
+                          "const": "spawn"
+                        }
                       }
                     },
                     {
                       "type": "object",
                       "additionalProperties": false,
-                      "required": ["content", "source"],
+                      "required": [
+                        "content",
+                        "source"
+                      ],
                       "properties": {
-                        "content": {"type": "string"},
-                        "source": {"const": "create"}
+                        "content": {
+                          "type": "string"
+                        },
+                        "source": {
+                          "const": "create"
+                        }
                       }
                     },
                     {
                       "type": "object",
                       "additionalProperties": false,
-                      "required": ["content", "source", "message_id"],
+                      "required": [
+                        "content",
+                        "source",
+                        "message_id"
+                      ],
                       "properties": {
-                        "content": {"type": "string"},
-                        "source": {"const": "send"},
-                        "message_id": {"type": "string", "pattern": "^msg_"}
+                        "content": {
+                          "type": "string"
+                        },
+                        "source": {
+                          "const": "send"
+                        },
+                        "message_id": {
+                          "type": "string",
+                          "pattern": "^msg_[0-9A-HJKMNP-TV-Z]{26}$"
+                        }
                       }
                     }
                   ]
@@ -288,17 +991,31 @@
         },
         {
           "allOf": [
-            {"$ref": "#/$defs/EventBase"},
+            {
+              "$ref": "#/$defs/EventBase"
+            },
             {
               "properties": {
-                "type": {"const": "assistant_message"},
+                "type": {
+                  "const": "assistant_message"
+                },
                 "data": {
                   "type": "object",
                   "additionalProperties": false,
-                  "required": ["content", "usage"],
+                  "required": [
+                    "content",
+                    "usage"
+                  ],
                   "properties": {
-                    "content": {"type": "string"},
-                    "usage": {"type": ["object", "null"]}
+                    "content": {
+                      "type": "string"
+                    },
+                    "usage": {
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    }
                   }
                 }
               }
@@ -308,35 +1025,24 @@
         },
         {
           "allOf": [
-            {"$ref": "#/$defs/EventBase"},
+            {
+              "$ref": "#/$defs/EventBase"
+            },
             {
               "properties": {
-                "type": {"const": "reasoning"},
+                "type": {
+                  "const": "reasoning"
+                },
                 "data": {
                   "type": "object",
                   "additionalProperties": false,
-                  "required": ["content"],
-                  "properties": {"content": {"type": "string"}}
-                }
-              }
-            }
-          ],
-          "unevaluatedProperties": false
-        },
-        {
-          "allOf": [
-            {"$ref": "#/$defs/EventBase"},
-            {
-              "properties": {
-                "type": {"const": "tool_call"},
-                "data": {
-                  "type": "object",
-                  "additionalProperties": false,
-                  "required": ["tool_call_id", "name", "arguments"],
+                  "required": [
+                    "content"
+                  ],
                   "properties": {
-                    "tool_call_id": {"type": "string"},
-                    "name": {"type": "string"},
-                    "arguments": {"type": "string"}
+                    "content": {
+                      "type": "string"
+                    }
                   }
                 }
               }
@@ -346,18 +1052,32 @@
         },
         {
           "allOf": [
-            {"$ref": "#/$defs/EventBase"},
+            {
+              "$ref": "#/$defs/EventBase"
+            },
             {
               "properties": {
-                "type": {"const": "tool_result"},
+                "type": {
+                  "const": "tool_call"
+                },
                 "data": {
                   "type": "object",
                   "additionalProperties": false,
-                  "required": ["tool_call_id", "name", "result"],
+                  "required": [
+                    "tool_call_id",
+                    "name",
+                    "arguments"
+                  ],
                   "properties": {
-                    "tool_call_id": {"type": "string"},
-                    "name": {"type": "string"},
-                    "result": {"$ref": "#/$defs/ToolResult"}
+                    "tool_call_id": {
+                      "type": "string"
+                    },
+                    "name": {
+                      "type": "string"
+                    },
+                    "arguments": {
+                      "type": "string"
+                    }
                   }
                 }
               }
@@ -367,66 +1087,154 @@
         },
         {
           "allOf": [
-            {"$ref": "#/$defs/EventBase"},
+            {
+              "$ref": "#/$defs/EventBase"
+            },
             {
               "properties": {
-                "type": {"const": "lifecycle"},
+                "type": {
+                  "const": "tool_result"
+                },
+                "data": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": [
+                    "tool_call_id",
+                    "name",
+                    "result"
+                  ],
+                  "properties": {
+                    "tool_call_id": {
+                      "type": "string"
+                    },
+                    "name": {
+                      "type": "string"
+                    },
+                    "result": {
+                      "$ref": "#/$defs/ToolResult"
+                    }
+                  }
+                }
+              }
+            }
+          ],
+          "unevaluatedProperties": false
+        },
+        {
+          "allOf": [
+            {
+              "$ref": "#/$defs/EventBase"
+            },
+            {
+              "properties": {
+                "type": {
+                  "const": "lifecycle"
+                },
                 "data": {
                   "oneOf": [
                     {
                       "type": "object",
                       "additionalProperties": false,
-                      "required": ["status", "reason"],
+                      "required": [
+                        "status",
+                        "reason"
+                      ],
                       "properties": {
-                        "status": {"const": "working"},
-                        "reason": {"const": "spawned"}
+                        "status": {
+                          "const": "working"
+                        },
+                        "reason": {
+                          "const": "spawned"
+                        }
                       }
                     },
                     {
                       "type": "object",
                       "additionalProperties": false,
-                      "required": ["status", "reason"],
+                      "required": [
+                        "status",
+                        "reason"
+                      ],
                       "properties": {
-                        "status": {"const": "working"},
-                        "reason": {"const": "created"}
+                        "status": {
+                          "const": "working"
+                        },
+                        "reason": {
+                          "const": "created"
+                        }
                       }
                     },
                     {
                       "type": "object",
                       "additionalProperties": false,
-                      "required": ["status", "reason", "run_number"],
+                      "required": [
+                        "status",
+                        "reason",
+                        "run_number"
+                      ],
                       "properties": {
-                        "status": {"const": "working"},
-                        "reason": {"const": "resumed"},
-                        "run_number": {"type": "integer", "minimum": 2}
+                        "status": {
+                          "const": "working"
+                        },
+                        "reason": {
+                          "const": "resumed"
+                        },
+                        "run_number": {
+                          "type": "integer",
+                          "minimum": 2
+                        }
                       }
                     },
                     {
                       "type": "object",
                       "additionalProperties": false,
-                      "required": ["status", "reason", "deadline_at"],
+                      "required": [
+                        "status",
+                        "reason",
+                        "deadline_at"
+                      ],
                       "properties": {
-                        "status": {"const": "working"},
-                        "reason": {"const": "deadline_updated"},
-                        "deadline_at": {"$ref": "#/$defs/Timestamp"}
+                        "status": {
+                          "const": "working"
+                        },
+                        "reason": {
+                          "const": "deadline_updated"
+                        },
+                        "deadline_at": {
+                          "$ref": "#/$defs/Timestamp"
+                        }
                       }
                     },
                     {
                       "type": "object",
                       "additionalProperties": false,
-                      "required": ["status"],
-                      "properties": {"status": {"const": "finished"}}
+                      "required": [
+                        "status"
+                      ],
+                      "properties": {
+                        "status": {
+                          "const": "finished"
+                        }
+                      }
                     },
                     {
                       "type": "object",
                       "additionalProperties": false,
-                      "required": ["status", "reason"],
+                      "required": [
+                        "status",
+                        "reason"
+                      ],
                       "properties": {
-                        "status": {"const": "stopped"},
+                        "status": {
+                          "const": "stopped"
+                        },
                         "reason": {
                           "enum": [
-                            "user_request", "wall_time",
-                            "daemon_shutdown", "daemon_interrupted", "parent_deleted"
+                            "user_request",
+                            "wall_time",
+                            "daemon_shutdown",
+                            "daemon_interrupted",
+                            "parent_deleted"
                           ]
                         }
                       }
@@ -440,17 +1248,28 @@
         },
         {
           "allOf": [
-            {"$ref": "#/$defs/EventBase"},
+            {
+              "$ref": "#/$defs/EventBase"
+            },
             {
               "properties": {
-                "type": {"const": "error"},
+                "type": {
+                  "const": "error"
+                },
                 "data": {
                   "type": "object",
                   "additionalProperties": false,
-                  "required": ["status", "error"],
+                  "required": [
+                    "status",
+                    "error"
+                  ],
                   "properties": {
-                    "status": {"const": "failed"},
-                    "error": {"type": "string"}
+                    "status": {
+                      "const": "failed"
+                    },
+                    "error": {
+                      "type": "string"
+                    }
                   }
                 }
               }
@@ -463,234 +1282,595 @@
     "ToolFailure": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["ok", "code", "error"],
+      "required": [
+        "ok",
+        "code",
+        "error"
+      ],
       "properties": {
-        "ok": {"const": false},
-        "code": {"const": "tool_error"},
-        "error": {"type": "string"}
+        "ok": {
+          "const": false
+        },
+        "code": {
+          "const": "tool_error"
+        },
+        "error": {
+          "type": "string"
+        }
       }
     },
     "Preview": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["content", "head_bytes", "tail_bytes", "total_bytes", "truncated"],
+      "required": [
+        "content",
+        "head_bytes",
+        "tail_bytes",
+        "total_bytes",
+        "truncated"
+      ],
       "properties": {
-        "content": {"type": "string"},
-        "head_bytes": {"type": "integer", "minimum": 0},
-        "tail_bytes": {"type": "integer", "minimum": 0},
-        "total_bytes": {"type": "integer", "minimum": 0},
-        "truncated": {"type": "boolean"}
+        "content": {
+          "type": "string"
+        },
+        "head_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "tail_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "total_bytes": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "truncated": {
+          "type": "boolean"
+        }
       }
     },
     "ToolResult": {
       "oneOf": [
-        {"$ref": "#/$defs/ToolFailure"},
         {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["ok", "notification_id", "priority", "event_type"],
-          "properties": {
-            "ok": {"const": true},
-            "notification_id": {"type": "string", "pattern": "^ntf_"},
-            "priority": {"type": "integer", "minimum": 1, "maximum": 4},
-            "event_type": {"enum": ["progress", "milestone", "input_required", "blocked"]}
-          }
+          "$ref": "#/$defs/ToolFailure"
         },
         {
           "type": "object",
           "additionalProperties": false,
-          "required": ["ok", "path", "offset", "lines", "truncated"],
+          "required": [
+            "ok",
+            "notification_id",
+            "priority",
+            "event_type"
+          ],
           "properties": {
-            "ok": {"const": true},
-            "path": {"type": "string"},
-            "offset": {"type": "integer", "minimum": 1},
-            "lines": {"type": "array", "items": {"type": "string"}},
-            "truncated": {"type": "boolean"}
-          }
-        },
-        {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["ok", "root", "paths", "truncated"],
-          "properties": {
-            "ok": {"const": true},
-            "root": {"type": "string"},
-            "paths": {"type": "array", "items": {"type": "string"}},
-            "truncated": {"type": "boolean"}
-          }
-        },
-        {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["ok", "root", "matches", "truncated"],
-          "properties": {
-            "ok": {"const": true},
-            "root": {"type": "string"},
-            "matches": {
-              "type": "array",
-              "items": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["path", "line", "text"],
-                "properties": {
-                  "path": {"type": "string"},
-                  "line": {"type": "integer", "minimum": 1},
-                  "text": {"type": "string"}
-                }
-              }
+            "ok": {
+              "const": true
             },
-            "truncated": {"type": "boolean"}
-          }
-        },
-        {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["ok", "path", "bytes"],
-          "properties": {
-            "ok": {"const": true},
-            "path": {"type": "string"},
-            "bytes": {"type": "integer", "minimum": 0}
-          }
-        },
-        {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["ok", "path", "replacements"],
-          "properties": {
-            "ok": {"const": true},
-            "path": {"type": "string"},
-            "replacements": {"type": "integer", "minimum": 1}
-          }
-        },
-        {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["ok", "changed_files"],
-          "properties": {
-            "ok": {"const": true},
-            "changed_files": {"type": "array", "items": {"type": "string"}}
-          }
-        },
-        {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["ok", "status", "exit_code", "output", "output_ref", "truncated"],
-          "properties": {
-            "ok": {"const": true},
-            "status": {"const": "completed"},
-            "exit_code": {"const": 0},
-            "output": {"$ref": "#/$defs/Preview"},
-            "output_ref": {"type": "string", "pattern": "^out_"},
-            "truncated": {"type": "boolean"}
-          }
-        },
-        {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["ok", "status", "terminal_id", "output", "output_ref", "truncated"],
-          "properties": {
-            "ok": {"const": true},
-            "status": {"const": "running"},
-            "terminal_id": {"type": "string", "pattern": "^term_"},
-            "output": {"$ref": "#/$defs/Preview"},
-            "output_ref": {"type": "string", "pattern": "^out_"},
-            "truncated": {"type": "boolean"}
+            "notification_id": {
+              "type": "string",
+              "pattern": "^ntf_[0-9A-HJKMNP-TV-Z]{26}$"
+            },
+            "priority": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 4
+            },
+            "event_type": {
+              "enum": [
+                "progress",
+                "milestone",
+                "input_required",
+                "blocked"
+              ]
+            }
           }
         },
         {
           "type": "object",
           "additionalProperties": false,
           "required": [
-            "ok", "terminal_id", "status", "exit_code", "output",
-            "output_ref", "next_offset", "truncated"
+            "ok",
+            "path",
+            "offset",
+            "lines",
+            "truncated"
           ],
           "properties": {
-            "ok": {"type": "boolean"},
-            "terminal_id": {"type": "string", "pattern": "^term_"},
-            "status": {"enum": ["running", "completed"]},
-            "exit_code": {"type": ["integer", "null"]},
-            "output": {"type": "string"},
-            "output_ref": {"type": "string", "pattern": "^out_"},
-            "next_offset": {"type": "integer", "minimum": 0},
-            "truncated": {"type": "boolean"}
+            "ok": {
+              "const": true
+            },
+            "path": {
+              "type": "string"
+            },
+            "offset": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "lines": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "truncated": {
+              "type": "boolean"
+            }
           }
         },
         {
           "type": "object",
           "additionalProperties": false,
-          "required": ["ok", "terminals", "count", "limit"],
+          "required": [
+            "ok",
+            "root",
+            "paths",
+            "truncated"
+          ],
           "properties": {
-            "ok": {"const": true},
+            "ok": {
+              "const": true
+            },
+            "root": {
+              "type": "string"
+            },
+            "paths": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "truncated": {
+              "type": "boolean"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "ok",
+            "root",
+            "matches",
+            "truncated"
+          ],
+          "properties": {
+            "ok": {
+              "const": true
+            },
+            "root": {
+              "type": "string"
+            },
+            "matches": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "path",
+                  "line",
+                  "text"
+                ],
+                "properties": {
+                  "path": {
+                    "type": "string"
+                  },
+                  "line": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "text": {
+                    "type": "string"
+                  }
+                }
+              }
+            },
+            "truncated": {
+              "type": "boolean"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "ok",
+            "path",
+            "bytes"
+          ],
+          "properties": {
+            "ok": {
+              "const": true
+            },
+            "path": {
+              "type": "string"
+            },
+            "bytes": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "ok",
+            "path",
+            "replacements"
+          ],
+          "properties": {
+            "ok": {
+              "const": true
+            },
+            "path": {
+              "type": "string"
+            },
+            "replacements": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "ok",
+            "changed_files"
+          ],
+          "properties": {
+            "ok": {
+              "const": true
+            },
+            "changed_files": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "ok",
+            "status",
+            "exit_code",
+            "output",
+            "output_ref",
+            "truncated"
+          ],
+          "properties": {
+            "ok": {
+              "const": true
+            },
+            "status": {
+              "const": "completed"
+            },
+            "exit_code": {
+              "const": 0
+            },
+            "output": {
+              "$ref": "#/$defs/Preview"
+            },
+            "output_ref": {
+              "type": "string",
+              "pattern": "^out_"
+            },
+            "truncated": {
+              "type": "boolean"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "ok",
+            "status",
+            "terminal_id",
+            "output",
+            "output_ref",
+            "truncated"
+          ],
+          "properties": {
+            "ok": {
+              "const": true
+            },
+            "status": {
+              "const": "running"
+            },
+            "terminal_id": {
+              "type": "string",
+              "pattern": "^term_"
+            },
+            "output": {
+              "$ref": "#/$defs/Preview"
+            },
+            "output_ref": {
+              "type": "string",
+              "pattern": "^out_"
+            },
+            "truncated": {
+              "type": "boolean"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "ok",
+            "terminal_id",
+            "status",
+            "exit_code",
+            "output",
+            "output_ref",
+            "next_offset",
+            "truncated"
+          ],
+          "properties": {
+            "ok": {
+              "type": "boolean"
+            },
+            "terminal_id": {
+              "type": "string",
+              "pattern": "^term_"
+            },
+            "status": {
+              "enum": [
+                "running",
+                "completed"
+              ]
+            },
+            "exit_code": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "output": {
+              "type": "string"
+            },
+            "output_ref": {
+              "type": "string",
+              "pattern": "^out_"
+            },
+            "next_offset": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "truncated": {
+              "type": "boolean"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "ok",
+            "terminals",
+            "count",
+            "limit"
+          ],
+          "properties": {
+            "ok": {
+              "const": true
+            },
             "terminals": {
               "type": "array",
               "items": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["terminal_id", "command", "cwd", "pid", "output_ref"],
+                "required": [
+                  "terminal_id",
+                  "command",
+                  "cwd",
+                  "pid",
+                  "output_ref"
+                ],
                 "properties": {
-                  "terminal_id": {"type": "string", "pattern": "^term_"},
-                  "command": {"type": "string"},
-                  "cwd": {"type": "string"},
-                  "pid": {"type": "integer", "minimum": 1},
-                  "output_ref": {"type": "string", "pattern": "^out_"}
+                  "terminal_id": {
+                    "type": "string",
+                    "pattern": "^term_"
+                  },
+                  "command": {
+                    "type": "string"
+                  },
+                  "cwd": {
+                    "type": "string"
+                  },
+                  "pid": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "output_ref": {
+                    "type": "string",
+                    "pattern": "^out_"
+                  }
                 }
               }
             },
-            "count": {"type": "integer", "minimum": 0, "maximum": 8},
-            "limit": {"const": 8}
+            "count": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 8
+            },
+            "limit": {
+              "const": 8
+            }
           }
         },
         {
           "type": "object",
           "additionalProperties": false,
-          "required": ["ok", "terminated"],
+          "required": [
+            "ok",
+            "terminated"
+          ],
           "properties": {
-            "ok": {"const": true},
-            "terminated": {"type": "boolean"}
+            "ok": {
+              "const": true
+            },
+            "terminated": {
+              "type": "boolean"
+            }
           }
         },
         {
           "type": "object",
           "additionalProperties": false,
-          "required": ["ok"],
-          "properties": {"ok": {"const": true}}
-        },
-        {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["ok", "output_ref", "offset", "next_offset", "content", "eof"],
+          "required": [
+            "ok"
+          ],
           "properties": {
-            "ok": {"const": true},
-            "output_ref": {"type": "string", "pattern": "^out_"},
-            "offset": {"type": "integer", "minimum": 0},
-            "next_offset": {"type": "integer", "minimum": 0},
-            "content": {"type": "string"},
-            "eof": {"type": "boolean"}
+            "ok": {
+              "const": true
+            }
           }
         },
         {
           "type": "object",
           "additionalProperties": false,
-          "required": ["ok", "path", "mime_type", "bytes", "note"],
+          "required": [
+            "ok",
+            "output_ref",
+            "offset",
+            "next_offset",
+            "content",
+            "eof"
+          ],
           "properties": {
-            "ok": {"const": true},
-            "path": {"type": "string"},
-            "mime_type": {"type": "string", "pattern": "^image/"},
-            "bytes": {"type": "integer", "minimum": 0, "maximum": 5242880},
-            "note": {"const": "image attached in the next model-visible message"}
+            "ok": {
+              "const": true
+            },
+            "output_ref": {
+              "type": "string",
+              "pattern": "^out_"
+            },
+            "offset": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "next_offset": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "content": {
+              "type": "string"
+            },
+            "eof": {
+              "type": "boolean"
+            }
           }
         },
         {
           "type": "object",
           "additionalProperties": false,
-          "required": ["ok", "status", "exit_code", "output", "output_ref", "truncated"],
+          "required": [
+            "ok",
+            "path",
+            "mime_type",
+            "bytes",
+            "note"
+          ],
           "properties": {
-            "ok": {"const": false},
-            "status": {"const": "completed"},
-            "exit_code": {"type": "integer"},
-            "output": {"$ref": "#/$defs/Preview"},
-            "output_ref": {"type": "string", "pattern": "^out_"},
-            "truncated": {"type": "boolean"}
+            "ok": {
+              "const": true
+            },
+            "path": {
+              "type": "string"
+            },
+            "mime_type": {
+              "type": "string",
+              "pattern": "^image/"
+            },
+            "bytes": {
+              "type": "integer",
+              "minimum": 0,
+              "maximum": 5242880
+            },
+            "note": {
+              "const": "image attached in the next model-visible message"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "ok",
+            "status",
+            "exit_code",
+            "output",
+            "output_ref",
+            "truncated"
+          ],
+          "properties": {
+            "ok": {
+              "const": false
+            },
+            "status": {
+              "const": "completed"
+            },
+            "exit_code": {
+              "type": "integer"
+            },
+            "output": {
+              "$ref": "#/$defs/Preview"
+            },
+            "output_ref": {
+              "type": "string",
+              "pattern": "^out_"
+            },
+            "truncated": {
+              "type": "boolean"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "ok",
+            "status",
+            "terminal_id",
+            "exit_code",
+            "output",
+            "output_ref",
+            "truncated"
+          ],
+          "properties": {
+            "ok": {
+              "const": false
+            },
+            "status": {
+              "const": "cancelled"
+            },
+            "terminal_id": {
+              "type": "string",
+              "pattern": "^term_[0-9A-HJKMNP-TV-Z]{26}$"
+            },
+            "exit_code": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "output": {
+              "$ref": "#/$defs/Preview"
+            },
+            "output_ref": {
+              "type": "string",
+              "pattern": "^out_[0-9A-HJKMNP-TV-Z]{26}$"
+            },
+            "truncated": {
+              "type": "boolean"
+            }
           }
         }
       ]
@@ -698,196 +1878,617 @@
     "Error": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["type", "code", "message", "details", "retryable"],
+      "required": [
+        "type",
+        "code",
+        "message",
+        "details",
+        "retryable"
+      ],
       "properties": {
-        "type": {"const": "error"},
+        "type": {
+          "const": "error"
+        },
         "code": {
           "enum": [
-            "daemon_unavailable", "daemon_already_running", "agent_not_found",
-            "event_not_found", "message_not_found", "side_not_found", "invalid_argument",
-            "file_too_large", "capacity_exceeded", "conflict", "timeout",
-            "api_error", "protocol_mismatch", "internal_error", "cli_error"
+            "daemon_unavailable",
+            "daemon_already_running",
+            "agent_not_found",
+            "event_not_found",
+            "message_not_found",
+            "side_not_found",
+            "invalid_argument",
+            "file_too_large",
+            "capacity_exceeded",
+            "conflict",
+            "timeout",
+            "api_error",
+            "protocol_mismatch",
+            "internal_error",
+            "cli_error",
+            "daemon_stopped",
+            "daemon_crashed",
+            "notification_not_found"
           ]
         },
-        "message": {"type": "string"},
-        "details": {"type": "object"},
-        "retryable": {"type": "boolean"}
+        "message": {
+          "type": "string"
+        },
+        "details": {
+          "type": "object"
+        },
+        "retryable": {
+          "type": "boolean"
+        }
       }
     },
     "DaemonRunning": {
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "type", "status", "version", "protocol_version", "pid", "socket", "working_agents",
-        "max_agents", "model", "base_url", "web_ui_url", "web_auth"
+        "type",
+        "status",
+        "version",
+        "protocol_version",
+        "pid",
+        "socket",
+        "working_agents",
+        "max_agents",
+        "model",
+        "base_url",
+        "web_ui_url",
+        "web_auth"
       ],
       "properties": {
-        "type": {"const": "daemon"},
-        "status": {"const": "running"},
-        "version": {"type": "string"},
-        "protocol_version": {"type": "integer", "minimum": 1},
-        "pid": {"type": "integer", "minimum": 1},
-        "socket": {"type": "string"},
-        "working_agents": {"type": "integer", "minimum": 0},
-        "max_agents": {"type": "integer", "minimum": 0},
-        "model": {"type": "string"},
-        "base_url": {"type": "string"},
-        "web_ui_url": {"type": ["string", "null"]},
-        "web_auth": {"enum": ["basic", "none", null]}
+        "type": {
+          "const": "daemon"
+        },
+        "status": {
+          "const": "running"
+        },
+        "version": {
+          "type": "string"
+        },
+        "protocol_version": {
+          "const": 2
+        },
+        "pid": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "socket": {
+          "type": "string"
+        },
+        "working_agents": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "max_agents": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "model": {
+          "type": "string"
+        },
+        "base_url": {
+          "type": "string"
+        },
+        "web_ui_url": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "web_auth": {
+          "enum": [
+            "basic",
+            "none",
+            null
+          ]
+        }
       }
     },
     "DaemonStopping": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["type", "status", "working_agents"],
+      "required": [
+        "type",
+        "status",
+        "working_agents"
+      ],
       "properties": {
-        "type": {"const": "daemon"},
-        "status": {"const": "stopping"},
-        "working_agents": {"type": "integer", "minimum": 0}
+        "type": {
+          "const": "daemon"
+        },
+        "status": {
+          "const": "stopping"
+        },
+        "working_agents": {
+          "type": "integer",
+          "minimum": 0
+        }
       }
     },
     "SideCreated": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["type", "id", "ref", "agent_id", "agent_ref", "status", "created_at"],
+      "required": [
+        "type",
+        "id",
+        "ref",
+        "agent_id",
+        "agent_ref",
+        "status",
+        "created_at"
+      ],
       "properties": {
-        "type": {"const": "side_created"},
-        "id": {"type": "string", "pattern": "^side_"},
-        "ref": {"type": "string", "pattern": "^s_[1-9][0-9]*$"},
-        "agent_id": {"type": "string", "pattern": "^agt_"},
-        "agent_ref": {"type": "string", "pattern": "^a_[1-9][0-9]*$"},
-        "status": {"const": "working"},
-        "created_at": {"$ref": "#/$defs/Timestamp"}
+        "type": {
+          "const": "side_created"
+        },
+        "id": {
+          "type": "string",
+          "pattern": "^side_[0-9A-HJKMNP-TV-Z]{26}$"
+        },
+        "ref": {
+          "type": "string",
+          "pattern": "^s_[1-9][0-9]*$"
+        },
+        "agent_id": {
+          "type": "string",
+          "pattern": "^agt_[0-9A-HJKMNP-TV-Z]{26}$"
+        },
+        "agent_ref": {
+          "type": "string",
+          "pattern": "^a_[1-9][0-9]*$"
+        },
+        "status": {
+          "const": "working"
+        },
+        "created_at": {
+          "$ref": "#/$defs/Timestamp"
+        }
       }
     },
     "Side": {
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "type", "id", "ref", "agent_id", "agent_ref", "status", "question", "answer", "model",
-        "mode", "parent_mode", "created_at", "run_started_at", "updated_at",
-        "finished_at", "stopped_at", "failed_at", "deadline_at",
-        "inherited_context_messages", "tool_calls", "stop_reason", "last_error",
-        "current_phase", "phase_started_at", "request_started_at",
-        "last_provider_activity_at", "provider_request_id", "retry_count",
-        "last_event_at", "last_model_event_at", "last_tool_event_at", "last_state_change_at"
+        "type",
+        "id",
+        "ref",
+        "agent_id",
+        "agent_ref",
+        "status",
+        "question",
+        "answer",
+        "model",
+        "mode",
+        "parent_mode",
+        "created_at",
+        "run_started_at",
+        "updated_at",
+        "finished_at",
+        "stopped_at",
+        "failed_at",
+        "deadline_at",
+        "inherited_context_messages",
+        "tool_calls",
+        "stop_reason",
+        "last_error",
+        "current_phase",
+        "phase_started_at",
+        "request_started_at",
+        "last_provider_activity_at",
+        "provider_request_id",
+        "retry_count",
+        "last_event_at",
+        "last_model_event_at",
+        "last_tool_event_at",
+        "last_state_change_at",
+        "last_provider_request_id",
+        "last_progress_at"
       ],
       "properties": {
-        "type": {"const": "side"},
-        "id": {"type": "string", "pattern": "^side_"},
-        "ref": {"type": "string", "pattern": "^s_[1-9][0-9]*$"},
-        "agent_id": {"type": "string", "pattern": "^agt_"},
-        "agent_ref": {"type": "string", "pattern": "^a_[1-9][0-9]*$"},
-        "status": {"enum": ["working", "finished", "stopped", "failed"]},
-        "question": {"type": "string"},
-        "answer": {"type": ["string", "null"]},
-        "model": {"type": "string"},
-        "mode": {"const": "readonly"},
-        "parent_mode": {"enum": ["readonly", "write"]},
-        "created_at": {"$ref": "#/$defs/Timestamp"},
-        "run_started_at": {"$ref": "#/$defs/Timestamp"},
-        "updated_at": {"$ref": "#/$defs/Timestamp"},
-        "finished_at": {"$ref": "#/$defs/NullableTimestamp"},
-        "stopped_at": {"$ref": "#/$defs/NullableTimestamp"},
-        "failed_at": {"$ref": "#/$defs/NullableTimestamp"},
-        "deadline_at": {"$ref": "#/$defs/NullableTimestamp"},
-        "inherited_context_messages": {"type": "integer", "minimum": 0},
-        "tool_calls": {"type": "integer", "minimum": 0},
-        "stop_reason": {"type": ["string", "null"]},
-        "last_error": {"type": ["string", "null"]},
-        "current_phase": {"$ref": "#/$defs/AgentPhase"},
-        "phase_started_at": {"$ref": "#/$defs/NullableTimestamp"},
-        "request_started_at": {"$ref": "#/$defs/NullableTimestamp"},
-        "last_provider_activity_at": {"$ref": "#/$defs/NullableTimestamp"},
-        "provider_request_id": {"type": ["string", "null"]},
-        "retry_count": {"type": "integer", "minimum": 0},
-        "last_event_at": {"$ref": "#/$defs/NullableTimestamp"},
-        "last_model_event_at": {"$ref": "#/$defs/NullableTimestamp"},
-        "last_tool_event_at": {"$ref": "#/$defs/NullableTimestamp"},
-        "last_state_change_at": {"$ref": "#/$defs/NullableTimestamp"}
+        "type": {
+          "const": "side"
+        },
+        "id": {
+          "type": "string",
+          "pattern": "^side_[0-9A-HJKMNP-TV-Z]{26}$"
+        },
+        "ref": {
+          "type": "string",
+          "pattern": "^s_[1-9][0-9]*$"
+        },
+        "agent_id": {
+          "type": "string",
+          "pattern": "^agt_[0-9A-HJKMNP-TV-Z]{26}$"
+        },
+        "agent_ref": {
+          "type": "string",
+          "pattern": "^a_[1-9][0-9]*$"
+        },
+        "status": {
+          "enum": [
+            "working",
+            "finished",
+            "stopped",
+            "failed"
+          ]
+        },
+        "question": {
+          "type": "string"
+        },
+        "answer": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "model": {
+          "type": "string"
+        },
+        "mode": {
+          "const": "readonly"
+        },
+        "parent_mode": {
+          "enum": [
+            "readonly",
+            "write"
+          ]
+        },
+        "created_at": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "run_started_at": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "updated_at": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "finished_at": {
+          "$ref": "#/$defs/NullableTimestamp"
+        },
+        "stopped_at": {
+          "$ref": "#/$defs/NullableTimestamp"
+        },
+        "failed_at": {
+          "$ref": "#/$defs/NullableTimestamp"
+        },
+        "deadline_at": {
+          "$ref": "#/$defs/NullableTimestamp"
+        },
+        "inherited_context_messages": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "tool_calls": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "stop_reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "last_error": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "current_phase": {
+          "$ref": "#/$defs/AgentPhase"
+        },
+        "phase_started_at": {
+          "$ref": "#/$defs/NullableTimestamp"
+        },
+        "request_started_at": {
+          "$ref": "#/$defs/NullableTimestamp"
+        },
+        "last_provider_activity_at": {
+          "$ref": "#/$defs/NullableTimestamp"
+        },
+        "provider_request_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "retry_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "last_event_at": {
+          "$ref": "#/$defs/NullableTimestamp"
+        },
+        "last_model_event_at": {
+          "$ref": "#/$defs/NullableTimestamp"
+        },
+        "last_tool_event_at": {
+          "$ref": "#/$defs/NullableTimestamp"
+        },
+        "last_state_change_at": {
+          "$ref": "#/$defs/NullableTimestamp"
+        },
+        "last_provider_request_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "last_progress_at": {
+          "$ref": "#/$defs/NullableTimestamp"
+        }
       }
     },
     "SideListItem": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["type", "id", "ref", "agent_id", "agent_ref", "status", "question_preview", "created_at", "updated_at", "tool_calls"],
+      "required": [
+        "type",
+        "id",
+        "ref",
+        "agent_id",
+        "agent_ref",
+        "status",
+        "question_preview",
+        "created_at",
+        "updated_at",
+        "tool_calls"
+      ],
       "properties": {
-        "type": {"const": "side_list_item"},
-        "id": {"type": "string", "pattern": "^side_"},
-        "ref": {"type": "string", "pattern": "^s_[1-9][0-9]*$"},
-        "agent_id": {"type": "string", "pattern": "^agt_"},
-        "agent_ref": {"type": "string", "pattern": "^a_[1-9][0-9]*$"},
-        "status": {"enum": ["working", "finished", "stopped", "failed"]},
-        "question_preview": {"type": "string", "maxLength": 200},
-        "created_at": {"$ref": "#/$defs/Timestamp"},
-        "updated_at": {"$ref": "#/$defs/Timestamp"},
-        "tool_calls": {"type": "integer", "minimum": 0}
+        "type": {
+          "const": "side_list_item"
+        },
+        "id": {
+          "type": "string",
+          "pattern": "^side_[0-9A-HJKMNP-TV-Z]{26}$"
+        },
+        "ref": {
+          "type": "string",
+          "pattern": "^s_[1-9][0-9]*$"
+        },
+        "agent_id": {
+          "type": "string",
+          "pattern": "^agt_[0-9A-HJKMNP-TV-Z]{26}$"
+        },
+        "agent_ref": {
+          "type": "string",
+          "pattern": "^a_[1-9][0-9]*$"
+        },
+        "status": {
+          "enum": [
+            "working",
+            "finished",
+            "stopped",
+            "failed"
+          ]
+        },
+        "question_preview": {
+          "type": "string",
+          "maxLength": 200
+        },
+        "created_at": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "updated_at": {
+          "$ref": "#/$defs/Timestamp"
+        },
+        "tool_calls": {
+          "type": "integer",
+          "minimum": 0
+        }
       }
     },
     "SideDeleted": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["type", "id", "ref", "agent_id", "agent_ref"],
+      "required": [
+        "type",
+        "id",
+        "ref",
+        "agent_id",
+        "agent_ref"
+      ],
       "properties": {
-        "type": {"const": "side_deleted"},
-        "id": {"type": "string", "pattern": "^side_"}
-        ,"ref": {"type": "string", "pattern": "^s_[1-9][0-9]*$"}
-        ,"agent_id": {"type": "string", "pattern": "^agt_"}
-        ,"agent_ref": {"type": "string", "pattern": "^a_[1-9][0-9]*$"}
+        "type": {
+          "const": "side_deleted"
+        },
+        "id": {
+          "type": "string",
+          "pattern": "^side_[0-9A-HJKMNP-TV-Z]{26}$"
+        },
+        "ref": {
+          "type": "string",
+          "pattern": "^s_[1-9][0-9]*$"
+        },
+        "agent_id": {
+          "type": "string",
+          "pattern": "^agt_[0-9A-HJKMNP-TV-Z]{26}$"
+        },
+        "agent_ref": {
+          "type": "string",
+          "pattern": "^a_[1-9][0-9]*$"
+        }
       }
     },
     "ContextMeta": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["type", "agent_id", "message_count", "compacted_at"],
+      "required": [
+        "type",
+        "agent_id",
+        "message_count",
+        "compacted_at",
+        "agent_ref",
+        "agent_name"
+      ],
       "properties": {
-        "type": {"const": "context_meta"},
-        "agent_id": {"type": "string", "pattern": "^agt_"},
-        "message_count": {"type": "integer", "minimum": 0},
-        "compacted_at": {"$ref": "#/$defs/NullableTimestamp"}
+        "type": {
+          "const": "context_meta"
+        },
+        "agent_id": {
+          "type": "string",
+          "pattern": "^agt_[0-9A-HJKMNP-TV-Z]{26}$"
+        },
+        "message_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "compacted_at": {
+          "$ref": "#/$defs/NullableTimestamp"
+        },
+        "agent_ref": {
+          "type": "string",
+          "pattern": "^a_[1-9][0-9]*$"
+        },
+        "agent_name": {
+          "type": "string",
+          "minLength": 4,
+          "maxLength": 40
+        }
       }
     },
     "ModelMessage": {
       "type": "object",
-      "required": ["role"],
+      "required": [
+        "role"
+      ],
       "properties": {
-        "role": {"enum": ["system", "user", "assistant", "tool"]},
+        "role": {
+          "enum": [
+            "system",
+            "user",
+            "assistant",
+            "tool"
+          ]
+        },
         "content": {},
-        "tool_calls": {"type": "array"},
-        "tool_call_id": {"type": "string"}
+        "tool_calls": {
+          "type": "array"
+        },
+        "tool_call_id": {
+          "type": "string"
+        }
       },
       "additionalProperties": true
     },
     "AgentDeleted": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["type", "id", "ref"],
+      "required": [
+        "type",
+        "id",
+        "ref"
+      ],
       "properties": {
-        "type": {"const": "agent_deleted"},
-        "id": {"type": "string", "pattern": "^agt_"},
-        "ref": {"type": "string", "pattern": "^a_[1-9][0-9]*$"}
+        "type": {
+          "const": "agent_deleted"
+        },
+        "id": {
+          "type": "string",
+          "pattern": "^agt_[0-9A-HJKMNP-TV-Z]{26}$"
+        },
+        "ref": {
+          "type": "string",
+          "pattern": "^a_[1-9][0-9]*$"
+        }
       }
     },
     "ConfigValue": {
       "type": "object",
-      "required": ["type", "key", "default_value", "persisted_value", "local_effective_value", "local_source", "active_value", "active_source", "restart_required"],
+      "required": [
+        "type",
+        "key",
+        "default_value",
+        "persisted_value",
+        "local_effective_value",
+        "local_source",
+        "active_value",
+        "active_source",
+        "restart_required"
+      ],
       "properties": {
-        "type": {"const": "config_value"},
+        "type": {
+          "const": "config_value"
+        },
         "key": {
           "enum": [
-            "base-url", "model", "max-agents",
-            "context-token-budget", "tool-output-preview-bytes", "stall-notification-seconds"
+            "base-url",
+            "model",
+            "max-agents",
+            "context-token-budget",
+            "tool-output-preview-bytes",
+            "stall-notification-seconds"
           ]
         },
-        "default_value": {"type": ["string", "integer"]},
-        "persisted_value": {"type": ["string", "integer", "null"]},
-        "local_effective_value": {"type": ["string", "integer"]},
-        "local_source": {"type": "string"},
-        "active_value": {"type": ["string", "integer", "null"]},
-        "active_source": {"type": ["string", "null"]},
-        "restart_required": {"type": ["boolean", "null"]}
+        "default_value": {
+          "type": [
+            "string",
+            "integer"
+          ]
+        },
+        "persisted_value": {
+          "type": [
+            "string",
+            "integer",
+            "null"
+          ]
+        },
+        "local_effective_value": {
+          "type": [
+            "string",
+            "integer"
+          ]
+        },
+        "local_source": {
+          "type": "string"
+        },
+        "active_value": {
+          "type": [
+            "string",
+            "integer",
+            "null"
+          ]
+        },
+        "active_source": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "restart_required": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        }
       },
       "additionalProperties": false
+    },
+    "InboxAcknowledged": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "acknowledged_through",
+        "previous_acknowledged_through"
+      ],
+      "properties": {
+        "type": {
+          "const": "inbox_acknowledged"
+        },
+        "acknowledged_through": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "previous_acknowledged_through": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
     }
   }
 }

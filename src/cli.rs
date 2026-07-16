@@ -1,6 +1,7 @@
 use crate::{
     config::{
         CONFIG_KEYS, FileConfig, Paths, RuntimeConfig, ensure_private_dir, local_config_values,
+        read_daemon_lifecycle,
     },
     daemon,
     ipc::{AgentMode, ListFilter, PROTOCOL_VERSION, Request, coded_error, error_json_for},
@@ -103,7 +104,7 @@ enum MessagesCommand {
     #[command(about = "List durable messages for an agent.")]
     List {
         /// Agent a_N ref, agt_<ULID>, or exact name.
-        #[arg(value_name = "AGENT_ID", value_parser = parse_agent_id)]
+        #[arg(value_name = "AGENT", value_parser = parse_agent_id)]
         agent_id: String,
         #[arg(long = "status", value_parser = ["pending", "delivered", "cancelled"])]
         statuses: Vec<String>,
@@ -111,7 +112,7 @@ enum MessagesCommand {
     #[command(about = "Get one durable message.")]
     Status {
         /// Agent a_N ref, agt_<ULID>, or exact name.
-        #[arg(value_name = "AGENT_ID", value_parser = parse_agent_id)]
+        #[arg(value_name = "AGENT", value_parser = parse_agent_id)]
         agent_id: String,
         /// Message m_N ref or msg_<ULID>.
         #[arg(value_name = "MESSAGE_ID", value_parser = parse_message_id)]
@@ -120,7 +121,7 @@ enum MessagesCommand {
     #[command(about = "Cancel one pending message.")]
     Cancel {
         /// Agent a_N ref, agt_<ULID>, or exact name.
-        #[arg(value_name = "AGENT_ID", value_parser = parse_agent_id)]
+        #[arg(value_name = "AGENT", value_parser = parse_agent_id)]
         agent_id: String,
         /// Message m_N ref or msg_<ULID>.
         #[arg(value_name = "MESSAGE_ID", value_parser = parse_message_id)]
@@ -130,12 +131,14 @@ enum MessagesCommand {
 
 #[derive(Subcommand)]
 enum SidesCommand {
-    #[command(about = "Start a one-shot Side run and return its side_id immediately.")]
+    #[command(
+        about = "Start a one-shot Side run and return its short ref plus durable Side ID immediately."
+    )]
     Create(SideArgs),
     #[command(about = "List persisted Side runs for one parent Agent.")]
     List {
         /// Parent Agent a_N ref, agt_<ULID>, or exact name.
-        #[arg(value_name = "AGENT_ID", value_parser = parse_agent_id)]
+        #[arg(value_name = "AGENT", value_parser = parse_agent_id)]
         agent_id: String,
         #[arg(long = "status")]
         statuses: Vec<StatusArg>,
@@ -166,18 +169,22 @@ enum SidesCommand {
 
 #[derive(Subcommand)]
 enum AgentsCommand {
-    #[command(about = "Spawn a named agent and return its ID immediately.")]
+    #[command(
+        about = "Spawn a named agent and return its preferred short ref plus durable ID immediately."
+    )]
     Spawn(SpawnArgs),
     #[command(about = "List agents, newest first. Each JSONL line is one compact list item.")]
     List(ListArgs),
     #[command(about = "Get one agent metadata object.")]
     Status {
-        #[arg(value_name = "AGENT_ID", value_parser = parse_agent_id)]
+        /// Agent a_N ref, agt_<ULID>, or exact name.
+        #[arg(value_name = "AGENT", value_parser = parse_agent_id)]
         id: String,
     },
     #[command(about = "Wait until one Agent reaches a terminal state and emit its final metadata.")]
     Wait {
-        #[arg(value_name = "AGENT_ID", value_parser = parse_agent_id)]
+        /// Agent a_N ref, agt_<ULID>, or exact name.
+        #[arg(value_name = "AGENT", value_parser = parse_agent_id)]
         id: String,
         /// Optional bounded wait; timeout is a retryable daemon error.
         #[arg(long, value_name = "SECONDS", value_parser = parse_wait_timeout)]
@@ -186,6 +193,7 @@ enum AgentsCommand {
     #[command(about = "Rename an agent tracking label.")]
     Rename {
         /// Agent a_N ref, agt_<ULID>, or exact name.
+        #[arg(value_name = "AGENT", value_parser = parse_agent_id)]
         id: String,
         /// New unique display name (4 through 40 characters).
         name: String,
@@ -203,19 +211,22 @@ enum AgentsCommand {
     Side(SideArgs),
     #[command(about = "Set a working agent deadline to MINUTES from now (1..=6000).")]
     Time {
-        #[arg(value_name = "AGENT_ID", value_parser = parse_agent_id)]
+        /// Agent a_N ref, agt_<ULID>, or exact name.
+        #[arg(value_name = "AGENT", value_parser = parse_agent_id)]
         id: String,
         #[arg(value_parser = parse_minutes)]
         minutes: u64,
     },
     #[command(about = "Stop a working agent and all its terminal process groups.")]
     Stop {
-        #[arg(value_name = "AGENT_ID", value_parser = parse_agent_id)]
+        /// Agent a_N ref, agt_<ULID>, or exact name.
+        #[arg(value_name = "AGENT", value_parser = parse_agent_id)]
         id: String,
     },
     #[command(about = "Permanently delete a non-working agent history.")]
     Delete {
-        #[arg(value_name = "AGENT_ID", value_parser = parse_agent_id)]
+        /// Agent a_N ref, agt_<ULID>, or exact name.
+        #[arg(value_name = "AGENT", value_parser = parse_agent_id)]
         id: String,
     },
 }
@@ -320,6 +331,9 @@ struct ListArgs {
     /// Number of matching objects to skip.
     #[arg(long, default_value_t = 0)]
     offset: usize,
+    /// Continue after an opaque cursor from a previous list_summary.
+    #[arg(long, conflicts_with = "offset")]
+    after_cursor: Option<String>,
     /// Emit complete lifecycle, deadline, error, and activity diagnostics.
     #[arg(long)]
     verbose: bool,
@@ -331,7 +345,7 @@ struct ListArgs {
 )]
 struct AgentLogsArgs {
     /// Agent a_N ref, agt_<ULID>, or exact name.
-    #[arg(value_name = "AGENT_ID", value_parser = parse_agent_id)]
+    #[arg(value_name = "AGENT", value_parser = parse_agent_id)]
     id: String,
     /// Exact Event type to include; repeatable. Empty selects system/user/assistant messages.
     #[arg(long = "type", value_name = "EVENT_TYPE", value_parser = ["system_message", "user_message", "assistant_message", "reasoning", "tool_call", "tool_result", "lifecycle", "error"])]
@@ -380,7 +394,7 @@ struct SideLogsArgs {
 )]
 struct ContextArgs {
     /// Agent a_N ref, agt_<ULID>, or exact name.
-    #[arg(value_name = "AGENT_ID", value_parser = parse_agent_id)]
+    #[arg(value_name = "AGENT", value_parser = parse_agent_id)]
     id: String,
 }
 
@@ -391,7 +405,7 @@ struct ContextArgs {
 )]
 struct SendArgs {
     /// Agent a_N ref, agt_<ULID>, or exact name.
-    #[arg(value_name = "AGENT_ID", value_parser = parse_agent_id)]
+    #[arg(value_name = "AGENT", value_parser = parse_agent_id)]
     id: String,
     /// Inline user message. Conflicts with --message-file.
     #[arg(long)]
@@ -407,11 +421,11 @@ struct SendArgs {
 #[derive(Args)]
 #[command(
     group(clap::ArgGroup::new("input").required(true).multiple(false).args(["message", "message_file"])),
-    after_help="Start a durable one-shot readonly Side run and return side_created immediately. Inspect progress with sides status or sides logs. The Side trace never enters the parent transcript."
+    after_help="Start a durable one-shot readonly Side run and return side_created immediately. `subagent agents btw` is an exact alias for `subagent agents side`. Inspect progress with sides status or sides logs. The Side trace never enters the parent transcript."
 )]
 struct SideArgs {
-    /// Parent agent ID.
-    #[arg(value_name = "AGENT_ID", value_parser = parse_agent_id)]
+    /// Parent Agent a_N ref, agt_<ULID>, or exact name.
+    #[arg(value_name = "AGENT", value_parser = parse_agent_id)]
     id: String,
     /// Inline side question. Conflicts with --message-file.
     #[arg(long)]
@@ -441,9 +455,36 @@ struct InboxArgs {
     /// Minimum priority to include, from 1 through 5.
     #[arg(long, default_value_t = 2, value_parser = parse_priority)]
     priority: u8,
-    /// Include notifications for only this main agent ID.
-    #[arg(long, value_name = "AGENT_ID")]
+    /// Include notifications for only this Agent ref, durable ID, or exact name.
+    #[arg(long, value_name = "AGENT")]
     agent: Option<String>,
+    /// Include acknowledged notifications; plain inbox shows unread records only.
+    #[arg(long)]
+    all: bool,
+    #[command(subcommand)]
+    command: Option<InboxCommand>,
+}
+
+#[derive(Subcommand)]
+enum InboxCommand {
+    /// Acknowledge one notification and everything older.
+    Ack {
+        /// Notification sequence number or durable ntf_<ULID>.
+        #[arg(value_name = "SEQUENCE_OR_NOTIFICATION_ID")]
+        identifier: String,
+    },
+    /// Stream unread notifications as JSONL.
+    Follow {
+        /// Resume strictly after this notification sequence.
+        #[arg(long)]
+        after: Option<u64>,
+        /// Minimum priority to include, from 1 through 5.
+        #[arg(long, default_value_t = 2, value_parser = parse_priority)]
+        priority: u8,
+        /// Include notifications for only this Agent ref, durable ID, or exact name.
+        #[arg(long, value_name = "AGENT")]
+        agent: Option<String>,
+    },
 }
 
 pub async fn run() -> Result<()> {
@@ -480,13 +521,26 @@ async fn run_inner() -> Result<()> {
         TopCommand::Daemon(DaemonCommand::Stop) => request_unchecked(Request::DaemonStop).await,
         TopCommand::Config(command) => config_command(command).await,
         TopCommand::Inbox(args) => {
-            request(Request::Inbox {
-                limit: args.limit,
-                offset: args.offset,
-                minimum_priority: args.priority,
-                agent_id: args.agent,
-            })
-            .await
+            let request_value = match args.command {
+                Some(InboxCommand::Ack { identifier }) => Request::InboxAck { identifier },
+                Some(InboxCommand::Follow {
+                    after,
+                    priority,
+                    agent,
+                }) => Request::InboxFollow {
+                    after_sequence: after,
+                    minimum_priority: priority,
+                    agent_id: agent,
+                },
+                None => Request::Inbox {
+                    limit: args.limit,
+                    offset: args.offset,
+                    minimum_priority: args.priority,
+                    agent_id: args.agent,
+                    include_acknowledged: args.all,
+                },
+            };
+            request(request_value).await
         }
         TopCommand::Messages(command) => {
             let req = match command {
@@ -572,6 +626,7 @@ async fn run_inner() -> Result<()> {
                         order: a.order,
                         limit: a.limit,
                         offset: a.offset,
+                        after_cursor: a.after_cursor,
                         verbose: a.verbose,
                     },
                 },
@@ -789,19 +844,73 @@ async fn exchange(req: Request) -> Result<Vec<Value>> {
 
 async fn send_request(req: Request) -> Result<tokio::io::Lines<BufReader<UnixStream>>> {
     let paths = Paths::discover()?;
-    let mut stream = UnixStream::connect(paths.socket()).await.map_err(|_| {
-        coded_error(
-            "daemon_unavailable",
-            "daemon is not running; run 'subagent daemon start'",
-            json!({"socket":paths.socket()}),
-            true,
-        )
-    })?;
+    let mut stream = UnixStream::connect(paths.socket())
+        .await
+        .map_err(|_| daemon_connection_error(&paths))?;
     let mut body = serde_json::to_vec(&req)?;
     body.push(b'\n');
     stream.write_all(&body).await?;
     stream.shutdown().await?;
     Ok(BufReader::new(stream).lines())
+}
+
+fn daemon_connection_error(paths: &Paths) -> anyhow::Error {
+    if let Some(state) = read_daemon_lifecycle(paths).ok().flatten() {
+        if matches!(state.status.as_str(), "running" | "starting") && !process_is_alive(state.pid) {
+            return coded_error(
+                "daemon_crashed",
+                "the previously running daemon exited unexpectedly",
+                json!({
+                    "last_pid":state.pid,
+                    "last_status":state.status,
+                    "started_at":state.started_at,
+                    "last_state_at":state.updated_at,
+                    "version":state.version,
+                    "log_path":paths.daemon_log(),
+                    "failure_summary":daemon_failure_summary(paths),
+                }),
+                true,
+            );
+        }
+        if state.status == "stopped" {
+            return coded_error(
+                "daemon_stopped",
+                "daemon is stopped; run 'subagent daemon start'",
+                json!({
+                    "last_pid":state.pid,
+                    "stopped_at":state.updated_at,
+                    "version":state.version,
+                    "log_path":paths.daemon_log(),
+                }),
+                true,
+            );
+        }
+    }
+    coded_error(
+        "daemon_unavailable",
+        "daemon is not running; run 'subagent daemon start'",
+        json!({"socket":paths.socket(),"log_path":paths.daemon_log()}),
+        true,
+    )
+}
+
+fn process_is_alive(pid: u32) -> bool {
+    let result = unsafe { libc::kill(pid as i32, 0) };
+    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+fn daemon_failure_summary(paths: &Paths) -> Option<String> {
+    let body = fs::read_to_string(paths.daemon_log()).ok()?;
+    let mut summary = body
+        .lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())?
+        .trim()
+        .to_string();
+    if summary.chars().count() > 500 {
+        summary = summary.chars().take(500).collect();
+    }
+    Some(summary)
 }
 
 async fn read_message(inline: Option<String>, file: Option<String>) -> Result<String> {
@@ -890,7 +999,7 @@ fn parse_typed_id(value: &str, prefix: &str, label: &str) -> std::result::Result
 
 fn parse_agent_id(value: &str) -> std::result::Result<String, String> {
     if value.starts_with("agt_") {
-        parse_typed_id(value, "agt_", "AGENT_ID")
+        parse_typed_id(value, "agt_", "AGENT")
     } else if valid_local_ref(value, "a_")
         || (!value.trim().is_empty()
             && !["a_", "s_", "m_", "e_", "side_", "msg_", "evt_"]
@@ -900,7 +1009,7 @@ fn parse_agent_id(value: &str) -> std::result::Result<String, String> {
         Ok(value.to_string())
     } else {
         Err(format!(
-            "expected AGENT_ID, a local a_<number> reference, or an exact agent name; received {value}"
+            "expected AGENT, a local a_<number> reference, or an exact agent name; received {value}"
         ))
     }
 }

@@ -243,10 +243,20 @@ main {
 }
 .inbox-filters {
   display: grid;
-  grid-template-columns: repeat(3, minmax(150px, 1fr));
+  grid-template-columns: repeat(4, minmax(140px, 1fr));
   gap: 12px;
   padding-bottom: 14px;
   border-bottom: 1px solid var(--line);
+}
+.inbox-filters .inbox-checkbox {
+  align-content: end;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-bottom: 8px;
+}
+.inbox-filters .inbox-checkbox span {
+  color: var(--muted);
 }
 .inbox-filters label {
   display: grid;

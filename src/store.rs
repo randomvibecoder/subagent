@@ -3,6 +3,7 @@ use crate::{
     ipc::{AgentMode, ListFilter, coded_error},
 };
 use anyhow::{Context, Result, bail};
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -79,6 +80,8 @@ pub struct ActivityTelemetry {
     #[serde(default)]
     pub provider_request_id: Option<String>,
     #[serde(default)]
+    pub last_provider_request_id: Option<String>,
+    #[serde(default)]
     pub retry_count: u32,
     #[serde(default)]
     pub last_event_at: Option<DateTime<Utc>>,
@@ -88,6 +91,8 @@ pub struct ActivityTelemetry {
     pub last_tool_event_at: Option<DateTime<Utc>>,
     #[serde(default)]
     pub last_state_change_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub last_progress_at: Option<DateTime<Utc>>,
 }
 
 impl ActivityTelemetry {
@@ -96,6 +101,7 @@ impl ActivityTelemetry {
             current_phase: AgentPhase::Starting,
             phase_started_at: Some(now),
             last_state_change_at: Some(now),
+            last_progress_at: Some(now),
             ..Self::default()
         }
     }
@@ -312,14 +318,37 @@ pub struct NotificationRecord {
     pub priority: u8,
     pub status: AgentStatus,
     pub summary: String,
+    #[serde(default)]
+    pub acknowledged: bool,
 }
 
-fn apply_event_activity(activity: &mut ActivityTelemetry, event_type: &str, at: DateTime<Utc>) {
+fn apply_event_activity(
+    activity: &mut ActivityTelemetry,
+    event_type: &str,
+    data: &Value,
+    at: DateTime<Utc>,
+) {
     activity.last_event_at = Some(at);
     match event_type {
         "reasoning" | "assistant_message" | "tool_call" => activity.last_model_event_at = Some(at),
         "tool_result" => activity.last_tool_event_at = Some(at),
         _ => {}
+    }
+    let meaningful = match event_type {
+        "tool_call" => data.get("name").and_then(Value::as_str) != Some("write_stdin"),
+        "tool_result" if data.get("name").and_then(Value::as_str) == Some("write_stdin") => {
+            let result = data.get("result").unwrap_or(&Value::Null);
+            result.get("status").and_then(Value::as_str) == Some("completed")
+                || result
+                    .get("output")
+                    .and_then(Value::as_str)
+                    .is_some_and(|output| !output.is_empty())
+        }
+        "lifecycle" => data.get("reason").and_then(Value::as_str) != Some("deadline_updated"),
+        _ => true,
+    };
+    if meaningful {
+        activity.last_progress_at = Some(at);
     }
 }
 
@@ -329,6 +358,7 @@ pub struct InboxFilter {
     pub offset: usize,
     pub minimum_priority: u8,
     pub agent_id: Option<String>,
+    pub include_acknowledged: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -502,35 +532,32 @@ impl Store {
             }
             let mut meta: AgentMetadata = serde_json::from_slice(&fs::read(&path)?)?;
             let needs_migration = meta.last_message_sent_at.is_none()
-                || meta.last_message_delivered_at.is_none()
                 || meta.activity.phase_started_at.is_none()
-                || meta.activity.last_event_at.is_none();
-            if !needs_migration {
-                continue;
-            }
+                || meta.activity.last_event_at.is_none()
+                || meta.activity.last_progress_at.is_none();
             meta.last_message_sent_at
                 .get_or_insert(meta.last_message_at);
             let messages = fs::read(self.messages_path(&meta.id))
                 .ok()
                 .and_then(|body| serde_json::from_slice::<Vec<MessageRecord>>(&body).ok())
                 .unwrap_or_default();
-            meta.last_message_delivered_at = Some(
-                messages
-                    .iter()
-                    .filter_map(|message| message.delivered_at)
-                    .max()
-                    .unwrap_or(meta.spawned_at),
-            );
-            migrate_event_activity(&self.events_path(&meta.id), &mut meta.activity)?;
-            migrate_terminal_activity(
-                &meta.status,
-                meta.spawned_at,
-                meta.finished_at,
-                meta.stopped_at,
-                meta.failed_at,
-                &mut meta.activity,
-            );
-            self.save_metadata(&meta)?;
+            let delivered = messages
+                .iter()
+                .filter_map(|message| message.delivered_at)
+                .max();
+            if meta.last_message_delivered_at != delivered || needs_migration {
+                meta.last_message_delivered_at = delivered;
+                migrate_event_activity(&self.events_path(&meta.id), &mut meta.activity)?;
+                migrate_terminal_activity(
+                    &meta.status,
+                    meta.spawned_at,
+                    meta.finished_at,
+                    meta.stopped_at,
+                    meta.failed_at,
+                    &mut meta.activity,
+                );
+                self.save_metadata(&meta)?;
+            }
         }
         for entry in fs::read_dir(&self.sides_root)? {
             let path = entry?.path().join("metadata.json");
@@ -538,7 +565,10 @@ impl Store {
                 continue;
             }
             let mut meta: SideMetadata = serde_json::from_slice(&fs::read(&path)?)?;
-            if meta.activity.phase_started_at.is_some() && meta.activity.last_event_at.is_some() {
+            if meta.activity.phase_started_at.is_some()
+                && meta.activity.last_event_at.is_some()
+                && meta.activity.last_progress_at.is_some()
+            {
                 continue;
             }
             migrate_event_activity(
@@ -585,6 +615,9 @@ impl Store {
     }
     fn notification_sequence_path(&self) -> PathBuf {
         self.state_root.join("notification-sequence")
+    }
+    fn notification_ack_path(&self) -> PathBuf {
+        self.state_root.join("notification-acknowledged-through")
     }
     fn context_path(&self, id: &str) -> PathBuf {
         self.agent_dir(id).join("context.json")
@@ -913,7 +946,7 @@ impl Store {
         file.flush()?;
         let mut meta = self.load_metadata(id)?;
         meta.updated_at = event.timestamp;
-        apply_event_activity(&mut meta.activity, event_type, event.timestamp);
+        apply_event_activity(&mut meta.activity, event_type, &event.data, event.timestamp);
         self.save_metadata(&meta)?;
         Ok(event)
     }
@@ -1006,6 +1039,7 @@ impl Store {
             priority,
             status,
             summary: truncate_chars(summary.as_ref(), 5_000),
+            acknowledged: false,
         };
         let mut options = fs::OpenOptions::new();
         options.create(true).append(true);
@@ -1049,9 +1083,15 @@ impl Store {
             }
             retained.push_back(notification);
         }
+        let acknowledged_through = self.notification_acknowledged_through()?;
         Ok(retained
             .into_iter()
             .rev()
+            .map(|mut notification| {
+                notification.acknowledged = notification.sequence <= acknowledged_through;
+                notification
+            })
+            .filter(|notification| filter.include_acknowledged || !notification.acknowledged)
             .filter(|notification| notification.priority >= filter.minimum_priority)
             .filter(|notification| {
                 filter
@@ -1064,12 +1104,101 @@ impl Store {
             .collect())
     }
 
+    pub fn notification_acknowledged_through(&self) -> Result<u64> {
+        let path = self.notification_ack_path();
+        if !path.exists() {
+            return Ok(0);
+        }
+        Ok(fs::read_to_string(path)?.trim().parse()?)
+    }
+
+    pub fn acknowledge_notifications(&self, identifier: &str) -> Result<Value> {
+        let _guard = self.write_lock.lock().unwrap();
+        let sequence = if let Ok(sequence) = identifier.parse::<u64>() {
+            sequence
+        } else {
+            self.read_all_notifications()?
+                .into_iter()
+                .find(|notification| notification.id == identifier)
+                .map(|notification| notification.sequence)
+                .ok_or_else(|| {
+                    coded_error(
+                        "notification_not_found",
+                        format!("notification not found: {identifier}"),
+                        json!({"notification":identifier}),
+                        false,
+                    )
+                })?
+        };
+        let latest = fs::read_to_string(self.notification_sequence_path())
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+        if sequence == 0 || sequence > latest {
+            return Err(coded_error(
+                "invalid_argument",
+                "notification acknowledgement sequence is outside the journal",
+                json!({"sequence":sequence,"latest_sequence":latest}),
+                false,
+            ));
+        }
+        let previous = self.notification_acknowledged_through()?;
+        let acknowledged_through = previous.max(sequence);
+        write_private_atomic(
+            &self.notification_ack_path(),
+            acknowledged_through.to_string().as_bytes(),
+        )?;
+        Ok(json!({
+            "type":"inbox_acknowledged",
+            "acknowledged_through":acknowledged_through,
+            "previous_acknowledged_through":previous,
+        }))
+    }
+
+    pub fn notifications_after(
+        &self,
+        sequence: u64,
+        minimum_priority: u8,
+        agent_id: Option<&str>,
+    ) -> Result<Vec<NotificationRecord>> {
+        let acknowledged_through = self.notification_acknowledged_through()?;
+        let mut notifications = self.read_all_notifications()?;
+        notifications.retain(|notification| {
+            notification.sequence > sequence
+                && notification.sequence > acknowledged_through
+                && notification.priority >= minimum_priority
+                && agent_id.is_none_or(|id| notification.agent_id == id)
+        });
+        for notification in &mut notifications {
+            notification.acknowledged = false;
+        }
+        Ok(notifications)
+    }
+
+    fn read_all_notifications(&self) -> Result<Vec<NotificationRecord>> {
+        let path = self.notifications_path();
+        if !path.exists() {
+            return Ok(Vec::new());
+        }
+        BufReader::new(fs::File::open(path)?)
+            .lines()
+            .filter_map(|line| match line {
+                Ok(line) if !line.trim().is_empty() => {
+                    Some(serde_json::from_str(&line).map_err(Into::into))
+                }
+                Ok(_) => None,
+                Err(error) => Some(Err(error.into())),
+            })
+            .collect()
+    }
+
     fn compact_notifications_locked(&self) -> Result<()> {
         let notifications = self.list_notifications(&InboxFilter {
             limit: 10_000,
             offset: 0,
             minimum_priority: 1,
             agent_id: None,
+            include_acknowledged: true,
         })?;
         let mut body = Vec::new();
         for notification in notifications.into_iter().rev() {
@@ -1177,11 +1306,41 @@ impl Store {
         if filter.order != "asc" {
             out.reverse();
         }
+        if let Some(cursor) = filter.after_cursor.as_deref() {
+            let cursor = decode_list_cursor(cursor)?;
+            if cursor.sort != filter.sort || cursor.order != filter.order {
+                return Err(coded_error(
+                    "invalid_argument",
+                    "list cursor does not match the requested sort order",
+                    json!({"cursor_sort":cursor.sort,"cursor_order":cursor.order,"sort":filter.sort,"order":filter.order}),
+                    false,
+                ));
+            }
+            out.retain(|meta| {
+                let key = list_cursor_key(meta, &filter.sort);
+                if filter.order == "asc" {
+                    key > (cursor.value, cursor.id.clone())
+                } else {
+                    key < (cursor.value, cursor.id.clone())
+                }
+            });
+        }
         Ok(out
             .into_iter()
             .skip(filter.offset)
             .take(filter.limit)
             .collect())
+    }
+
+    pub fn list_cursor(&self, meta: &AgentMetadata, sort: &str, order: &str) -> Result<String> {
+        let (value, id) = list_cursor_key(meta, sort);
+        let cursor = ListCursor {
+            sort: sort.into(),
+            order: order.into(),
+            value,
+            id,
+        };
+        Ok(URL_SAFE_NO_PAD.encode(serde_json::to_vec(&cursor)?))
     }
 
     pub fn recover_interrupted(&self) -> Result<usize> {
@@ -1198,10 +1357,12 @@ impl Store {
                 meta.status = AgentStatus::Stopped;
                 meta.updated_at = now;
                 meta.stopped_at = Some(now);
+                meta.deadline_at = None;
                 meta.stop_reason = Some("daemon_interrupted".into());
                 meta.activity.current_phase = AgentPhase::Stopped;
                 meta.activity.phase_started_at = Some(now);
                 meta.activity.last_state_change_at = Some(now);
+                clear_recovered_request(&mut meta.activity);
                 self.save_metadata(&meta)?;
                 self.append_event(
                     &meta.id,
@@ -1301,7 +1462,7 @@ impl Store {
         file.write_all(b"\n")?;
         file.flush()?;
         meta.updated_at = event.timestamp;
-        apply_event_activity(&mut meta.activity, event_type, event.timestamp);
+        apply_event_activity(&mut meta.activity, event_type, &event.data, event.timestamp);
         self.save_side_metadata(&meta)?;
         Ok(event)
     }
@@ -1354,6 +1515,7 @@ impl Store {
                 meta.activity.current_phase = AgentPhase::Stopped;
                 meta.activity.phase_started_at = Some(now);
                 meta.activity.last_state_change_at = Some(now);
+                clear_recovered_request(&mut meta.activity);
                 self.save_side_metadata(&meta)?;
                 self.append_side_event(
                     &id,
@@ -1439,7 +1601,7 @@ fn migrate_event_activity(path: &Path, activity: &mut ActivityTelemetry) -> Resu
             continue;
         }
         if let Ok(event) = serde_json::from_str::<EventRecord>(&line) {
-            apply_event_activity(activity, &event.event_type, event.timestamp);
+            apply_event_activity(activity, &event.event_type, &event.data, event.timestamp);
         }
     }
     Ok(())
@@ -1463,6 +1625,17 @@ fn migrate_terminal_activity(
     activity.phase_started_at.get_or_insert(changed_at);
     activity.last_state_change_at.get_or_insert(changed_at);
     activity.last_event_at.get_or_insert(created_at);
+    if *status != AgentStatus::Working {
+        clear_recovered_request(activity);
+    }
+}
+
+fn clear_recovered_request(activity: &mut ActivityTelemetry) {
+    if activity.last_provider_request_id.is_none() {
+        activity.last_provider_request_id = activity.provider_request_id.clone();
+    }
+    activity.request_started_at = None;
+    activity.provider_request_id = None;
 }
 
 fn matches_filter(m: &AgentMetadata, f: &ListFilter) -> Result<bool> {
@@ -1504,6 +1677,46 @@ fn compare_meta(a: &AgentMetadata, b: &AgentMetadata, key: &str) -> Ordering {
         _ => a.spawned_at.cmp(&b.spawned_at),
     }
     .then_with(|| a.id.cmp(&b.id))
+}
+
+#[derive(Serialize, Deserialize)]
+struct ListCursor {
+    sort: String,
+    order: String,
+    value: Option<(i64, u32)>,
+    id: String,
+}
+
+fn list_cursor_key(meta: &AgentMetadata, sort: &str) -> (Option<(i64, u32)>, String) {
+    let value = match sort {
+        "updated_at" => Some(timestamp_key(meta.updated_at)),
+        "finished_at" => meta.finished_at.map(timestamp_key),
+        _ => Some(timestamp_key(meta.spawned_at)),
+    };
+    (value, meta.id.clone())
+}
+
+fn timestamp_key(time: DateTime<Utc>) -> (i64, u32) {
+    (time.timestamp(), time.timestamp_subsec_nanos())
+}
+
+fn decode_list_cursor(value: &str) -> Result<ListCursor> {
+    let decoded = URL_SAFE_NO_PAD.decode(value).map_err(|_| {
+        coded_error(
+            "invalid_argument",
+            "invalid agent list cursor",
+            json!({"cursor":value}),
+            false,
+        )
+    })?;
+    serde_json::from_slice(&decoded).map_err(|_| {
+        coded_error(
+            "invalid_argument",
+            "invalid agent list cursor",
+            json!({"cursor":value}),
+            false,
+        )
+    })
 }
 
 fn truncate_chars(value: &str, maximum: usize) -> String {
@@ -1683,9 +1896,41 @@ mod name_tests {
                 offset: 0,
                 minimum_priority: 2,
                 agent_id: Some(agent.id.clone()),
+                include_acknowledged: false,
             })
             .unwrap();
         assert_eq!(inbox[0].id, notification.id);
+        let acknowledgement = store.acknowledge_notifications(&notification.id).unwrap();
+        assert_eq!(
+            acknowledgement["acknowledged_through"],
+            notification.sequence
+        );
+        assert!(
+            store
+                .list_notifications(&InboxFilter {
+                    limit: 10,
+                    offset: 0,
+                    minimum_priority: 1,
+                    agent_id: Some(agent.id.clone()),
+                    include_acknowledged: false,
+                })
+                .unwrap()
+                .is_empty()
+        );
+        let newer = store
+            .append_notification(
+                &agent.id,
+                "progress",
+                1,
+                AgentStatus::Finished,
+                "new progress",
+            )
+            .unwrap();
+        let followed = store
+            .notifications_after(notification.sequence, 1, Some(&agent.id))
+            .unwrap();
+        assert_eq!(followed.len(), 1);
+        assert_eq!(followed[0].id, newer.id);
         store.delete_sides_for_agent(&agent.id).unwrap();
         assert!(!store.side_dir(&side.id).exists());
         assert!(
@@ -1695,6 +1940,7 @@ mod name_tests {
                     offset: 0,
                     minimum_priority: 1,
                     agent_id: Some(agent.id.clone()),
+                    include_acknowledged: true,
                 })
                 .unwrap()
                 .is_empty()
@@ -1729,6 +1975,7 @@ mod name_tests {
                     priority: 1,
                     status: AgentStatus::Working,
                     summary: sequence.to_string(),
+                    acknowledged: false,
                 },
             )
             .unwrap();
@@ -1741,6 +1988,7 @@ mod name_tests {
                 offset: 0,
                 minimum_priority: 1,
                 agent_id: None,
+                include_acknowledged: true,
             })
             .unwrap();
         assert_eq!(inbox.len(), 10_000);

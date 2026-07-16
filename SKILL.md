@@ -6,7 +6,7 @@ description: Use the subagent JSONL CLI to install, configure, start, monitor, m
 # Subagent CLI
 
 Use subagent to run coding agents through a detached per-user daemon. Background work
-returns an ID immediately. Every operational response is UTF-8 JSONL: one object per
+returns a preferred short ref plus durable ID immediately. Every operational response is UTF-8 JSONL: one object per
 line, never a top-level array. Help and version output are plain text.
 
 For exact input grammar, output schemas, lifecycle, errors, tools, and edge behavior,
@@ -83,7 +83,7 @@ subagent agents spawn \
 Output is one Agent. Prefer its short local `ref`; retain `id` for exports and external integrations:
 
 ~~~json
-{"type":"agent","id":"agt_...","ref":"a_1","dir":"/home/me/project","status":"working","spawned_at":"2026-07-10T12:00:00Z","last_message_at":"2026-07-10T12:00:00Z","updated_at":"2026-07-10T12:00:00Z"}
+{"type":"agent","id":"agt_...","ref":"a_1","name":"Website","dir":"/home/me/project","status":"working","spawned_at":"2026-07-10T12:00:00Z","last_message_at":"2026-07-10T12:00:00Z","updated_at":"2026-07-10T12:00:00Z"}
 ~~~
 
 The actual Agent contains every field defined in the schema reference.
@@ -98,7 +98,7 @@ Each match is one compact agent_list_item line followed by a `list_summary`. Zer
 
 ~~~json
 {"type":"agent_list_item","id":"agt_1...","ref":"a_1","name":"Website","status":"working","model":"gpt-5.4-mini","current_phase":"requesting_model","last_event_at":"...","dir":"/home/me/project","mode":"readonly","spawned_at":"...","last_message_at":"...","updated_at":"...","run_number":1,"working_sides":0}
-{"type":"list_summary","resource":"agents","count":1}
+{"type":"list_summary","resource":"agents","count":1,"next_cursor":null}
 ~~~
 
 Inspect one:
@@ -124,8 +124,8 @@ subagent inbox
 subagent inbox --agent a_1 --priority 3 --limit 50 --offset 0
 ~~~
 
-Inbox emits durable Notifications newest-first, one per line. The default is the
-newest 20 entries at priority 2 or higher. Agents publish meaningful progress,
+Inbox emits unread durable Notifications newest-first, one per line. The default is
+the newest 20 unread entries at priority 2 or higher. Agents publish meaningful progress,
 milestones, requests for input, and blockers; spawn, resume, finish, stop, and failure
 notifications are automatic. This is the recommended master-agent view because it
 avoids importing transcripts, code, tool calls, and tool results into the master's
@@ -188,31 +188,31 @@ subagent agents list
     [--spawned-after RFC3339] [--spawned-before RFC3339]
     [--finished-after RFC3339] [--finished-before RFC3339]
     [--sort spawned_at|updated_at|finished_at]
-    [--order asc|desc] [--limit N] [--offset N] [--verbose]
+    [--order asc|desc] [--limit N] [--offset N | --after-cursor CURSOR] [--verbose]
 
-subagent agents status AGENT_ID
-subagent agents wait AGENT_ID [--timeout-seconds SECONDS]
-subagent agents rename AGENT_ID NEW_NAME
+subagent agents status AGENT
+subagent agents wait AGENT [--timeout-seconds SECONDS]
+subagent agents rename AGENT NEW_NAME
 
-subagent agents logs AGENT_ID
+subagent agents logs AGENT
     [--type EVENT_TYPE]... [--all]
     [--after EVENT_ID] [--limit N] [--follow]
 
-subagent agents context AGENT_ID
+subagent agents context AGENT
 
-subagent agents send AGENT_ID
+subagent agents send AGENT
     (--message TEXT | --message-file PATH) [--wall-time-minutes MINUTES]
 
-subagent agents side AGENT_ID
+subagent agents side AGENT
     (--message TEXT | --message-file PATH) [--model MODEL]
     [--wall-time-minutes MINUTES]
 
-subagent agents time AGENT_ID MINUTES
-subagent agents stop AGENT_ID
-subagent agents delete AGENT_ID
+subagent agents time AGENT MINUTES
+subagent agents stop AGENT
+subagent agents delete AGENT
 ~~~
 
-Spawn returns immediately with an Agent ID. Relative paths resolve from DIR; absolute
+Spawn returns immediately with a preferred a_N ref and durable Agent ID. Relative paths resolve from DIR; absolute
 paths, .., and escaping symlinks are permitted because DIR is a working directory, not
 a security boundary.
 
@@ -223,16 +223,19 @@ receipt. MINUTES is an integer from 1 through 6000; omission means no deadline.
 Each agent_list_item also contains working_sides, from zero through two.
 Compact list output includes model, current_phase, and last_event_at. `--verbose`
 emits the full Agent telemetry plus working_sides and seconds_since_last_event.
+The final agent list_summary contains a nullable `next_cursor`; pass a non-null value
+back through `--after-cursor` for keyset pagination. Offset remains available for
+compatibility but is less stable during concurrent updates.
 MODEL overrides the daemon default only for the new Agent and remains attached across
 resumed runs. Omit it to use the daemon default.
 
 ### Sides
 
 ~~~text
-subagent sides create AGENT_ID
+subagent sides create AGENT
     (--message TEXT | --message-file PATH) [--model MODEL]
     [--wall-time-minutes MINUTES]
-subagent sides list AGENT_ID
+subagent sides list AGENT
     [--status working|finished|stopped|failed]... [--limit N] [--offset N]
 subagent sides status SIDE_ID
 subagent sides logs SIDE_ID
@@ -253,11 +256,14 @@ Agent timestamps:
 - spawned_at: creation time.
 - last_message_at and last_message_sent_at: latest daemon acceptance of a user message.
 - last_message_delivered_at: latest message actually consumed by the model loop.
+- run_started_at: start of the current run.
 - updated_at: latest consumed message, model/tool activity, deadline change, or state
 transition.
 
-Working status includes `current_phase`, request/model/tool activity timestamps,
-`provider_request_id`, and `retry_count`. A daemon watchdog emits one deduplicated
+Working status includes `current_phase`, active request telemetry, historical
+`last_provider_request_id`, `last_progress_at`, model/tool timestamps, and
+`retry_count`. Active `request_started_at` and `provider_request_id` are null outside
+requesting_model/retrying_model. A daemon watchdog emits one deduplicated
 `possible_stall` notification after 180 seconds without progress by default. Configure
 `stall-notification-seconds`; zero disables it. The watchdog diagnoses but never stops
 or resumes work.
@@ -269,19 +275,24 @@ new Side.
 
 ~~~text
 subagent inbox [--limit N] [--offset N] [--priority 1|2|3|4|5]
-    [--agent AGENT_ID]
+    [--agent AGENT] [--all]
+subagent inbox ack SEQUENCE_OR_NOTIFICATION_ID
+subagent inbox follow [--after SEQUENCE] [--priority 1|2|3|4|5]
+    [--agent AGENT]
 ~~~
 
-Output is Notification JSONL, newest first. limit defaults 20 and accepts 1–100;
+Plain output is unread Notification JSONL, newest first. limit defaults 20 and accepts 1–100;
 offset defaults zero. priority is a minimum threshold, defaults 2, and therefore
-`--priority 3` includes priorities 3, 4, and 5. agent filters by the main Agent ID and
-also includes its Side notifications. The journal exposes its newest 10,000 entries.
-There is no follow, wait, read/unread, or acknowledgement state.
+`--priority 3` includes priorities 3, 4, and 5. agent accepts a ref, durable ID, or
+exact name and also includes its Side notifications. `--all` includes acknowledged
+history. ack durably marks the selected notification and every older sequence
+handled; the watermark never moves backward. follow emits matching unread history
+oldest-first and then flushes new JSONL until disconnected. The journal exposes its
+newest 10,000 entries.
 
 Priority meanings are: 1 routine progress, 2 milestone/finish, 3 input required or
 stop, 4 blocker/failure, and 5 reserved critical severity. Natural finish summary is
 the final Agent message, capped at 5,000 Unicode scalar values.
-- run_started_at: start of the current run.
 
 ### Log types
 
@@ -300,7 +311,7 @@ tool_result, lifecycle, and error.
 agents context dumps the complete current persisted model context. Its first line is:
 
 ~~~json
-{"type":"context_meta","agent_id":"agt_...","message_count":42,"compacted_at":"RFC3339|null"}
+{"type":"context_meta","agent_id":"agt_...","agent_ref":"a_1","agent_name":"Website","message_count":42,"compacted_at":"RFC3339|null"}
 ~~~
 
 Remaining lines are unchanged model messages:
@@ -328,9 +339,9 @@ compacted. Use agents logs --all for persisted Event history.
 ### Durable messages
 
 ~~~text
-subagent messages list AGENT_ID [--status pending|delivered|cancelled]...
-subagent messages status AGENT_ID MESSAGE_ID
-subagent messages cancel AGENT_ID MESSAGE_ID
+subagent messages list AGENT [--status pending|delivered|cancelled]...
+subagent messages status AGENT MESSAGE_ID
+subagent messages cancel AGENT MESSAGE_ID
 ~~~
 
 List emits one Message per line followed by `list_summary`. Cancel works only while pending. Delivery is FIFO.
@@ -382,7 +393,8 @@ reverts the working directory, project files, Git state, commits, or branches.
 - End active work: agents stop.
 - Remove daemon history: agents delete only with explicit authorization.
 
-The binary reports `version` and `protocol_version` in daemon status. Operational CLI
+The v0.1.5 contract uses `protocol_version:2`. The binary reports `version` and
+`protocol_version` in daemon status. Operational CLI
 commands reject an incompatible running daemon with `protocol_mismatch`; restart the
 daemon after replacing the binary. The latest binary, this skill, the protocol
 reference, and the JSON Schema form one contract.

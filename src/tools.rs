@@ -10,7 +10,10 @@ use std::{
     io::{BufRead, BufReader, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     process::Stdio,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use tokio::{
@@ -438,6 +441,8 @@ struct TerminalSession {
     output_ref: String,
     cursor: Mutex<u64>,
     exit_code: Mutex<Option<i32>>,
+    cancelled: AtomicBool,
+    cancellation: tokio::sync::Notify,
 }
 
 impl TerminalManager {
@@ -492,29 +497,39 @@ impl TerminalManager {
             output_ref: output_ref.clone(),
             cursor: Mutex::new(0),
             exit_code: Mutex::new(None),
+            cancelled: AtomicBool::new(false),
+            cancellation: tokio::sync::Notify::new(),
         });
         self.sessions
             .lock()
             .unwrap()
             .insert(id.clone(), session.clone());
+        let waiter_session = session.clone();
         tokio::spawn(async move {
             let code = child.wait().await.ok().and_then(|s| s.code()).unwrap_or(-1);
-            *session.exit_code.lock().unwrap() = Some(code);
+            *waiter_session.exit_code.lock().unwrap() = Some(code);
         });
-        tokio::time::sleep(Duration::from_millis(yield_ms)).await;
-        let status = *self
-            .sessions
-            .lock()
-            .unwrap()
-            .get(&id)
-            .unwrap()
-            .exit_code
-            .lock()
-            .unwrap();
-        let output = read_preview(
-            &self.sessions.lock().unwrap().get(&id).unwrap().output_path,
-            preview_bytes,
-        )?;
+        if !session.cancelled.load(Ordering::Acquire) {
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(yield_ms)) => {}
+                _ = session.cancellation.notified() => {}
+            }
+        }
+        let status = *session.exit_code.lock().unwrap();
+        let cancelled = session.cancelled.load(Ordering::Acquire);
+        let output = read_preview(&session.output_path, preview_bytes)?;
+        if cancelled {
+            self.sessions.lock().unwrap().remove(&id);
+            return Ok(json!({
+                "ok":false,
+                "status":"cancelled",
+                "terminal_id":id,
+                "exit_code":status,
+                "output":output,
+                "output_ref":output_ref,
+                "truncated":output.truncated,
+            }));
+        }
         if let Some(exit_code) = status {
             self.sessions.lock().unwrap().remove(&id);
             Ok(
@@ -570,6 +585,8 @@ impl TerminalManager {
     pub async fn terminate(&self, id: &str) -> bool {
         let session = self.sessions.lock().unwrap().remove(id);
         if let Some(s) = session {
+            s.cancelled.store(true, Ordering::Release);
+            s.cancellation.notify_waiters();
             terminate_group(s.pid).await;
             true
         } else {
@@ -586,6 +603,8 @@ impl TerminalManager {
             .map(|(_, s)| s)
             .collect();
         for s in sessions {
+            s.cancelled.store(true, Ordering::Release);
+            s.cancellation.notify_waiters();
             terminate_group(s.pid).await;
         }
     }
@@ -939,5 +958,37 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(output.content["content"], "2345");
+    }
+
+    #[tokio::test]
+    async fn cancelling_during_exec_yield_returns_without_panic() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = runtime(&temp);
+        let terminals = runtime.terminals.clone();
+        let store = runtime.store.clone();
+        let cwd = runtime.cwd.clone();
+        let task = tokio::spawn(async move {
+            terminals
+                .exec(
+                    "sleep 30".into(),
+                    cwd,
+                    30_000,
+                    false,
+                    &store,
+                    "agt_test",
+                    1024,
+                )
+                .await
+                .unwrap()
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        runtime.terminals.terminate_all().await;
+        let result = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("cancelled exec should wake before yield timeout")
+            .unwrap();
+        assert_eq!(result["status"], "cancelled");
+        assert_eq!(result["ok"], false);
+        assert_eq!(runtime.terminals.list()["count"], 0);
     }
 }

@@ -66,6 +66,8 @@ pub async fn start(
         .route("/assets/app.js", get(js))
         .route("/api/agents", get(list_agents).post(spawn_agent))
         .route("/api/inbox", get(inbox))
+        .route("/api/inbox/ack/{identifier}", post(ack_inbox))
+        .route("/api/inbox/follow", get(follow_inbox))
         .route("/api/agents/{id}", get(agent_status).delete(delete_agent))
         .route("/api/agents/{id}/rename", post(rename_agent))
         .route("/api/agents/{id}/events", get(agent_events))
@@ -246,6 +248,8 @@ struct InboxQuery {
     offset: Option<usize>,
     priority: Option<u8>,
     agent: Option<String>,
+    all: Option<bool>,
+    after: Option<u64>,
 }
 
 async fn inbox(
@@ -272,18 +276,75 @@ async fn inbox(
             false,
         )));
     }
+    let agent_id = query
+        .agent
+        .filter(|value| !value.is_empty())
+        .map(|value| state.store.resolve_agent_id(&value))
+        .transpose()?;
     let values = state
         .store
         .list_notifications(&InboxFilter {
             limit,
             offset: query.offset.unwrap_or(0),
             minimum_priority: priority,
-            agent_id: query.agent.filter(|value| !value.is_empty()),
+            agent_id,
+            include_acknowledged: query.all.unwrap_or(false),
         })?
         .into_iter()
         .map(serde_json::to_value)
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(ndjson(values))
+}
+
+async fn ack_inbox(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Path(identifier): Path<String>,
+) -> ApiResult<Json<Value>> {
+    authorize(&state, &headers, true)?;
+    Ok(Json(state.store.acknowledge_notifications(&identifier)?))
+}
+
+async fn follow_inbox(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Query(query): Query<InboxQuery>,
+) -> ApiResult<Sse<impl futures_util::Stream<Item = std::result::Result<Event, Infallible>>>> {
+    authorize(&state, &headers, false)?;
+    let minimum_priority = query.priority.unwrap_or(2);
+    if !(1..=5).contains(&minimum_priority) {
+        return Err(ApiError(coded_error(
+            "invalid_argument",
+            "priority must be from 1 through 5",
+            json!({"field":"priority"}),
+            false,
+        )));
+    }
+    let mut after = query
+        .after
+        .unwrap_or(state.store.notification_acknowledged_through()?);
+    let agent_id = query
+        .agent
+        .filter(|value| !value.is_empty())
+        .map(|value| state.store.resolve_agent_id(&value))
+        .transpose()?;
+    let output = stream! {
+        loop {
+            let notifications = state
+                .store
+                .notifications_after(after, minimum_priority, agent_id.as_deref())
+                .unwrap_or_default();
+            for notification in notifications {
+                after = after.max(notification.sequence);
+                yield Ok(Event::default()
+                    .id(notification.sequence.to_string())
+                    .event("notification")
+                    .data(serde_json::to_string(&notification).unwrap()));
+            }
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+    };
+    Ok(Sse::new(output).keep_alive(axum::response::sse::KeepAlive::default()))
 }
 
 #[derive(Deserialize)]
@@ -731,9 +792,7 @@ async fn cancel_message(
 }
 
 fn agent_value(meta: crate::store::AgentMetadata) -> Result<Value> {
-    let mut value = serde_json::to_value(meta)?;
-    value.as_object_mut().unwrap().remove("name");
-    Ok(value)
+    Ok(serde_json::to_value(meta)?)
 }
 
 #[cfg(test)]
