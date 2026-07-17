@@ -79,7 +79,13 @@ class Handler(BaseHTTPRequestHandler):
         if latest_user.startswith("DEMO_") and not has_tool_result:
             time.sleep(12)
 
-        if "EMPTY_TWICE" in latest_user:
+        if "You compact context for a long-running coding agent" in system_text:
+            deltas = [
+                {
+                    "content": "The agent is completing a context-compaction test. Preserve the original objective and continue from the retained recent messages."
+                }
+            ]
+        elif "EMPTY_TWICE" in latest_user:
             deltas = []
         elif "EMPTY_ONCE" in latest_user:
             if "previous response contained no assistant content" in system_text:

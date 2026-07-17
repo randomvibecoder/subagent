@@ -6,6 +6,7 @@ pub const AGENT_READONLY: &str = include_str!("../prompts/agent-readonly.md");
 pub const AGENT_WRITE: &str = include_str!("../prompts/agent-write.md");
 pub const SIDE: &str = include_str!("../prompts/side.md");
 pub const CONTEXT_COMPACTION: &str = include_str!("../prompts/context-compaction.md");
+pub const CONTEXT_SUMMARY_REQUEST: &str = include_str!("../prompts/context-summary-request.md");
 pub const EMPTY_COMPLETION_RETRY: &str = include_str!("../prompts/empty-completion-retry.md");
 
 pub fn render(template: &str, values: &[(&str, &str)]) -> Result<String> {
@@ -71,6 +72,7 @@ mod tests {
         render(AGENT_WRITE, &[]).unwrap();
         render(SIDE, &[("working_directory", "/tmp/work")]).unwrap();
         render(CONTEXT_COMPACTION, &[("summary", "older work")]).unwrap();
+        render(CONTEXT_SUMMARY_REQUEST, &[("target_words", "750")]).unwrap();
         render(EMPTY_COMPLETION_RETRY, &[]).unwrap();
     }
 }

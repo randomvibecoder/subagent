@@ -971,7 +971,6 @@ impl AgentManager {
         }
         let mut context = self.store.load_context(id)?;
         make_side_snapshot_valid(&mut context);
-        compact_context(&mut context, self.cfg.file.context_token_budget);
         let inherited_context_messages = context.messages.len();
         let side_system_prompt =
             prompts::render(prompts::SIDE, &[("working_directory", meta.dir.as_str())])?;
@@ -1361,7 +1360,43 @@ async fn run_side(
         if *stop.borrow() {
             return Ok(());
         }
-        compact_context(&mut context, cfg.file.context_token_budget);
+        if context_needs_compaction(&context, cfg.file.context_token_budget) {
+            begin_side_model_request(&store, &side.id)?;
+            let mut last_activity_write = None;
+            let compaction = compact_context(
+                &client,
+                &mut context,
+                cfg.file.context_token_budget,
+                |progress| {
+                    record_side_model_progress(&store, &side.id, progress, &mut last_activity_write)
+                },
+            );
+            let changed = if let Some(deadline) = side.deadline_at {
+                let remaining = (deadline - Utc::now())
+                    .to_std()
+                    .unwrap_or(std::time::Duration::ZERO);
+                tokio::select! {
+                    _ = stop.changed() => return Ok(()),
+                    result = tokio::time::timeout(remaining, compaction) => match result {
+                        Ok(value) => value?,
+                        Err(_) => {
+                            let _owner = owner_lock.lock().await;
+                            mark_side_stopped(&store, &side.id, "wall_time")?;
+                            return Ok(());
+                        }
+                    }
+                }
+            } else {
+                tokio::select! {
+                    _ = stop.changed() => return Ok(()),
+                    result = compaction => result?,
+                }
+            };
+            complete_side_model_request(&store, &side.id)?;
+            if changed {
+                store.save_side_context(&side.id, &context)?;
+            }
+        }
         begin_side_model_request(&store, &side.id)?;
         let mut last_activity_write = None;
         let completion = client.complete_observed(&context.messages, &defs, |progress| {
@@ -1547,8 +1582,49 @@ async fn run_worker(
             let _operation = operations.lock().unwrap();
             deliver_pending_messages(&store, &meta.id, &mut context)?;
         }
-        compact_context(&mut context, cfg.file.context_token_budget);
-        store.save_context(&meta.id, &context)?;
+        if context_needs_compaction(&context, cfg.file.context_token_budget) {
+            begin_agent_model_request(&store, &meta.id)?;
+            let mut last_activity_write = None;
+            let changed = {
+                let compaction = compact_context(
+                    &client,
+                    &mut context,
+                    cfg.file.context_token_budget,
+                    |progress| {
+                        record_agent_model_progress(
+                            &store,
+                            &meta.id,
+                            progress,
+                            &mut last_activity_write,
+                        )
+                    },
+                );
+                tokio::pin!(compaction);
+                loop {
+                    tokio::select! {
+                        result = &mut compaction => break result?,
+                        changed = stop_rx.changed() => {
+                            if changed.is_ok() && *stop_rx.borrow() {
+                                terminals.terminate_all().await?;
+                                return Ok(());
+                            }
+                        },
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {
+                            if deadline.lock().unwrap().is_some_and(|d| Utc::now() >= d) {
+                                terminals.terminate_all().await?;
+                                let _owner = owner_lock.lock().await;
+                                mark_stopped(&store, &meta.id, "wall_time")?;
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+            };
+            complete_agent_model_request(&store, &meta.id)?;
+            if changed {
+                store.save_context(&meta.id, &context)?;
+            }
+        }
         if *stop_rx.borrow() {
             terminals.terminate_all().await?;
             return Ok(());
@@ -1940,69 +2016,134 @@ fn deadline_from_minutes(v: Option<u64>) -> Result<Option<chrono::DateTime<Utc>>
     }
 }
 
-fn compact_context(context: &mut ContextSnapshot, budget: usize) {
-    if estimated_tokens(&context.messages) <= budget {
-        return;
+fn context_needs_compaction(context: &ContextSnapshot, budget: usize) -> bool {
+    estimated_tokens(&context.messages) > budget
+}
+
+async fn compact_context(
+    client: &OpenAiClient,
+    context: &mut ContextSnapshot,
+    budget: usize,
+    mut progress: impl FnMut(ModelProgress) -> Result<()>,
+) -> Result<bool> {
+    if !context_needs_compaction(context, budget) {
+        return Ok(false);
     }
-    let len = context.messages.len();
-    for msg in context.messages.iter_mut().take(len.saturating_sub(8)) {
-        if msg.get("role").and_then(Value::as_str) == Some("tool")
-            && let Some(obj) = msg.as_object_mut()
-        {
-            let compact = obj
-                .get("content")
-                .and_then(Value::as_str)
-                .and_then(|content| serde_json::from_str::<Value>(content).ok())
-                .and_then(|content| content.get("output_ref").cloned())
-                .map(|output_ref| {
-                    json!({"omitted":true,"output_ref":output_ref,"hint":"use read_output"})
-                        .to_string()
-                })
-                .unwrap_or_else(|| "[older tool output omitted]".to_string());
-            obj.insert("content".into(), Value::String(compact));
+    let Some(cut) = compaction_boundary(&context.messages) else {
+        return Err(coded_error(
+            "context_compaction_failed",
+            "context exceeds its budget but cannot be split at a safe turn boundary",
+            json!({"estimated_tokens":estimated_tokens(&context.messages),"budget":budget}),
+            false,
+        ));
+    };
+    let earlier = context.messages[1..cut].to_vec();
+    let retained = context.messages[cut..].to_vec();
+    let target_tokens = (budget / 10).clamp(128, 4_000);
+    let target_words = (target_tokens * 3 / 4).max(96).to_string();
+    let request_prompt = prompts::render(
+        prompts::CONTEXT_SUMMARY_REQUEST,
+        &[("target_words", target_words.as_str())],
+    )?;
+    let mut summary_messages = Vec::with_capacity(earlier.len() + 2);
+    summary_messages.push(json!({"role":"system","content":request_prompt}));
+    summary_messages.extend(earlier);
+    summary_messages.push(json!({
+        "role":"user",
+        "content":"Produce the compacted handoff now. Output only the summary text."
+    }));
+    let turn = client
+        .complete_text_observed(&summary_messages, &mut progress)
+        .await?;
+    let mut summary = turn.content.trim().to_string();
+    if summary.is_empty() {
+        return Err(coded_error(
+            "context_compaction_failed",
+            "the context summarization request returned empty content",
+            json!({"estimated_tokens":estimated_tokens(&context.messages),"budget":budget}),
+            true,
+        ));
+    }
+
+    let mut replacement = compacted_messages(&context.messages[0], &summary, &retained)?;
+    if estimated_tokens(&replacement) > budget || summary.len() / 4 > target_tokens {
+        let tighter_words = (target_words.parse::<usize>().unwrap_or(96) / 2)
+            .max(64)
+            .to_string();
+        let tighter_prompt = prompts::render(
+            prompts::CONTEXT_SUMMARY_REQUEST,
+            &[("target_words", tighter_words.as_str())],
+        )?;
+        let compression_request = vec![
+            json!({"role":"system","content":tighter_prompt}),
+            json!({"role":"user","content":summary}),
+            json!({"role":"user","content":"Compress this handoff further. Output only the summary text."}),
+        ];
+        let turn = client
+            .complete_text_observed(&compression_request, &mut progress)
+            .await?;
+        summary = turn.content.trim().to_string();
+        if summary.is_empty() {
+            return Err(coded_error(
+                "context_compaction_failed",
+                "the tighter context summarization request returned empty content",
+                json!({"budget":budget}),
+                true,
+            ));
+        }
+        replacement = compacted_messages(&context.messages[0], &summary, &retained)?;
+    }
+    if estimated_tokens(&replacement) > budget {
+        return Err(coded_error(
+            "context_compaction_failed",
+            "the model-generated summary and retained context still exceed the context budget",
+            json!({"estimated_tokens":estimated_tokens(&replacement),"budget":budget}),
+            true,
+        ));
+    }
+    context.messages = replacement;
+    context.compacted_at = Some(Utc::now());
+    Ok(true)
+}
+
+fn compacted_messages(system: &Value, summary: &str, retained: &[Value]) -> Result<Vec<Value>> {
+    let wrapper = prompts::render(prompts::CONTEXT_COMPACTION, &[("summary", summary)])?;
+    let mut messages = Vec::with_capacity(retained.len() + 2);
+    messages.push(system.clone());
+    messages.push(json!({"role":"system","content":wrapper}));
+    messages.extend_from_slice(retained);
+    Ok(messages)
+}
+
+fn compaction_boundary(messages: &[Value]) -> Option<usize> {
+    if messages.len() < 3 {
+        return None;
+    }
+    let weights = messages[1..].iter().map(message_weight).collect::<Vec<_>>();
+    let target = weights.iter().sum::<usize>() * 3 / 5;
+    let mut cumulative = 0usize;
+    let mut best = None;
+    for cut in 2..messages.len() {
+        cumulative = cumulative.saturating_add(weights[cut - 2]);
+        if !safe_compaction_boundary(messages, cut) {
+            continue;
+        }
+        let distance = cumulative.abs_diff(target);
+        if best.is_none_or(|(_, best_distance)| distance < best_distance) {
+            best = Some((cut, distance));
         }
     }
-    if estimated_tokens(&context.messages) <= budget {
-        return;
-    }
-    if context.messages.len() > 12 {
-        let mut keep_from = context.messages.len() - 10;
-        if context.messages[keep_from]
-            .get("role")
-            .and_then(Value::as_str)
-            == Some("tool")
-        {
-            while keep_from > 2 {
-                keep_from -= 1;
-                if context.messages[keep_from]
-                    .get("tool_calls")
-                    .and_then(Value::as_array)
-                    .is_some()
-                {
-                    break;
-                }
-            }
-        }
-        let removed = context.messages.drain(2..keep_from).collect::<Vec<_>>();
-        let mut summary = removed
-            .iter()
-            .filter_map(|m| {
-                let role = m.get("role")?.as_str()?;
-                let content = m.get("content")?.as_str().unwrap_or("");
-                Some(format!(
-                    "{role}: {}",
-                    content.chars().take(500).collect::<String>()
-                ))
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        summary = summary.chars().take(8_000).collect();
-        context.messages.insert(
-            2,
-            json!({"role":"system","content":prompts::render(prompts::CONTEXT_COMPACTION, &[("summary", summary.as_str())]).expect("bundled compaction prompt must render")}),
-        );
-        context.compacted_at = Some(Utc::now());
-    }
+    best.map(|(cut, _)| cut)
+}
+
+fn safe_compaction_boundary(messages: &[Value], cut: usize) -> bool {
+    cut > 1
+        && cut < messages.len()
+        && messages[cut].get("role").and_then(Value::as_str) != Some("tool")
+}
+
+fn message_weight(message: &Value) -> usize {
+    serde_json::to_vec(message).map_or(1, |bytes| bytes.len().max(1))
 }
 
 fn estimated_tokens(messages: &[Value]) -> usize {
@@ -2310,7 +2451,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn compaction_does_not_orphan_tool_results() {
+    fn compaction_boundary_is_near_sixty_percent_and_keeps_tool_turns_whole() {
         let mut messages = vec![
             json!({"role":"system","content":"system"}),
             json!({"role":"user","content":"task"}),
@@ -2319,27 +2460,38 @@ mod tests {
             messages.push(json!({"role":"assistant","content":null,"tool_calls":[{"id":format!("call_{index}"),"type":"function","function":{"name":"read","arguments":"{}"}}]}));
             messages.push(json!({"role":"tool","tool_call_id":format!("call_{index}"),"content":"x".repeat(2000)}));
         }
-        let mut context = ContextSnapshot {
-            messages,
-            compacted_at: None,
-            delivered_message_ids: Vec::new(),
-        };
-        compact_context(&mut context, 1000);
-        assert!(context.compacted_at.is_some());
-        for (index, message) in context.messages.iter().enumerate() {
-            if message.get("role").and_then(Value::as_str) == Some("tool") {
-                assert!(context.messages[..index].iter().any(|candidate| {
-                    candidate
-                        .get("tool_calls")
-                        .and_then(Value::as_array)
-                        .is_some_and(|calls| {
-                            calls
-                                .iter()
-                                .any(|call| call.get("id") == message.get("tool_call_id"))
-                        })
-                }));
-            }
-        }
+        let cut = compaction_boundary(&messages).expect("context has safe boundaries");
+        assert_ne!(
+            messages[cut].get("role").and_then(Value::as_str),
+            Some("tool")
+        );
+        assert!(cut > 2);
+        assert!(cut < messages.len());
+        let removed_weight = messages[1..cut].iter().map(message_weight).sum::<usize>();
+        let total_weight = messages[1..].iter().map(message_weight).sum::<usize>();
+        let removed_ratio = removed_weight as f64 / total_weight as f64;
+        assert!(
+            (0.50..=0.70).contains(&removed_ratio),
+            "ratio={removed_ratio}"
+        );
+    }
+
+    #[test]
+    fn compaction_replacement_preserves_system_and_recent_messages_verbatim() {
+        let system = json!({"role":"system","content":"immutable"});
+        let retained = vec![
+            json!({"role":"user","content":"recent question"}),
+            json!({"role":"assistant","content":"recent answer"}),
+        ];
+        let replacement = compacted_messages(&system, "older facts", &retained).unwrap();
+        assert_eq!(replacement[0], system);
+        assert_eq!(&replacement[2..], retained.as_slice());
+        assert!(
+            replacement[1]["content"]
+                .as_str()
+                .unwrap()
+                .contains("older facts")
+        );
     }
 
     #[test]

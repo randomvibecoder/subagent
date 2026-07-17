@@ -1,4 +1,4 @@
-# Subagent v0.2.0 / Protocol 6 Reference
+# Subagent v0.2.1 / Protocol 6 Reference
 
 This file specifies the current binary. Backward compatibility is not promised. The
 release binary, SKILL.md, this reference, and cli.schema.json must change together.
@@ -54,6 +54,9 @@ object. Current semantic codes:
 - timeout: reserved for synchronous bounded operations; retryable true. Side deadline
   expiry is persisted as stopped wall_time instead of returning this Error.
 - api_error: endpoint/network/status failure; retryable reflects status.
+- context_compaction_failed: semantic summarization was empty, unsplittable, or could
+  not fit with the retained recent context; retryable reflects whether another model
+  request may succeed.
 - protocol_mismatch: CLI and daemon protocol versions differ; restart after upgrading.
 - internal_error: unclassified I/O, persistence, decoding, or invariant failure.
 - cli_error: local clap/config/file-input failure not assigned a narrower code.
@@ -760,6 +763,18 @@ and outputs. Metadata/context/messages use private atomic temporary-write plus r
 Events append and flush each JSONL line. Per-owner sequence counters avoid rescanning
 complete Event files on append. Event/log queries scan incrementally and retain only
 their bounded result window in memory.
+
+Model context is append-only between compactions. Its approximate size is compact JSON
+bytes divided by four. Once it exceeds context-token-budget, the daemon preserves the
+first system message, chooses a complete-message boundary nearest 60% of the remaining
+serialized weight, and sends that older prefix to the Agent's selected model with no
+tools. The returned semantic handoff replaces only that prefix; the newest roughly 40%
+is retained verbatim. Boundaries never begin the retained suffix with a tool result, so
+assistant tool calls and their results remain together. Subsequent compactions fold the
+prior rolling summary into a new summary. The new context is persisted before the task
+model request. Empty, unsplittable, or still-oversized summaries fail the run with
+context_compaction_failed rather than applying mechanical clipping. Side runs use the
+same policy on their inherited context plus Side question.
 
 The global notifications.jsonl journal, notification-sequence counter, and durable
 acknowledgement watermark live in the state directory. Queries expose only the latest 10,000 global records. The physical

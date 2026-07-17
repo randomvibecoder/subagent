@@ -74,12 +74,33 @@ impl OpenAiClient {
             "tool_choice": "auto",
             "stream": true,
         });
+        self.complete_body_observed(body, &mut progress).await
+    }
+
+    pub async fn complete_text_observed(
+        &self,
+        messages: &[Value],
+        mut progress: impl FnMut(ModelProgress) -> Result<()>,
+    ) -> Result<ModelTurn> {
+        let body = json!({
+            "model": self.model,
+            "messages": messages,
+            "stream": true,
+        });
+        self.complete_body_observed(body, &mut progress).await
+    }
+
+    async fn complete_body_observed(
+        &self,
+        body: Value,
+        progress: &mut impl FnMut(ModelProgress) -> Result<()>,
+    ) -> Result<ModelTurn> {
         let mut last_error = None;
         for attempt in 0..MAX_ATTEMPTS {
             progress(ModelProgress::AttemptStarted {
                 retry_count: attempt,
             })?;
-            match self.complete_once(&body, &mut progress).await {
+            match self.complete_once(&body, progress).await {
                 Ok(turn) => return Ok(turn),
                 Err(e) => {
                     let delay = retry_delay(&e, attempt);

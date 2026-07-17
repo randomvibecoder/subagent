@@ -224,6 +224,8 @@ subagent agents context a_7 | jq -c 'select(.role == "user")'
 
 `context` dumps the complete raw model context. Never read an unfiltered context dump into an agent conversation: it can be extremely large and is intended for debugging. Redirect it to a file or filter it narrowly with `jq`.
 
+Agent context is append-only during normal work: user messages, assistant messages, and tool results are appended in order. When the configured approximate token budget is exceeded, the daemon makes a tool-free request to that Agent's selected model. It summarizes the oldest safe roughly 60% of conversation weight into one rolling summary while retaining the newest roughly 40% verbatim. The original Agent system prompt is always preserved, tool-call/result groups are never split, and a later compaction summarizes the previous rolling summary again. If semantic compaction cannot produce a nonempty summary that fits, the run fails explicitly instead of silently clipping history.
+
 ### Daemon and configuration
 
 ~~~text

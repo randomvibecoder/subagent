@@ -71,7 +71,7 @@ if SUBAGENT_WEB_PASSWORD='' $BIN daemon start 2>"$ROOT/empty-web-password-error.
   exit 1
 fi
 python3 -c 'import json,sys; value=json.load(open(sys.argv[1])); assert value["code"] == "cli_error" and "SUBAGENT_WEB_PASSWORD is empty" in value["message"]' "$ROOT/empty-web-password-error.jsonl"
-$BIN daemon start | python3 -c 'import json,sys; value=json.load(sys.stdin); assert value["status"] == "running" and value["version"] == "0.2.0" and value["protocol_version"] == 6 and value["web_ui_url"] is None and value["web_auth"] is None'
+$BIN daemon start | python3 -c 'import json,sys; value=json.load(sys.stdin); assert value["status"] == "running" and value["version"] == "0.2.1" and value["protocol_version"] == 6 and value["web_ui_url"] is None and value["web_auth"] is None'
 $BIN config list | python3 -c 'import json,sys; rows=[json.loads(x) for x in sys.stdin]; assert len(rows) == 6 and all(row["type"] == "config_value" and row["active_value"] is not None and row["active_differs_from_local"] is False and row["restart_required"] is False for row in rows); row=next(x for x in rows if x["key"] == "model"); assert row["active_source"] == "OPENAI_MODEL"'
 env -u OPENAI_MODEL -u OPENAI_BASE_URL "$BIN" config get model | python3 -c 'import json,sys; row=json.load(sys.stdin); assert row["local_source"] == "persisted" and row["active_source"] == "OPENAI_MODEL" and row["active_differs_from_local"] is True and row["restart_required"] is False'
 $BIN config set context-token-budget 65000 >/dev/null
@@ -475,6 +475,32 @@ if $BIN sides status "$SIDE_ID" 2>"$ROOT/deleted-side-error.jsonl"; then
 fi
 python3 -c 'import json,sys; assert json.load(open(sys.argv[1]))["code"] == "side_not_found"' "$ROOT/deleted-side-error.jsonl"
 $BIN daemon status | python3 -c 'import json,sys; value=json.load(sys.stdin); assert value["web_ui_url"] == sys.argv[1] and value["web_auth"] == "basic"' "http://127.0.0.1:$WEB_PORT/"
+$BIN daemon stop >/dev/null
+for _ in $(seq 1 100); do
+  [[ ! -S "$XDG_RUNTIME_DIR/subagent.sock" ]] && break
+  sleep 0.05
+done
+
+$BIN config set context-token-budget 1000 >/dev/null
+$BIN daemon start >/dev/null
+COMPACTION_SEED=$(python3 -c 'print("COMPACTION_SEED " + "a" * 1200)')
+COMPACTION_AGENT=$($BIN agents spawn --name compaction-test --dir "$ROOT/project" --mode readonly --message "$COMPACTION_SEED")
+COMPACTION_ID=$(printf '%s\n' "$COMPACTION_AGENT" | json_field id)
+wait_status "$COMPACTION_ID" finished
+COMPACTION_RECENT=$(python3 -c 'print("COMPACTION_RECENT " + "b" * 2400)')
+$BIN agents followup "$COMPACTION_ID" --message "$COMPACTION_RECENT" >/dev/null
+wait_status "$COMPACTION_ID" finished
+$BIN agents context "$COMPACTION_ID" >"$ROOT/compacted-context.jsonl"
+python3 - "$ROOT/compacted-context.jsonl" "$COMPACTION_RECENT" <<'PY'
+import json, sys
+rows = [json.loads(line) for line in open(sys.argv[1])]
+assert rows[0]["type"] == "context_meta" and rows[0]["compacted_at"]
+assert rows[1]["role"] == "system"
+assert "model-generated rolling summary" in rows[2]["content"]
+assert "context-compaction test" in rows[2]["content"]
+assert rows[-2] == {"role": "user", "content": sys.argv[2]}
+assert "older tool output omitted" not in open(sys.argv[1]).read()
+PY
 $BIN daemon stop >/dev/null
 
 echo '{"type":"test_result","status":"passed","suite":"e2e"}'

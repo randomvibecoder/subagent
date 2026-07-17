@@ -2023,6 +2023,7 @@
             "daemon_start_failed",
             "shutdown_failed",
             "empty_completion",
+            "context_compaction_failed",
             "final_answer_too_large",
             "notification_not_found"
           ]
