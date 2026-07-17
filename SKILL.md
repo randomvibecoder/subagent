@@ -1,14 +1,64 @@
 ---
 name: subagent-cli
 description: Delegate, monitor, steer, interrupt, and collect final answers from persistent background coding Agents and readonly context-inheriting Sides through the Subagent JSONL CLI. Use for parallel or long-running coding work, keeping a coordinator's context small, supervising multiple models, or operating the subagent daemon, team, inbox, messages, Agents, and Sides.
-version: 0.2.2
+metadata:
+  version: "0.2.2"
 ---
 
 # Subagent CLI
 
-Use `subagent` as a task system. Keep the coordinator focused on delegation, progress, and final answers; do not import raw code, tool output, or complete transcripts unless debugging requires it.
+## What Subagent is
 
-Operational output is UTF-8 JSONL: one object per line, never a top-level array. Prefer short local refs such as `a_7`, `s_3`, `m_12`, and `e_90`. Retain ULIDs for exports, backups, HTTP integrations, or cross-machine data.
+`subagent` is a local CLI and long-lived daemon for delegating work to independent AI workers. The Agent invoking this CLI is the **coordinator** (or master Agent). A worker created with `agents spawn` is a persistent **Agent** with its own model conversation, tools, working directory, lifecycle, logs, and final answer.
+
+The CLI is only the control surface. `agents spawn` returns immediately while the daemon continues running the worker in the background. Closing the CLI command does not end the worker. Agent records, messages, events, and final answers survive coordinator turns and daemon restarts.
+
+Workers operate directly in the directory supplied with `--dir`; Subagent does not create a Git branch, copy the project, or isolate workers from one another. Give parallel Agents separate directories or clearly non-overlapping ownership when concurrent edits could conflict.
+
+~~~text
+coordinator context
+    |
+    | short task, follow-up, status request
+    v
+subagent CLI -> local daemon -> Agent a_7 context + tools -> project directory
+                            -> Agent a_8 context + tools -> project directory
+                            -> Side  s_3 context + readonly tools
+    ^
+    | compact JSONL status, notifications, final answers
+    +-----------------------------------------------------
+~~~
+
+## How it saves coordinator context
+
+Subagent keeps worker detail outside the coordinator's model context. The coordinator sends a bounded task, remembers a short reference such as `a_7`, and consumes progress notifications plus the authoritative final answer. Raw reasoning, tool calls, terminal output, and the complete worker transcript remain in daemon-managed storage unless explicitly requested.
+
+This lets the coordinator spend its context on decomposition, dependencies, decisions, and next steps instead of accumulating every file read and test log from every worker. For the common path:
+
+1. Spawn a worker with all facts it needs.
+2. Save its `ref` from the JSON response.
+3. Use `team list --active` or `inbox wait` for bounded supervision.
+4. Use `agents followup` only when direction changes.
+5. Read `final_answer` when the run finishes.
+
+Do not routinely call `agents context`, `logs --all`, or ingest generated source code into the coordinator conversation. Those commands defeat the context-saving design and are intended for targeted diagnosis. Default logs are bounded and omit tool traffic.
+
+Context is isolated, not magically shared:
+
+- A normal Agent receives the bundled Agent system prompt and the task passed to `spawn`. It does **not** inherit the coordinator's conversation, hidden reasoning, open files, or prior tool results. Put necessary requirements, paths, constraints, decisions, and acceptance tests in the task.
+- A follow-up becomes durable input to that same Agent's existing context.
+- A Side receives a frozen snapshot of one parent Agent's context plus a new question. It does not inherit the coordinator's separate conversation, and its trace is not added back to the parent.
+- Each worker manages its own context budget. When an Agent context grows too large, the daemon semantically summarizes the oldest safe roughly 60% and retains the newest roughly 40% verbatim. This compaction affects the worker context, not the coordinator context.
+
+## Coordinator rules
+
+- Delegate concrete outcomes with explicit scope and verification criteria.
+- Prefer several independent Agents for parallelizable work; avoid assigning two writers the same files.
+- Treat JSONL receipts as the source of IDs and state. Prefer local refs such as `a_7`, `s_3`, `m_12`, and `e_90` for local commands.
+- Supervise through `team list --active` and `inbox wait`; do not repeatedly poll every transcript.
+- Trust an Agent's final answer as its report, but independently verify high-risk results with a separate focused Agent or a narrow local check.
+- Pull raw logs or context only when a failure cannot be understood from status, notifications, and the final answer.
+
+Operational output is UTF-8 JSONL: one object per line, never a top-level array. Retain full ULIDs for exports, backups, HTTP integrations, or cross-machine data.
 
 For exact schemas, lifecycle invariants, tools, cursors, HTTP endpoints, and error codes, read [references/protocol.md](references/protocol.md) and [references/cli.schema.json](references/cli.schema.json).
 
@@ -20,7 +70,13 @@ Install the latest static Linux x86-64 release:
 curl -fsSL https://raw.githubusercontent.com/randomvibecoder/subagent/main/install.sh | sh
 ~~~
 
-Configure the OpenAI-compatible Chat Completions endpoint and start the daemon:
+Check whether a daemon is already running:
+
+~~~sh
+subagent daemon status
+~~~
+
+If it reports a running daemon, use that daemon. Otherwise configure the OpenAI-compatible Chat Completions endpoint and start one:
 
 ~~~sh
 export OPENAI_API_KEY='...'
@@ -29,7 +85,7 @@ export OPENAI_MODEL='your-model'
 subagent daemon start
 ~~~
 
-The daemon captures environment values at startup. Restart after changing them. Agent shell commands run with the daemon user's host permissions. Readonly mode and Side non-mutation rules are advisory, not an OS sandbox.
+The daemon captures environment values at startup; restart it after changing them. Agent shell commands run with the daemon user's host permissions. Readonly mode and Side non-mutation rules are advisory, not an OS sandbox.
 
 ## Recommended workflow
 
@@ -53,6 +109,14 @@ Use `--model MODEL` to override the daemon model for one Agent. Normal Agents st
 
 ### 2. Supervise the team
 
+For one known Agent, wait for it to reach a terminal state and return its complete Agent object:
+
+~~~sh
+subagent agents wait a_7 --timeout-seconds 300
+~~~
+
+For several concurrent workers, use the bounded active-team view:
+
 ~~~sh
 subagent team list --active
 ~~~
@@ -62,7 +126,7 @@ This is the preferred coordinator view. `--active` emits working, interrupted, a
 Wait for the first future high-signal update without polling:
 
 ~~~sh
-subagent inbox wait --timeout-seconds 300 --priority 2
+subagent inbox wait --timeout-seconds 300 --priority 2 --type FINAL_ANSWER
 ~~~
 
 The command returns the first matching Notification and exits. With no match before the deadline it exits successfully with:
@@ -71,7 +135,7 @@ The command returns the first matching Notification and exits. With no match bef
 {"type":"wait_summary","resource":"inbox","matched":false,"count":0,"after_sequence":42,"timeout_seconds":300}
 ~~~
 
-Use `--after SEQUENCE` to include existing records after a known sequence. Filter with `--agent AGENT`, `--priority 1..4`, or repeat `--type TYPE`.
+Use `--after SEQUENCE` to include existing records after a known sequence. Omit `--type FINAL_ANSWER` when progress and coordination messages should also wake the coordinator. Filter with `--agent AGENT`, `--priority 1..4`, or repeat `--type TYPE`.
 
 ### 3. Steer deliberately
 
