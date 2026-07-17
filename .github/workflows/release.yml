@@ -34,17 +34,22 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" \
-            subagent-linux-x86_64 subagent-linux-x86_64.sha256 \
-            --title "subagent $GITHUB_REF_NAME" --generate-notes
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" \
+              subagent-linux-x86_64 subagent-linux-x86_64.sha256 --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              subagent-linux-x86_64 subagent-linux-x86_64.sha256 \
+              --title "subagent $GITHUB_REF_NAME" --generate-notes
+          fi
       - name: Verify latest installer
-        env:
-          EXPECTED_VERSION: "subagent 0.1.8"
         run: |
+          crate_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)
+          expected_version="subagent $crate_version"
           install_root=$(mktemp -d)
           for attempt in 1 2 3 4 5; do
             if SUBAGENT_INSTALL_DIR="$install_root/bin" sh install.sh; then break; fi
             test "$attempt" -lt 5
             sleep 3
           done
-          test "$("$install_root/bin/subagent" --version)" = "$EXPECTED_VERSION"
+          test "$("$install_root/bin/subagent" --version)" = "$expected_version"
