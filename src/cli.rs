@@ -68,6 +68,11 @@ enum TopCommand {
         about = "Read the durable high-signal notification journal. Output: JSONL."
     )]
     Inbox(InboxCommand),
+    #[command(
+        subcommand,
+        about = "Inspect the flat Agent and Side team. Output: JSONL."
+    )]
+    Team(TeamCommand),
     #[command(subcommand, about = "Manage non-secret configuration. Output: JSONL.")]
     Config(ConfigCommand),
     #[command(name = "__serve", hide = true)]
@@ -122,6 +127,8 @@ enum ConfigCommand {
 
 #[derive(Subcommand)]
 enum MessagesCommand {
+    #[command(about = "Store a durable message without waking an inactive Agent.")]
+    Send(BasicMessageArgs),
     #[command(
         about = "List durable messages newest-first for an Agent.",
         after_help = "Repeated --status filters use OR. JSONL output is zero or more Message records followed by one Agent-scoped list_summary with a nullable next_cursor.\n\nExample:\n  subagent messages list a_7 --status pending --status delivered --limit 100"
@@ -248,8 +255,16 @@ enum AgentsCommand {
     Logs(AgentLogsArgs),
     #[command(about = "Dump the complete current raw model context as JSONL for debugging.")]
     Context(ContextArgs),
-    #[command(about = "Send input at the next safe boundary, or resume a non-working agent.")]
+    #[command(about = "Compatibility alias for `agents followup`.")]
     Send(SendArgs),
+    #[command(about = "Assign durable follow-up work and wake or resume the Agent.")]
+    Followup(SendArgs),
+    #[command(about = "Interrupt the current turn while preserving resumable Agent identity.")]
+    Interrupt {
+        /// Agent a_N ref, agt_<ULID>, or exact name.
+        #[arg(value_name = "AGENT", value_parser = parse_agent_id)]
+        id: String,
+    },
     #[command(
         about = "Set a working agent deadline in minutes from now.",
         after_help = "JSONL output: one complete Agent object with the updated deadline.\n\nExample:\n  subagent agents time a_7 90"
@@ -285,6 +300,7 @@ enum ModeArg {
 #[derive(Clone, Copy, ValueEnum)]
 enum StatusArg {
     Working,
+    Interrupted,
     Finished,
     Stopped,
     Failed,
@@ -294,6 +310,7 @@ impl StatusArg {
     fn as_str(self) -> &'static str {
         match self {
             Self::Working => "working",
+            Self::Interrupted => "interrupted",
             Self::Finished => "finished",
             Self::Stopped => "stopped",
             Self::Failed => "failed",
@@ -346,7 +363,7 @@ struct SpawnArgs {
     after_help = "JSONL output: zero or more compact Agent records followed by one list_summary. Compact records contain {type,id,ref,name,status,dir,mode,model,spawned_at,last_message_at,updated_at,current_phase,last_event_at,run_number,working_sides}; --verbose emits full telemetry.\n\nExamples:\n  subagent agents list --status working --limit 20\n  subagent agents list --limit 100 --after-cursor CURSOR\n  subagent agents list --after-cursor CURSOR --offset 0"
 )]
 struct ListArgs {
-    /// Filter by status; repeat for working, finished, stopped, or failed.
+    /// Filter by status; repeat for working, interrupted, finished, stopped, or failed.
     #[arg(long = "status")]
     statuses: Vec<StatusArg>,
     /// Filter by canonical working directory.
@@ -386,7 +403,7 @@ struct ListArgs {
 
 #[derive(Args)]
 #[command(
-    after_help = "Finite JSONL output ends with logs_summary. Event schema: {event_id,ref,agent_id,agent_ref,sequence,timestamp,type,data}. Types: system_message,user_message,assistant_message,reasoning,tool_call,tool_result,lifecycle,error. Follow mode streams Events only."
+    after_help = "Finite JSONL output ends with logs_summary. Event schema: {owner,event_id,ref,agent_id,agent_ref,sequence,timestamp,type,data}. Types: system_message,user_message,assistant_message,reasoning,tool_call,tool_result,lifecycle,error. Follow mode streams Events only."
 )]
 struct AgentLogsArgs {
     /// Agent a_N ref, agt_<ULID>, or exact name.
@@ -411,7 +428,7 @@ struct AgentLogsArgs {
 
 #[derive(Args)]
 #[command(
-    after_help = "Finite JSONL output ends with logs_summary. Event schema: {event_id,ref,agent_id,agent_ref,side_id,side_ref,sequence,timestamp,type,data}. Types: system_message,user_message,assistant_message,reasoning,tool_call,tool_result,lifecycle,error. Follow mode streams Events only."
+    after_help = "Finite JSONL output ends with logs_summary. Event schema: {owner,event_id,ref,agent_id,agent_ref,side_id,side_ref,sequence,timestamp,type,data}. Types: system_message,user_message,assistant_message,reasoning,tool_call,tool_result,lifecycle,error. Follow mode streams Events only."
 )]
 struct SideLogsArgs {
     /// Side short ref (s_N) or durable ID (side_<ULID>).
@@ -446,7 +463,7 @@ struct ContextArgs {
 #[derive(Args)]
 #[command(
     group(clap::ArgGroup::new("input").required(true).multiple(false).args(["message", "message_file"])),
-    after_help="JSONL output: one message_sent acceptance receipt immediately; model delivery continues in the daemon.\n\nExample:\n  subagent agents send a_7 --message \"Run the full test suite too\""
+    after_help="JSONL output: one immediate acceptance receipt: message_sent for `agents send`, or followup_sent for `agents followup`. Model delivery continues in the daemon.\n\nExamples:\n  subagent agents followup a_7 --message \"Run the full test suite too\"\n  subagent agents send a_7 --message \"Run the full test suite too\""
 )]
 struct SendArgs {
     /// Agent a_N ref, agt_<ULID>, or exact name.
@@ -461,6 +478,22 @@ struct SendArgs {
     /// Optional deadline in integer minutes, from 1 through 6000; resets an active deadline.
     #[arg(long, value_name = "MINUTES", value_parser = parse_minutes)]
     wall_time_minutes: Option<u64>,
+}
+
+#[derive(Args)]
+#[command(
+    group(clap::ArgGroup::new("input").required(true).multiple(false).args(["message", "message_file"])),
+    after_help="JSONL output: one message_sent receipt. The message is durable but an inactive Agent is not resumed."
+)]
+struct BasicMessageArgs {
+    /// Agent a_N ref, agt_<ULID>, or exact name.
+    #[arg(value_name = "AGENT", value_parser = parse_agent_id)]
+    id: String,
+    #[arg(long)]
+    message: Option<String>,
+    /// Read UTF-8 input from PATH; use - for stdin.
+    #[arg(long, value_name = "PATH")]
+    message_file: Option<String>,
 }
 
 #[derive(Args)]
@@ -503,7 +536,7 @@ struct InboxListArgs {
     /// Include notifications for only this Agent ref, durable ID, or exact name.
     #[arg(long, value_name = "AGENT")]
     agent: Option<String>,
-    /// Include acknowledged notifications; plain inbox shows unread records only.
+    /// Include acknowledged notifications; without --all only unread records are shown.
     #[arg(long)]
     all: bool,
 }
@@ -533,6 +566,28 @@ enum InboxCommand {
         #[arg(long, value_name = "AGENT")]
         agent: Option<String>,
     },
+    #[command(about = "Wait for the first matching future notification and exit.")]
+    Wait {
+        /// Resume strictly after this notification sequence; omitted starts at invocation.
+        #[arg(long)]
+        after: Option<u64>,
+        /// Maximum wait in seconds, from 1 through 86400.
+        #[arg(long, default_value_t = 60, value_parser = parse_wait_timeout)]
+        timeout_seconds: u64,
+        #[arg(long, default_value_t = 2, value_parser = parse_priority)]
+        priority: u8,
+        #[arg(long, value_name = "AGENT")]
+        agent: Option<String>,
+        /// Typed envelope/event type to include; repeatable and ORed.
+        #[arg(long = "type", value_name = "TYPE")]
+        event_types: Vec<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum TeamCommand {
+    #[command(about = "List Agents and Sides, followed by one capacity summary.")]
+    List,
 }
 
 pub async fn run() -> Result<()> {
@@ -588,11 +643,29 @@ async fn run_inner() -> Result<()> {
                     agent_id: args.agent,
                     include_acknowledged: args.all,
                 },
+                InboxCommand::Wait {
+                    after,
+                    timeout_seconds,
+                    priority,
+                    agent,
+                    event_types,
+                } => Request::InboxWait {
+                    after_sequence: after,
+                    timeout_seconds,
+                    minimum_priority: priority,
+                    agent_id: agent,
+                    event_types,
+                },
             };
             request(request_value).await
         }
+        TopCommand::Team(TeamCommand::List) => request(Request::TeamList).await,
         TopCommand::Messages(command) => {
             let req = match command {
+                MessagesCommand::Send(args) => Request::MessageSend {
+                    id: args.id,
+                    message: read_message(args.message, args.message_file).await?,
+                },
                 MessagesCommand::List {
                     agent_id,
                     statuses,
@@ -715,6 +788,12 @@ async fn run_inner() -> Result<()> {
                     message: read_message(a.message, a.message_file).await?,
                     wall_time_minutes: a.wall_time_minutes,
                 },
+                AgentsCommand::Followup(a) => Request::AgentFollowup {
+                    id: a.id,
+                    message: read_message(a.message, a.message_file).await?,
+                    wall_time_minutes: a.wall_time_minutes,
+                },
+                AgentsCommand::Interrupt { id } => Request::AgentInterrupt { id },
                 AgentsCommand::Time { id, minutes } => Request::AgentTime { id, minutes },
                 AgentsCommand::Stop { id } => Request::AgentStop { id },
                 AgentsCommand::Delete { id } => Request::AgentDelete { id },
@@ -844,18 +923,32 @@ async fn start_daemon(web_ui_port: Option<u16>) -> Result<()> {
             Ok(())
         });
     }
-    let child = cmd.spawn().context("start daemon")?;
+    let mut child = cmd.spawn().context("start daemon")?;
     for _ in 0..100 {
         if UnixStream::connect(&socket).await.is_ok() {
             return request_unchecked(Request::DaemonStatus).await;
         }
+        if let Some(status) = child.try_wait()? {
+            return Err(coded_error(
+                "daemon_start_failed",
+                "daemon exited before becoming ready",
+                json!({
+                    "pid":child.id(),
+                    "exit_status":status.code(),
+                    "log_path":cfg.paths.daemon_log(),
+                    "failure_summary":daemon_failure_summary(&cfg.paths),
+                }),
+                true,
+            ));
+        }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    bail!(
-        "daemon process {} did not become ready; inspect {}",
-        child.id(),
-        cfg.paths.daemon_log().display()
-    )
+    Err(coded_error(
+        "daemon_start_failed",
+        "daemon did not become ready within five seconds",
+        json!({"pid":child.id(),"log_path":cfg.paths.daemon_log(),"failure_summary":daemon_failure_summary(&cfg.paths)}),
+        true,
+    ))
 }
 
 fn rotate_daemon_log(paths: &Paths) -> Result<()> {
@@ -971,6 +1064,20 @@ fn daemon_connection_error(paths: &Paths) -> anyhow::Error {
                     "stopped_at":state.updated_at,
                     "version":state.version,
                     "log_path":paths.daemon_log(),
+                }),
+                true,
+            );
+        }
+        if state.status == "shutdown_failed" {
+            return coded_error(
+                "shutdown_failed",
+                "the daemon encountered an error while stopping workers",
+                json!({
+                    "last_pid":state.pid,
+                    "failed_at":state.updated_at,
+                    "version":state.version,
+                    "log_path":paths.daemon_log(),
+                    "failure_summary":daemon_failure_summary(paths),
                 }),
                 true,
             );

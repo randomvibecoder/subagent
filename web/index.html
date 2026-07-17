@@ -105,6 +105,12 @@
           </div>
           <div id="agents" class="agent-list"></div>
         </section>
+        <section class="panel">
+          <div class="section-heading">
+            <div><h2>Team</h2><p id="team-summary">Loading capacity…</p></div>
+          </div>
+          <div id="team-members" class="team-list"></div>
+        </section>
         <section class="panel inbox-panel">
           <div class="section-heading inbox-heading">
             <div>
@@ -121,6 +127,9 @@
               <option value="4">4 · blocked or failed+</option>
             </select></label>
             <label><span>Agent</span><select id="inbox-agent" name="agent"><option value="">All agents</option></select></label>
+            <label><span>Envelope</span><select name="event_type">
+              <option value="">All types</option><option>NEW_TASK</option><option>MESSAGE</option><option>FOLLOWUP</option><option>PROGRESS</option><option>INTERRUPTED</option><option>FINAL_ANSWER</option><option>FAILED</option>
+            </select></label>
             <label><span>Entries</span><select name="limit">
               <option value="10">10</option><option value="20" selected>20</option><option value="50">50</option><option value="100">100</option>
             </select></label>
@@ -148,6 +157,7 @@
           </div>
           <button id="copy-id" class="copy-id" type="button"></button>
           <div id="agent-meta" class="agent-meta"></div>
+          <div id="agent-final-answer" class="final-answer hidden"></div>
         </section>
 
         <nav id="agent-tabs" class="agent-tabs" aria-label="Agent sections">
@@ -175,6 +185,7 @@
             </button>
             <div id="pending-messages" class="pending-strip hidden"></div>
             <form id="send-form" class="chat-composer">
+              <select name="delivery" aria-label="Delivery behavior"><option value="followup">Follow up and wake</option><option value="message">Message without waking</option></select>
               <textarea
                 name="message"
                 rows="2"
@@ -255,7 +266,8 @@
                 </div>
               </div>
               <div class="control-actions">
-                <button id="stop" type="button">Stop agent</button
+                <button id="interrupt" type="button">Interrupt turn</button
+                ><button id="stop" type="button">Stop agent</button
                 ><button id="delete" class="danger" type="button">
                   Delete agent
                 </button>
@@ -283,6 +295,7 @@
           </div>
           <button id="copy-side-id" class="copy-id" type="button"></button>
           <div id="side-page-meta" class="agent-meta"></div>
+          <div id="side-final-answer" class="final-answer hidden"></div>
         </section>
 
         <nav id="side-tabs" class="agent-tabs" aria-label="Side sections">

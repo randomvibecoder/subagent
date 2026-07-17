@@ -257,6 +257,7 @@
     if (!value) return "Done";
     if (value.message) return value.message;
     if (value.type === "message_sent") return "Message queued";
+    if (value.type === "followup_sent") return "Follow-up queued";
     if (value.type === "side_created") return "Side run started";
     if (value.type === "side_deleted") return "Side history deleted";
     if (value.type === "agent_renamed") return "Agent renamed to " + value.name;

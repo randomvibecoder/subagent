@@ -116,12 +116,41 @@
           })
           .join("");
       inboxAgent.value = selectedAgent;
+      loadTeam();
       return agents;
     } catch (error) {
       $("#connection").textContent = "disconnected";
       $("#connection").classList.add("offline");
       notice(error.message);
       return [];
+    }
+  }
+
+  async function loadTeam() {
+    try {
+      var records = await lines("/api/team"),
+        summary = records.find(function (record) { return record.type === "team_summary"; }),
+        members = records.filter(function (record) { return record.type === "team_member"; });
+      $("#team-summary").textContent = summary
+        ? summary.working_agents + " active · " +
+          (summary.available_agent_slots == null ? "unlimited slots" : summary.available_agent_slots + " slots available") +
+          " · " + summary.active_sides + " active Sides"
+        : "Capacity unavailable";
+      $("#team-members").innerHTML = members.length
+        ? members.map(function (member) {
+            return '<button class="team-member" data-resource="' + UI.escapeHtml(member.resource) + '" data-id="' + UI.escapeHtml(member.id) + '"><span><strong>' +
+              UI.escapeHtml(member.name) + '</strong><small>' + UI.escapeHtml(member.ref) + ' · ' + UI.escapeHtml(member.model) +
+              '</small></span><span class="status ' + UI.escapeHtml(member.status) + '">' +
+              UI.escapeHtml(member.coordination_state) + '</span></button>';
+          }).join("")
+        : '<div class="empty-state">No team members yet.</div>';
+      document.querySelectorAll(".team-member").forEach(function (button) {
+        button.onclick = function () {
+          route([button.dataset.resource === "side" ? "sides" : "agents", encodeURIComponent(button.dataset.id), "main"]);
+        };
+      });
+    } catch (_) {
+      $("#team-summary").textContent = "Team unavailable";
     }
   }
 
@@ -135,8 +164,10 @@
         offset: String(inboxOffset),
         priority: String(values.get("priority") || 2),
       }),
-      agent = values.get("agent");
+      agent = values.get("agent"),
+      envelope = values.get("event_type");
     if (agent) params.set("agent", agent);
+    if (envelope) params.set("event_type", envelope);
     if (values.get("all")) params.set("all", "true");
     try {
       var records = await lines("/api/inbox?" + params.toString()),
@@ -307,6 +338,13 @@
       $("#time-form input").disabled = metadata.status !== "working";
       $("#time-form button").disabled = metadata.status !== "working";
       $("#delete").disabled = metadata.status === "working";
+      $("#interrupt").disabled = metadata.status !== "working";
+      var finalAnswer = metadata.final_answer;
+      $("#agent-final-answer").classList.toggle("hidden", !finalAnswer);
+      $("#agent-final-answer").innerHTML = finalAnswer
+        ? '<span class="eyebrow">Final answer · run ' + finalAnswer.run_number + '</span><div>' +
+          UI.escapeHtml(finalAnswer.content).replaceAll("\n", "<br>") + "</div>"
+        : "";
       var working = item ? item.working_sides : 0;
       $("#side-working-badge").textContent = working;
       $("#side-working-badge").classList.toggle("hidden", working === 0);
@@ -801,6 +839,11 @@
       (side.provider_request_id
         ? "<span>request " + UI.escapeHtml(side.provider_request_id) + "</span>"
         : "");
+    var finalAnswer = side.final_answer;
+    $("#side-final-answer").classList.toggle("hidden", !finalAnswer);
+    $("#side-final-answer").innerHTML = finalAnswer
+      ? '<span class="eyebrow">Final answer</span><div>' + UI.escapeHtml(finalAnswer.content).replaceAll("\n", "<br>") + "</div>"
+      : "";
     showSideTab(tab, side);
   }
   function showSideTab(tab, side) {
@@ -852,9 +895,10 @@
     event.preventDefault();
     var input = event.target.elements.message,
       message = input.value.trim();
+    var delivery = event.target.elements.delivery.value || "followup";
     try {
       var response = await api(
-        "/api/agents/" + encodeURIComponent(selected) + "/send",
+        "/api/agents/" + encodeURIComponent(selected) + "/" + delivery,
         { method: "POST", body: JSON.stringify({ message: message }) },
       );
       input.value = "";
@@ -913,6 +957,18 @@
         method: "POST",
       });
       notice("Agent stopped");
+      await loadAgents();
+      await showAgent(selected, "controls");
+    } catch (error) {
+      notice(error.message);
+    }
+  };
+  $("#interrupt").onclick = async function () {
+    try {
+      await api("/api/agents/" + encodeURIComponent(selected) + "/interrupt", {
+        method: "POST",
+      });
+      notice("Agent interrupted; follow up to resume");
       await loadAgents();
       await showAgent(selected, "controls");
     } catch (error) {

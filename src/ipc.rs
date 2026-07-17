@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 pub const MAX_LIST_LIMIT: usize = 1_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,6 +48,19 @@ pub enum Request {
         message: String,
         wall_time_minutes: Option<u64>,
     },
+    AgentFollowup {
+        id: String,
+        message: String,
+        wall_time_minutes: Option<u64>,
+    },
+    MessageSend {
+        id: String,
+        message: String,
+    },
+    AgentInterrupt {
+        id: String,
+    },
+    TeamList,
     SideCreate {
         id: String,
         message: String,
@@ -69,6 +82,13 @@ pub enum Request {
         after_sequence: Option<u64>,
         minimum_priority: u8,
         agent_id: Option<String>,
+    },
+    InboxWait {
+        after_sequence: Option<u64>,
+        timeout_seconds: u64,
+        minimum_priority: u8,
+        agent_id: Option<String>,
+        event_types: Vec<String>,
     },
     SideList {
         agent_id: String,

@@ -79,7 +79,14 @@ class Handler(BaseHTTPRequestHandler):
         if latest_user.startswith("DEMO_") and not has_tool_result:
             time.sleep(12)
 
-        if latest_user.startswith("DEMO_AUTH") and not has_tool_result:
+        if "EMPTY_TWICE" in latest_user:
+            deltas = []
+        elif "EMPTY_ONCE" in latest_user:
+            if "previous response contained no assistant content" in system_text:
+                deltas = [{"content": "recovered from empty completion"}]
+            else:
+                deltas = []
+        elif latest_user.startswith("DEMO_AUTH") and not has_tool_result:
             deltas = fragment_calls(
                 [
                     function_call(
@@ -123,7 +130,10 @@ class Handler(BaseHTTPRequestHandler):
         elif "READONLY_PROMPT" in latest_user:
             correct = (
                 "must not modify files or system state" in system_text
-                and "sed without -i" in system_text
+                and (
+                    "sed without -i" in system_text
+                    or "`sed` without `-i`" in system_text
+                )
                 and not {"write", "edit", "apply_patch"}.intersection(tool_names)
             )
             deltas = [{"content": "readonly prompt correct" if correct else "readonly prompt incorrect"}]

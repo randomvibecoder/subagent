@@ -65,6 +65,7 @@ pub async fn start(
         .route("/assets/ui-core.js", get(ui_core))
         .route("/assets/app.js", get(js))
         .route("/api/agents", get(list_agents).post(spawn_agent))
+        .route("/api/team", get(team))
         .route("/api/inbox", get(inbox))
         .route("/api/inbox/ack/{identifier}", post(ack_inbox))
         .route("/api/inbox/follow", get(follow_inbox))
@@ -74,6 +75,9 @@ pub async fn start(
         .route("/api/agents/{id}/events/{event_id}", get(full_event))
         .route("/api/agents/{id}/stream", get(event_stream))
         .route("/api/agents/{id}/send", post(send_message))
+        .route("/api/agents/{id}/message", post(store_message))
+        .route("/api/agents/{id}/followup", post(followup_agent))
+        .route("/api/agents/{id}/interrupt", post(interrupt_agent))
         .route("/api/agents/{id}/side", post(side_question))
         .route("/api/agents/{id}/sides", get(list_sides).post(create_side))
         .route("/api/sides/{id}", get(side_status).delete(delete_side))
@@ -190,7 +194,10 @@ impl IntoResponse for ApiError {
         }
         let value = error_json_for(&self.0, "internal_error");
         let status = match value.get("code").and_then(Value::as_str) {
-            Some("not_found") => StatusCode::NOT_FOUND,
+            Some(
+                "not_found" | "agent_not_found" | "side_not_found" | "message_not_found"
+                | "event_not_found",
+            ) => StatusCode::NOT_FOUND,
             Some("conflict") | Some("max_agents_reached") => StatusCode::CONFLICT,
             Some("invalid_argument") => StatusCode::BAD_REQUEST,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
@@ -249,6 +256,7 @@ struct InboxQuery {
     after_cursor: Option<String>,
     priority: Option<u8>,
     agent: Option<String>,
+    event_type: Option<String>,
     all: Option<bool>,
     after: Option<u64>,
 }
@@ -297,6 +305,7 @@ async fn inbox(
         after_cursor: query.after_cursor,
         minimum_priority: priority,
         agent_id,
+        envelope_type: query.event_type.filter(|value| !value.is_empty()),
         include_acknowledged: query.all.unwrap_or(false),
     })?;
     let mut values = page
@@ -399,6 +408,7 @@ async fn agent_status(
     Path(id): Path<String>,
 ) -> ApiResult<Json<Value>> {
     authorize(&state, &headers, false)?;
+    let id = state.store.resolve_agent_id(&id)?;
     Ok(Json(agent_value(state.store.load_metadata(&id)?)?))
 }
 
@@ -413,6 +423,7 @@ async fn rename_agent(
     Json(body): Json<RenameBody>,
 ) -> ApiResult<Json<Value>> {
     authorize(&state, &headers, true)?;
+    let id = state.store.resolve_agent_id(&id)?;
     let _mutation = state.manager.begin_mutation()?;
     Ok(Json(state.manager.rename(&id, body.name).await?))
 }
@@ -423,6 +434,7 @@ async fn delete_agent(
     Path(id): Path<String>,
 ) -> ApiResult<Json<Value>> {
     authorize(&state, &headers, true)?;
+    let id = state.store.resolve_agent_id(&id)?;
     let _mutation = state.manager.begin_mutation()?;
     Ok(Json(state.manager.delete_agent(&id).await?))
 }
@@ -441,6 +453,7 @@ async fn agent_events(
     Query(query): Query<EventsQuery>,
 ) -> ApiResult<Response> {
     authorize(&state, &headers, false)?;
+    let id = state.store.resolve_agent_id(&id)?;
     let types = event_types(query.types.as_deref());
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
     let events = state.store.query_events(
@@ -460,6 +473,8 @@ async fn full_event(
     Path((id, event_id)): Path<(String, String)>,
 ) -> ApiResult<Json<EventRecord>> {
     authorize(&state, &headers, false)?;
+    let id = state.store.resolve_agent_id(&id)?;
+    let event_id = state.store.resolve_event_id(&id, false, &event_id)?;
     let event = state.store.find_event(&id, false, &event_id)?;
     Ok(Json(event))
 }
@@ -471,6 +486,7 @@ async fn event_stream(
     Query(query): Query<EventsQuery>,
 ) -> ApiResult<Sse<impl futures_util::Stream<Item = std::result::Result<Event, Infallible>>>> {
     authorize(&state, &headers, false)?;
+    let id = state.store.resolve_agent_id(&id)?;
     state.store.load_metadata(&id)?;
     let mut cursor = query.after;
     if cursor.is_none() {
@@ -595,6 +611,7 @@ async fn send_message(
     Json(body): Json<MessageBody>,
 ) -> ApiResult<Json<Value>> {
     authorize(&state, &headers, true)?;
+    let id = state.store.resolve_agent_id(&id)?;
     let _mutation = state.manager.begin_mutation()?;
     Ok(Json(
         state
@@ -603,6 +620,50 @@ async fn send_message(
             .await?,
     ))
 }
+async fn store_message(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<MessageBody>,
+) -> ApiResult<Json<Value>> {
+    authorize(&state, &headers, true)?;
+    let id = state.store.resolve_agent_id(&id)?;
+    let _mutation = state.manager.begin_mutation()?;
+    Ok(Json(state.manager.message(&id, body.message).await?))
+}
+
+async fn followup_agent(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+    Json(body): Json<MessageBody>,
+) -> ApiResult<Json<Value>> {
+    authorize(&state, &headers, true)?;
+    let id = state.store.resolve_agent_id(&id)?;
+    let _mutation = state.manager.begin_mutation()?;
+    Ok(Json(
+        state
+            .manager
+            .followup(&id, body.message, body.wall_time_minutes)
+            .await?,
+    ))
+}
+
+async fn interrupt_agent(
+    State(state): State<WebState>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> ApiResult<Json<Value>> {
+    authorize(&state, &headers, true)?;
+    let id = state.store.resolve_agent_id(&id)?;
+    let _mutation = state.manager.begin_mutation()?;
+    Ok(Json(agent_value(state.manager.interrupt(&id).await?)?))
+}
+
+async fn team(State(state): State<WebState>, headers: HeaderMap) -> ApiResult<Response> {
+    authorize(&state, &headers, false)?;
+    Ok(ndjson(state.manager.team_values()?))
+}
 async fn side_question(
     State(state): State<WebState>,
     headers: HeaderMap,
@@ -610,6 +671,7 @@ async fn side_question(
     Json(body): Json<MessageBody>,
 ) -> ApiResult<Json<Value>> {
     authorize(&state, &headers, true)?;
+    let id = state.store.resolve_agent_id(&id)?;
     let _mutation = state.manager.begin_mutation()?;
     Ok(Json(
         state
@@ -639,6 +701,7 @@ async fn list_sides(
     Query(query): Query<SidesQuery>,
 ) -> ApiResult<Response> {
     authorize(&state, &headers, false)?;
+    let id = state.store.resolve_agent_id(&id)?;
     let statuses = query
         .statuses
         .unwrap_or_default()
@@ -685,6 +748,7 @@ async fn create_side(
     Json(body): Json<MessageBody>,
 ) -> ApiResult<Json<Value>> {
     authorize(&state, &headers, true)?;
+    let id = state.store.resolve_agent_id(&id)?;
     let _mutation = state.manager.begin_mutation()?;
     Ok(Json(
         state
@@ -705,6 +769,7 @@ async fn side_status(
     Path(id): Path<String>,
 ) -> ApiResult<Json<crate::store::SideMetadata>> {
     authorize(&state, &headers, false)?;
+    let id = state.store.resolve_side_id(&id)?;
     Ok(Json(state.store.load_side_metadata(&id)?))
 }
 
@@ -714,6 +779,7 @@ async fn stop_side(
     Path(id): Path<String>,
 ) -> ApiResult<Json<crate::store::SideMetadata>> {
     authorize(&state, &headers, true)?;
+    let id = state.store.resolve_side_id(&id)?;
     let _mutation = state.manager.begin_mutation()?;
     Ok(Json(state.manager.stop_side(&id, "user_request").await?))
 }
@@ -724,6 +790,7 @@ async fn delete_side(
     Path(id): Path<String>,
 ) -> ApiResult<Json<Value>> {
     authorize(&state, &headers, true)?;
+    let id = state.store.resolve_side_id(&id)?;
     let _mutation = state.manager.begin_mutation()?;
     Ok(Json(state.manager.delete_side(&id).await?))
 }
@@ -735,6 +802,7 @@ async fn side_events(
     Query(query): Query<EventsQuery>,
 ) -> ApiResult<Response> {
     authorize(&state, &headers, false)?;
+    let id = state.store.resolve_side_id(&id)?;
     let types = event_types(query.types.as_deref());
     let limit = query.limit.unwrap_or(50).clamp(1, 200);
     let events = state.store.query_events(
@@ -754,6 +822,8 @@ async fn full_side_event(
     Path((id, event_id)): Path<(String, String)>,
 ) -> ApiResult<Json<EventRecord>> {
     authorize(&state, &headers, false)?;
+    let id = state.store.resolve_side_id(&id)?;
+    let event_id = state.store.resolve_event_id(&id, true, &event_id)?;
     let event = state.store.find_event(&id, true, &event_id)?;
     Ok(Json(event))
 }
@@ -765,6 +835,7 @@ async fn side_event_stream(
     Query(query): Query<EventsQuery>,
 ) -> ApiResult<Sse<impl futures_util::Stream<Item = std::result::Result<Event, Infallible>>>> {
     authorize(&state, &headers, false)?;
+    let id = state.store.resolve_side_id(&id)?;
     state.store.load_side_metadata(&id)?;
     let mut cursor = query.after;
     if cursor.is_none() {
@@ -797,6 +868,7 @@ async fn set_time(
     Json(body): Json<TimeBody>,
 ) -> ApiResult<Json<Value>> {
     authorize(&state, &headers, true)?;
+    let id = state.store.resolve_agent_id(&id)?;
     let _mutation = state.manager.begin_mutation()?;
     Ok(Json(agent_value(
         state.manager.update_time(&id, body.minutes).await?,
@@ -808,6 +880,7 @@ async fn stop_agent(
     Path(id): Path<String>,
 ) -> ApiResult<Json<Value>> {
     authorize(&state, &headers, true)?;
+    let id = state.store.resolve_agent_id(&id)?;
     let _mutation = state.manager.begin_mutation()?;
     Ok(Json(agent_value(
         state.manager.stop(&id, "user_request").await?,
@@ -827,6 +900,7 @@ async fn list_messages(
     Query(query): Query<MessagesQuery>,
 ) -> ApiResult<Response> {
     authorize(&state, &headers, false)?;
+    let id = state.store.resolve_agent_id(&id)?;
     let limit = query.limit.unwrap_or(100);
     if !(1..=crate::ipc::MAX_LIST_LIMIT).contains(&limit) {
         return Err(ApiError(coded_error(
@@ -862,6 +936,8 @@ async fn message_status(
     Path((id, message_id)): Path<(String, String)>,
 ) -> ApiResult<Json<Value>> {
     authorize(&state, &headers, false)?;
+    let id = state.store.resolve_agent_id(&id)?;
+    let message_id = state.store.resolve_message_id(&id, &message_id)?;
     Ok(Json(serde_json::to_value(
         state.store.load_message(&id, &message_id)?,
     )?))
@@ -872,9 +948,11 @@ async fn cancel_message(
     Path((id, message_id)): Path<(String, String)>,
 ) -> ApiResult<Json<Value>> {
     authorize(&state, &headers, true)?;
+    let id = state.store.resolve_agent_id(&id)?;
+    let message_id = state.store.resolve_message_id(&id, &message_id)?;
     let _mutation = state.manager.begin_mutation()?;
     Ok(Json(serde_json::to_value(
-        state.manager.cancel_message(&id, &message_id)?,
+        state.manager.cancel_message(&id, &message_id).await?,
     )?))
 }
 

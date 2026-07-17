@@ -1,0 +1,2 @@
+Compacted earlier history:
+{{summary}}

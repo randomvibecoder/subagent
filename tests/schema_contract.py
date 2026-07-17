@@ -36,10 +36,13 @@ assert "active_differs_from_local" in schema["$defs"]["ConfigValue"]["required"]
 assert {"$ref": "#/$defs/InboxSummary"} in schema["oneOf"]
 assert {"$ref": "#/$defs/LogsSummary"} in schema["oneOf"]
 assert schema["$defs"]["DaemonRunning"]["properties"]["protocol_version"] == {
-    "const": 5
+    "const": 6
 }
 codes = set(schema["$defs"]["Error"]["properties"]["code"]["enum"])
 assert {"side_not_found", "protocol_mismatch"} <= codes
+assert {"FinalAnswer", "TeamMember", "TeamSummary", "WaitSummary"} <= set(
+    schema["$defs"]
+)
 
 format_checker = jsonschema.FormatChecker()
 
@@ -86,12 +89,39 @@ assert_invalid(
         "agent_id": "agt_01ARZ3NDEKTSV4RRFFQ69G5FAV",
         "agent_ref": "a_1",
         "content": "queued",
+        "intent": "followup",
         "status": "pending",
         "sent_at": "2026-07-16T00:00:00Z",
         "delivered_at": "2026-07-16T00:00:01Z",
         "cancelled_at": None,
     }
 )
+
+valid_followup_receipt = {
+    "type": "followup_sent",
+    "message_id": "msg_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+    "message_ref": "m_1",
+    "agent_id": "agt_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+    "agent_ref": "a_1",
+    "status": "queued",
+    "sent_at": "2026-07-16T00:00:00Z",
+    "agent_resumed": True,
+    "run_number": 2,
+    "agent_status": "working",
+    "resume_state": "started",
+    "intent": "followup",
+}
+assert not list(validator.iter_errors(valid_followup_receipt))
+
+valid_wait_summary = {
+    "type": "wait_summary",
+    "resource": "inbox",
+    "matched": False,
+    "count": 0,
+    "after_sequence": 42,
+    "timeout_seconds": 60,
+}
+assert not list(validator.iter_errors(valid_wait_summary))
 assert_invalid(
     {
         "type": "message_sent",
@@ -105,6 +135,7 @@ assert_invalid(
         "run_number": 1,
         "agent_status": "failed",
         "resume_state": "started",
+        "intent": "followup",
     }
 )
 assert_invalid(

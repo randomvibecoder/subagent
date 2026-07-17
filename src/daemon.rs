@@ -11,6 +11,7 @@ use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     net::{UnixListener, UnixStream},
     sync::watch,
+    task::JoinSet,
 };
 
 pub async fn serve(cfg: RuntimeConfig, web_ui_port: Option<u16>) -> Result<()> {
@@ -57,17 +58,39 @@ pub async fn serve(cfg: RuntimeConfig, web_ui_port: Option<u16>) -> Result<()> {
         );
     }
     let mut stall_tick = tokio::time::interval(std::time::Duration::from_secs(5));
+    let mut connections = JoinSet::new();
     stall_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             accepted=listener.accept()=>{
-                let (stream,_)=accepted?;let manager=manager.clone();let store=store.clone();let cfg=cfg.clone();let tx=shutdown_tx.clone();let web_ui_url=web_ui_url.clone();let web_auth=web_auth.clone();
-                tokio::spawn(async move{if let Err(e)=handle_connection(stream,manager,store,cfg,tx,web_ui_url,web_auth).await{eprintln!("ipc error: {e:#}");}});
+                let (stream, _) = accepted?;
+                let manager = manager.clone();
+                let store = store.clone();
+                let cfg = cfg.clone();
+                let tx = shutdown_tx.clone();
+                let web_ui_url = web_ui_url.clone();
+                let web_auth = web_auth.clone();
+                connections.spawn(async move {
+                    if let Err(error) = handle_connection(
+                        stream,
+                        manager,
+                        store,
+                        cfg,
+                        tx,
+                        web_ui_url,
+                        web_auth,
+                    )
+                    .await
+                    {
+                        eprintln!("ipc error: {error:#}");
+                    }
+                });
             }
             _=shutdown_rx.changed()=>{if *shutdown_rx.borrow(){break}}
             _=stall_tick.tick()=>{if let Err(error)=manager.check_stalls(){eprintln!("stall watchdog error: {error:#}");}}
         }
     }
+    while connections.join_next().await.is_some() {}
     manager.wait_for_mutations().await;
     if let Err(error) = manager.stop_all("daemon_shutdown").await {
         write_daemon_lifecycle(
@@ -99,6 +122,7 @@ async fn handle_connection(
     let mut lines = BufReader::new(read_half).lines();
     let line = lines.next_line().await?.context("empty request")?;
     let request: Request = serde_json::from_str(&line).context("invalid request JSON")?;
+    let mut connection_shutdown = shutdown.subscribe();
     match dispatch(
         request,
         &manager,
@@ -125,11 +149,14 @@ async fn handle_connection(
             follow_logs(
                 &mut write_half,
                 &store,
-                &id,
-                &types,
-                after.as_deref(),
-                limit,
-                side,
+                FollowLogOptions {
+                    id: &id,
+                    types: &types,
+                    after: after.as_deref(),
+                    limit,
+                    side,
+                },
+                &mut connection_shutdown,
             )
             .await?
         }
@@ -144,6 +171,7 @@ async fn handle_connection(
                 after_sequence,
                 minimum_priority,
                 agent_id.as_deref(),
+                &mut connection_shutdown,
             )
             .await?
         }
@@ -277,7 +305,7 @@ async fn dispatch(
             id,
             timeout_seconds,
         } => vec![agent_value(
-            wait_for_agent(store, &id, timeout_seconds).await?,
+            wait_for_agent(store, &id, timeout_seconds, shutdown.subscribe()).await?,
         )?],
         Request::AgentRename { id, name } => vec![manager.rename(&id, name).await?],
         Request::AgentLogs {
@@ -319,6 +347,18 @@ async fn dispatch(
             message,
             wall_time_minutes,
         } => vec![manager.send(&id, message, wall_time_minutes).await?],
+        Request::AgentFollowup {
+            id,
+            message,
+            wall_time_minutes,
+        } => vec![manager.followup(&id, message, wall_time_minutes).await?],
+        Request::MessageSend { id, message } => {
+            vec![manager.message(&id, message).await?]
+        }
+        Request::AgentInterrupt { id } => {
+            vec![agent_value(manager.interrupt(&id).await?)?]
+        }
+        Request::TeamList => manager.team_values()?,
         Request::SideCreate {
             id,
             message,
@@ -354,6 +394,7 @@ async fn dispatch(
                 after_cursor,
                 minimum_priority,
                 agent_id,
+                envelope_type: None,
                 include_acknowledged,
             })?;
             let mut values = page
@@ -391,6 +432,54 @@ async fn dispatch(
                 minimum_priority,
                 agent_id,
             });
+        }
+        Request::InboxWait {
+            after_sequence,
+            timeout_seconds,
+            minimum_priority,
+            agent_id,
+            event_types,
+        } => {
+            if !(1..=86_400).contains(&timeout_seconds) || !(1..=4).contains(&minimum_priority) {
+                return Err(coded_error(
+                    "invalid_argument",
+                    "inbox wait timeout must be 1..=86400 and priority must be 1..=4",
+                    json!({"timeout_seconds":timeout_seconds,"priority":minimum_priority}),
+                    false,
+                ));
+            }
+            let after = after_sequence.unwrap_or(store.latest_notification_sequence()?);
+            let started = tokio::time::Instant::now();
+            let mut stopping = shutdown.subscribe();
+            let value = loop {
+                if let Some(notification) = store.first_notification_after(
+                    after,
+                    minimum_priority,
+                    agent_id.as_deref(),
+                    &event_types,
+                )? {
+                    break serde_json::to_value(notification)?;
+                }
+                if started.elapsed().as_secs() >= timeout_seconds {
+                    break json!({
+                        "type":"wait_summary",
+                        "resource":"inbox",
+                        "matched":false,
+                        "count":0,
+                        "after_sequence":after,
+                        "timeout_seconds":timeout_seconds,
+                    });
+                }
+                tokio::select! {
+                    _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+                    changed = stopping.changed() => {
+                        if changed.is_err() || *stopping.borrow() {
+                            return Err(daemon_stopping_error());
+                        }
+                    }
+                }
+            };
+            vec![value]
         }
         Request::SideList {
             agent_id,
@@ -502,7 +591,7 @@ async fn dispatch(
             message_id,
         } => {
             vec![serde_json::to_value(
-                manager.cancel_message(&agent_id, &message_id)?,
+                manager.cancel_message(&agent_id, &message_id).await?,
             )?]
         }
     };
@@ -515,6 +604,9 @@ fn request_is_mutating(request: &Request) -> bool {
         Request::AgentSpawn { .. }
             | Request::AgentRename { .. }
             | Request::AgentSend { .. }
+            | Request::AgentFollowup { .. }
+            | Request::MessageSend { .. }
+            | Request::AgentInterrupt { .. }
             | Request::SideCreate { .. }
             | Request::InboxAck { .. }
             | Request::SideStop { .. }
@@ -553,6 +645,22 @@ fn resolve_local_references(req: Request, store: &Store) -> Result<Request> {
             id: store.resolve_agent_id(&id)?,
             message,
             wall_time_minutes,
+        },
+        Request::AgentFollowup {
+            id,
+            message,
+            wall_time_minutes,
+        } => Request::AgentFollowup {
+            id: store.resolve_agent_id(&id)?,
+            message,
+            wall_time_minutes,
+        },
+        Request::MessageSend { id, message } => Request::MessageSend {
+            id: store.resolve_agent_id(&id)?,
+            message,
+        },
+        Request::AgentInterrupt { id } => Request::AgentInterrupt {
+            id: store.resolve_agent_id(&id)?,
         },
         Request::SideCreate {
             id,
@@ -696,6 +804,19 @@ fn resolve_local_references(req: Request, store: &Store) -> Result<Request> {
             minimum_priority,
             agent_id: agent_id.map(|id| store.resolve_agent_id(&id)).transpose()?,
         },
+        Request::InboxWait {
+            after_sequence,
+            timeout_seconds,
+            minimum_priority,
+            agent_id,
+            event_types,
+        } => Request::InboxWait {
+            after_sequence,
+            timeout_seconds,
+            minimum_priority,
+            agent_id: agent_id.map(|id| store.resolve_agent_id(&id)).transpose()?,
+            event_types,
+        },
         other => other,
     })
 }
@@ -704,6 +825,7 @@ async fn wait_for_agent(
     store: &Store,
     id: &str,
     timeout_seconds: Option<u64>,
+    mut shutdown: watch::Receiver<bool>,
 ) -> Result<crate::store::AgentMetadata> {
     let started = tokio::time::Instant::now();
     loop {
@@ -719,7 +841,14 @@ async fn wait_for_agent(
                 true,
             ));
         }
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() {
+                    return Err(daemon_stopping_error());
+                }
+            }
+        }
     }
 }
 
@@ -733,6 +862,15 @@ fn cursor_offset_error(resource: &str, offset: usize) -> anyhow::Error {
         format!("{resource} cursor may only be combined with offset 0"),
         json!({"fields":["after_cursor","offset"],"offset":offset}),
         false,
+    )
+}
+
+fn daemon_stopping_error() -> anyhow::Error {
+    coded_error(
+        "conflict",
+        "daemon is stopping and no longer accepts this request",
+        json!({"daemon_status":"stopping"}),
+        true,
     )
 }
 
@@ -780,15 +918,27 @@ fn context_lines(
     Ok(out)
 }
 
+struct FollowLogOptions<'a> {
+    id: &'a str,
+    types: &'a [String],
+    after: Option<&'a str>,
+    limit: usize,
+    side: bool,
+}
+
 async fn follow_logs<W: tokio::io::AsyncWrite + Unpin>(
     writer: &mut W,
     store: &Store,
-    id: &str,
-    types: &[String],
-    after: Option<&str>,
-    limit: usize,
-    side: bool,
+    options: FollowLogOptions<'_>,
+    shutdown: &mut watch::Receiver<bool>,
 ) -> Result<()> {
+    let FollowLogOptions {
+        id,
+        types,
+        after,
+        limit,
+        side,
+    } = options;
     let mut cursor = after.map(str::to_string);
     let initial = query_logs(store, id, side, types, after, limit)?;
     for event in initial {
@@ -796,7 +946,12 @@ async fn follow_logs<W: tokio::io::AsyncWrite + Unpin>(
         write_json_line(writer, &serde_json::to_value(event)?).await?;
     }
     loop {
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {}
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() { return Ok(()); }
+            }
+        }
         let events = query_logs(store, id, side, types, cursor.as_deref(), 10_000)?;
         for event in events {
             cursor = Some(event.event_id.clone());
@@ -824,13 +979,19 @@ async fn follow_notifications<W: tokio::io::AsyncWrite + Unpin>(
     mut after_sequence: u64,
     minimum_priority: u8,
     agent_id: Option<&str>,
+    shutdown: &mut watch::Receiver<bool>,
 ) -> Result<()> {
     loop {
         for notification in store.notifications_after(after_sequence, minimum_priority, agent_id)? {
             after_sequence = after_sequence.max(notification.sequence);
             write_json_line(writer, &serde_json::to_value(notification)?).await?;
         }
-        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
+            changed = shutdown.changed() => {
+                if changed.is_err() || *shutdown.borrow() { return Ok(()); }
+            }
+        }
     }
 }
 

@@ -55,6 +55,7 @@ assert.match(result, /failed cleanly/);
 assert.doesNotMatch(result, /\{"ok"/);
 
 assert.equal(ui.noticeText({ type: "message_sent" }), "Message queued");
+assert.equal(ui.noticeText({ type: "followup_sent" }), "Follow-up queued");
 assert.equal(
   ui.noticeText({ type: "agent_renamed", name: "Builder" }),
   "Agent renamed to Builder",

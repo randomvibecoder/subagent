@@ -1,431 +1,253 @@
 ---
 name: subagent-cli
-description: Use the subagent JSONL CLI to install, configure, start, monitor, message, question, stop, and delete persistent background coding agents. Trigger for delegated or parallel coding work and requests involving subagent daemon, agents, messages, or config commands.
+description: Delegate, monitor, steer, interrupt, and collect final answers from persistent background coding Agents and readonly context-inheriting Sides through the Subagent JSONL CLI. Use for parallel or long-running coding work, keeping a coordinator's context small, supervising multiple models, or operating the subagent daemon, team, inbox, messages, Agents, and Sides.
 ---
 
 # Subagent CLI
 
-Use subagent to run coding agents through a detached per-user daemon. Background work
-returns a preferred short ref plus durable ID immediately. Every operational response is UTF-8 JSONL: one object per
-line, never a top-level array. Help and version output are plain text.
+Use `subagent` as a task system. Keep the coordinator focused on delegation, progress, and final answers; do not import raw code, tool output, or complete transcripts unless debugging requires it.
 
-For exact input grammar, output schemas, lifecycle, errors, tools, and edge behavior,
-read [references/protocol.md](references/protocol.md). Before implementing a parser or
-using an unfamiliar command, also read
-[references/cli.schema.json](references/cli.schema.json).
+Operational output is UTF-8 JSONL: one object per line, never a top-level array. Prefer short local refs such as `a_7`, `s_3`, `m_12`, and `e_90`. Retain ULIDs for exports, backups, HTTP integrations, or cross-machine data.
 
-## Install
+For exact schemas, lifecycle invariants, tools, cursors, HTTP endpoints, and error codes, read [references/protocol.md](references/protocol.md) and [references/cli.schema.json](references/cli.schema.json).
 
-Linux x86-64 only. This always installs the latest statically linked release:
+## Install and start
+
+Install the latest static Linux x86-64 release:
 
 ~~~sh
 curl -fsSL https://raw.githubusercontent.com/randomvibecoder/subagent/main/install.sh | sh
 ~~~
 
-The installer verifies SHA-256 and writes to $HOME/.local/bin/subagent. To choose
-another user-owned destination:
-
-~~~sh
-curl -fsSL https://raw.githubusercontent.com/randomvibecoder/subagent/main/install.sh |
-  SUBAGENT_INSTALL_DIR="$HOME/bin" sh
-~~~
-
-## Start the daemon
+Configure the OpenAI-compatible Chat Completions endpoint and start the daemon:
 
 ~~~sh
 export OPENAI_API_KEY='...'
-export OPENAI_BASE_URL='https://example.com/v1'
+export OPENAI_BASE_URL='https://api.openai.com/v1'
 export OPENAI_MODEL='your-model'
 subagent daemon start
 ~~~
 
-The daemon captures these values at startup. Restart it after config or environment
-changes. It removes OPENAI_API_KEY and SUBAGENT_WEB_PASSWORD from agent shell
-environments, but this is not a sandbox: agents retain the daemon user's other host,
-filesystem, process, network, and credential access.
+The daemon captures environment values at startup. Restart after changing them. Agent shell commands run with the daemon user's host permissions. Readonly mode and Side non-mutation rules are advisory, not an OS sandbox.
 
-## Optional Web UI
+## Recommended workflow
 
-The Web UI is only needed when a human is in the loop and wants to watch transcripts,
-inspect tool calls, send messages, or manage agents interactively. Agents and automated
-workflows should use the JSONL CLI directly; they do not need to start or open the Web
-UI. To enable the localhost-only interface for a human:
-
-~~~sh
-subagent daemon start --web-ui-port 7341
-~~~
-
-To require a password even on localhost, set it only in the startup environment:
-
-~~~sh
-SUBAGENT_WEB_PASSWORD='choose-a-secret' \
-  subagent daemon start --web-ui-port 7341
-~~~
-
-Open the plain `web_ui_url` returned by `daemon start` or `daemon status`. HTTP Basic
-Auth uses the fixed username `subagent`. If `SUBAGENT_WEB_PASSWORD` is absent, the
-localhost UI is unauthenticated. `web_auth` reports `basic`, `none`, or `null` when the
-UI is disabled; the password is never returned and is removed from agent shell
-environments. The Web UI exposes human-facing views of CLI capabilities; it is not
-required for daemon or agent operation.
-
-## Happy path
-
-Start independent background work:
+### 1. Delegate
 
 ~~~sh
 subagent agents spawn \
+  --name "API tests" \
   --dir /home/me/project \
-  --message "Build the website" \
-  --name "Website"
+  --mode write \
+  --message "Add regression tests, run them, and summarize the result"
 ~~~
 
-Output is one Agent. Prefer its short local `ref`; retain `id` for exports and external integrations:
+Spawn returns one complete Agent immediately. Save `ref` for local commands:
 
 ~~~json
-{"type":"agent","id":"agt_...","ref":"a_1","name":"Website","dir":"/home/me/project","status":"working","spawned_at":"2026-07-10T12:00:00Z","last_message_at":"2026-07-10T12:00:00Z","updated_at":"2026-07-10T12:00:00Z"}
+{"type":"agent","id":"agt_...","ref":"a_7","name":"API tests","status":"working","run_number":1,"final_answer":null}
 ~~~
 
-The actual Agent contains every field defined in the schema reference.
+Use `--model MODEL` to override the daemon model for one Agent. Normal Agents start with only the Agent system prompt and their assigned task; they do not inherit another Agent's conversation.
 
-List all working agents:
+### 2. Supervise the team
 
 ~~~sh
-subagent agents list --status working
+subagent team list
 ~~~
 
-Each match is one compact agent_list_item line followed by a `list_summary`. Zero matches still emits `{"type":"list_summary","resource":"agents","count":0}`:
+This is the preferred coordinator view. It emits one `team_member` per Agent and Side, then one `team_summary`. Members include model, task, lifecycle status, derived coordination state, elapsed time, pending-message count, latest progress, and the full authoritative final answer when available. The summary includes working and available Agent slots.
+
+Wait for the first future high-signal update without polling:
+
+~~~sh
+subagent inbox wait --timeout-seconds 300 --priority 2
+~~~
+
+The command returns the first matching Notification and exits. With no match before the deadline it exits successfully with:
 
 ~~~json
-{"type":"agent_list_item","id":"agt_1...","ref":"a_1","name":"Website","status":"working","model":"gpt-5.4-mini","current_phase":"requesting_model","last_event_at":"...","dir":"/home/me/project","mode":"readonly","spawned_at":"...","last_message_at":"...","updated_at":"...","run_number":1,"working_sides":0}
-{"type":"list_summary","resource":"agents","count":1,"next_cursor":null}
+{"type":"wait_summary","resource":"inbox","matched":false,"count":0,"after_sequence":42,"timeout_seconds":300}
 ~~~
 
-Inspect one:
+Use `--after SEQUENCE` to include existing records after a known sequence. Filter with `--agent AGENT`, `--priority 1..4`, or repeat `--type TYPE`.
+
+### 3. Steer deliberately
+
+Assign more work and wake or resume the Agent:
 
 ~~~sh
-subagent agents status a_1
+subagent agents followup a_7 --message "Also test the error response"
 ~~~
 
-Read its transcript:
+`subagent agents send` remains a behavior-compatible alias for `agents followup`.
+It returns the historical `message_sent` receipt type; `agents followup` returns
+`followup_sent`.
+
+Store context without waking an inactive Agent:
 
 ~~~sh
-subagent agents logs a_1
+subagent messages send a_7 --message "The API contract changed yesterday"
 ~~~
 
-By default Agent logs emit the newest 20 system, user, and assistant Events in
-chronological order, followed by `logs_summary`. Tool calls/results, reasoning,
-lifecycle, and errors are excluded so they do not waste model context.
+Both commands return immediately after durable acceptance. A receipt includes the Message ID/ref, intent, Agent status, run number, whether a run resumed, and one of:
 
-Prefer the high-signal inbox when coordinating several agents:
+- `not_needed`: the Agent was already working.
+- `started`: a new working run began.
+- `waiting_for_capacity`: the follow-up is pending and no slot is free.
+- `not_woken`: a Message was stored for an inactive Agent.
+
+Messages for a working Agent are delivered FIFO at the next safe model boundary. Inspect or cancel pending Messages with:
 
 ~~~sh
-subagent inbox list --agent a_1 --priority 3 --limit 50 --offset 0
+subagent messages list a_7 --status pending
+subagent messages status a_7 m_12
+subagent messages cancel a_7 m_12
 ~~~
 
-Inbox emits unread durable Notifications newest-first, then one `inbox_summary`. The default is
-the newest 20 unread entries at priority 2 or higher. Agents publish meaningful progress,
-milestones, requests for input, and blockers; spawn, resume, finish, stop, and failure
-notifications are automatic. This is the recommended master-agent view because it
-avoids importing transcripts, code, tool calls, and tool results into the master's
-context.
+### 4. Interrupt or stop
 
-Send durable follow-up work:
+Interrupt only the current turn while preserving the Agent, context, and pending Messages:
 
 ~~~sh
-subagent agents send a_1 --message "Also add dark mode"
+subagent agents interrupt a_7
 ~~~
 
-The daemon stores the message before returning:
+The Agent becomes `interrupted`. Resume it only with `agents followup` or the `agents send` alias.
 
-~~~json
-{"type":"message_sent","message_id":"msg_...","message_ref":"m_1","agent_id":"agt_...","agent_ref":"a_1","status":"queued","agent_resumed":false,"run_number":1,"agent_status":"working","resume_state":"not_needed","sent_at":"2026-07-10T12:05:00Z"}
-~~~
-
-Sent means durably accepted, not yet consumed by the model. Poll it:
+Stop creates a terminal stopped lifecycle transition and cancels pending Messages:
 
 ~~~sh
-subagent messages status a_1 m_1
+subagent agents stop a_7
 ~~~
 
-~~~json
-{"type":"message","id":"msg_...","ref":"m_1","agent_id":"agt_...","agent_ref":"a_1","content":"Also add dark mode","status":"delivered","sent_at":"...","delivered_at":"...","cancelled_at":null}
-~~~
-
-Start one durable readonly Side question:
+Delete removes daemon-managed history only. It never deletes or reverts workspace files:
 
 ~~~sh
-subagent sides create a_1 --message "Which framework is it using?"
+subagent agents delete a_7
 ~~~
 
-Output is a side_created receipt with a stable `side_<ULID>` and local `s_` reference. It returns immediately.
-Inspect the saved answer and tool trace with sides status and sides logs. `sides create`
-is the sole Agent-context Side creation command.
+### 5. Consume the result
 
-## Commands
+A successful run must produce nonempty assistant content. One empty provider turn is retried; a second fails with `empty_completion`.
 
-### Daemon
+The authoritative `FINAL_ANSWER` is stored in all three places:
+
+- `final_answer` in `agents status` or `sides status`.
+- The terminal `team_member`.
+- The completion Notification's typed payload.
+
+Each answer includes content, run number, Event ID/ref, and timestamp. Answers are limited to 1 MiB and are never silently truncated. Starting a new Agent run clears its current `final_answer`; historical Events and Notifications remain durable.
+
+## Sides
+
+Use a Side for one bounded question that needs the parent Agent's conversational context:
+
+~~~sh
+subagent sides create a_7 --message "Which migration is still unsafe?"
+~~~
+
+A Side:
+
+- Inherits a frozen, compacted snapshot of the parent model context.
+- Reads the same live working directory.
+- Runs readonly tools under advisory non-mutation instructions.
+- Has its own durable transcript and terminal processes.
+- Is one-shot and cannot receive follow-ups.
+- Does not add its trace to the parent context.
+- Publishes the same typed `FINAL_ANSWER` envelope as an Agent.
+
+Inspect it with:
+
+~~~sh
+subagent sides list a_7
+subagent sides status s_3
+subagent sides logs s_3
+subagent sides stop s_3
+subagent sides delete s_3
+~~~
+
+Sides remain a separate resource, not nested child Agents. At most two Sides may work for one parent at once.
+
+## Command reference
+
+### Agents and team
 
 ~~~text
-subagent daemon start
-subagent daemon status
-subagent daemon stop
-~~~
+subagent team list
 
-Start and status emit one daemon object. Stop returns status stopping before full
-shutdown. Agent commands never auto-start the daemon.
-
-### Agents
-
-~~~text
 subagent agents spawn --name NAME --dir DIR (--message TEXT | --message-file PATH)
     [--mode readonly|write] [--model MODEL] [--wall-time-minutes MINUTES]
-
-subagent agents list
-    [--status working|finished|stopped|failed]...
-    [--dir DIR]
-    [--spawned-after RFC3339] [--spawned-before RFC3339]
-    [--finished-after RFC3339] [--finished-before RFC3339]
-    [--sort spawned_at|updated_at|finished_at]
-    [--order asc|desc] [--limit N] [--offset N] [--after-cursor CURSOR] [--verbose]
-
+subagent agents list [--status STATUS]... [--limit N] [--after-cursor CURSOR] [--verbose]
 subagent agents status AGENT
 subagent agents wait AGENT [--timeout-seconds SECONDS]
 subagent agents rename AGENT NEW_NAME
-
-subagent agents logs AGENT
-    [--type EVENT_TYPE]... [--all]
-    [--after EVENT_ID] [--limit N] [--follow]
-
-subagent agents context AGENT
-
-subagent agents send AGENT
-    (--message TEXT | --message-file PATH) [--wall-time-minutes MINUTES]
-
-subagent sides create AGENT
-    (--message TEXT | --message-file PATH) [--model MODEL]
-    [--wall-time-minutes MINUTES]
-
+subagent agents followup AGENT (--message TEXT | --message-file PATH) [--wall-time-minutes MINUTES]
+subagent agents send AGENT (--message TEXT | --message-file PATH) [--wall-time-minutes MINUTES]
+subagent agents interrupt AGENT
 subagent agents time AGENT MINUTES
 subagent agents stop AGENT
 subagent agents delete AGENT
 ~~~
 
-Spawn returns immediately with a preferred a_N ref and durable Agent ID. Relative paths resolve from DIR; absolute
-paths, .., and escaping symlinks are permitted because DIR is a working directory, not
-a security boundary.
-
-NAME is mandatory, trimmed, 4–40 Unicode scalar values, control-free, case-sensitive,
-and unique across all stored agents. Canonical system IDs/refs are reserved, while
-prefix-like names such as `a_team` remain valid. Commands resolve the full durable ID,
-then short local reference, then exact Agent name. Rename works in every state and returns one agent_renamed
-receipt. MINUTES is an integer from 1 through 6000; omission means no deadline.
-Each agent_list_item also contains working_sides, from zero through two.
-Compact list output includes model, current_phase, and last_event_at. `--verbose`
-emits the full Agent telemetry plus working_sides and seconds_since_last_event.
-Agent and Side list limits default to 100 and accept 1 through 1000. The final Agent
-list_summary contains a nullable `next_cursor`; pass a non-null value back through
-`--after-cursor` for keyset pagination. Cursor mode permits omitted `--offset` or
-explicit `--offset 0` and rejects nonzero offset. Offset-only pagination remains
-available for compatibility but is less stable during concurrent updates.
-MODEL overrides the daemon default only for the new Agent and remains attached across
-resumed runs. Omit it to use the daemon default.
-
-### Sides
-
-~~~text
-subagent sides create AGENT
-    (--message TEXT | --message-file PATH) [--model MODEL]
-    [--wall-time-minutes MINUTES]
-subagent sides list AGENT
-    [--status working|finished|stopped|failed]... [--limit N] [--offset N]
-    [--after-cursor CURSOR]
-subagent sides status SIDE
-subagent sides logs SIDE
-    [--type EVENT_TYPE]... [--all] [--after EVENT_ID] [--limit N] [--follow]
-subagent sides stop SIDE
-subagent sides delete SIDE
-~~~
-
-Side creation is asynchronous and persistent. At most two Side runs may be working
-for one parent; a third returns capacity_exceeded. list emits compact Side records
-including model/current_phase and a cursor-bearing summary,
-status includes the full question and nullable answer, and logs exposes the saved
-conversation, reasoning, tool calls, and tool results. A daemon interruption marks a
-working Side stopped instead of resuming it. Deleting a parent stops its working
-Sides and removes all its Side histories. Side never appends to parent context.
-
-Agent timestamps:
-
-- spawned_at: creation time.
-- last_message_at and last_message_sent_at: latest daemon acceptance of user input;
-  both begin at spawned_at for the initial task.
-- last_message_delivered_at: latest input placed into model context; the initial task
-  is direct context and therefore begins at spawned_at even though it is not a durable Message.
-- run_started_at: start of the current run.
-- updated_at: latest consumed message, model/tool activity, deadline change, or state
-transition.
-
-Working status includes `current_phase`, active request telemetry, historical
-`last_provider_request_id`, `last_progress_at`, model/tool timestamps, and
-`retry_count`. Active `request_started_at` and `provider_request_id` are null outside
-requesting_model/retrying_model. A daemon watchdog emits one deduplicated
-`possible_stall` notification after 180 seconds without progress by default. Configure
-`stall-notification-seconds`; zero disables it. The watchdog diagnoses but never stops
-or resumes work.
-
-Omitted Side MODEL inherits the parent Agent model; an override applies only to the
-new Side.
+Agent statuses are `working`, `interrupted`, `finished`, `stopped`, or `failed`. List commands emit zero or more item records followed by one summary record, so empty success is never silent.
 
 ### Inbox
 
 ~~~text
-subagent inbox list [--limit N] [--offset N] [--priority 1|2|3|4]
-    [--after-cursor CURSOR] [--agent AGENT] [--all]
+subagent inbox wait [--after SEQUENCE] [--timeout-seconds N]
+    [--priority 1|2|3|4] [--agent AGENT] [--type TYPE]...
+subagent inbox list [--priority N] [--agent AGENT] [--limit N] [--all]
 subagent inbox ack SEQUENCE_OR_NOTIFICATION_ID
-subagent inbox follow [--after SEQUENCE] [--priority 1|2|3|4]
-    [--agent AGENT]
+subagent inbox follow [--after SEQUENCE] [--priority N] [--agent AGENT]
 ~~~
 
-List output is unread Notification JSONL, newest first, followed by exactly one
-`inbox_summary` containing the emitted count, global acknowledgement watermark, and
-nullable cursor toward older matches.
-limit defaults 20 and accepts 1–100;
-offset defaults zero. priority is a minimum threshold, defaults 2, and therefore
-`--priority 3` includes priorities 3 and 4. agent accepts a ref, durable ID, or
-exact name and also includes its Side notifications. `--all` includes acknowledged
-history. ack durably marks the selected notification and every older sequence
-handled; the watermark never moves backward. follow emits matching unread history
-oldest-first and then flushes new JSONL until disconnected. The journal exposes its
-newest 10,000 entries.
+Typed envelopes are `NEW_TASK`, `MESSAGE`, `FOLLOWUP`, `PROGRESS`, `INTERRUPTED`, `FINAL_ANSWER`, and `FAILED`. Automatic progress comes from lifecycle transitions; Agents use `notify` for meaningful progress. Do not infer progress from arbitrary tool calls.
 
-Priority meanings are: 1 routine progress, 2 milestone/finish, 3 input required or
-stop, and 4 blocker/failure. Natural finish summary is
-the final Agent message, capped at 5,000 Unicode scalar values.
+### Logs
 
-### Log types
+~~~text
+subagent agents logs AGENT [--type EVENT_TYPE]... [--all]
+    [--after EVENT_ID] [--limit N] [--follow]
+subagent sides logs SIDE [--type EVENT_TYPE]... [--all]
+    [--after EVENT_ID] [--limit N] [--follow]
+~~~
 
-Valid types are system_message, user_message, assistant_message, reasoning, tool_call,
-tool_result, lifecycle, and error. Agent logs default to system/user/assistant; Side
-logs default to user/assistant. New Side histories do contain a system_message that can
-be selected explicitly.
-
-- No --type: the Agent or Side default described above.
-- Repeated --type: only those exact types.
-- --all: every type; conflicts with --type.
-- --limit: 1 through 10000; default 20.
-- --after: exclusive same-owner Event cursor.
-- --follow: flush new matches and exit after the agent becomes terminal.
-- Finite output always ends with logs_summary; follow emits Events only.
+Agent logs default to the newest 20 `system_message`, `user_message`, and `assistant_message` Events, emitted chronologically, followed by `logs_summary`. Side logs default to user and assistant messages. Tool calls/results, reasoning, lifecycle, and errors are excluded by default to protect coordinator context. Use `--all` only for diagnosis.
 
 ### Raw context debugging
 
-agents context dumps the complete current persisted model context. Its first line is:
-
-~~~json
-{"type":"context_meta","agent_id":"agt_...","agent_ref":"a_1","agent_name":"Website","message_count":42,"compacted_at":"RFC3339|null"}
-~~~
-
-Remaining lines are unchanged model messages:
-
-~~~json
-{"role":"system","content":"..."}
-{"role":"user","content":"..."}
-{"role":"assistant","content":null,"tool_calls":[...]}
-{"role":"tool","tool_call_id":"call_...","content":"..."}
-~~~
-
-Never print raw context directly into model-visible terminal output. It can contain
-large tool results, image data, system instructions, and sensitive material. Redirect
-it or filter narrowly:
-
 ~~~sh
-subagent agents context agt_... > /tmp/agent-context.jsonl
-subagent agents context agt_... |
-  jq -c 'select(.role == "user" or .role == "assistant")'
+subagent agents context a_7 > context.jsonl
+subagent agents context a_7 | jq -c 'select(.role == "user")'
 ~~~
 
-This is the complete current context, not lifetime history. It may already be
-compacted. Use agents logs --all for persisted Event history.
+`context` dumps the complete raw model context. Never read an unfiltered context dump into an agent conversation: it can be extremely large and is intended for debugging. Redirect it to a file or filter it narrowly with `jq`.
 
-### Durable messages
-
-~~~text
-subagent messages list AGENT [--status pending|delivered|cancelled]...
-    [--limit N] [--after-cursor CURSOR]
-subagent messages status AGENT MESSAGE_ID
-subagent messages cancel AGENT MESSAGE_ID
-~~~
-
-List emits newest-first, applies repeated status filters with OR, and ends with an
-Agent-scoped cursor-bearing `list_summary`. Limit defaults 100 and accepts 1–1000.
-Cancel works only while pending. Delivery is FIFO.
-Pending messages survive daemon failure. On restart, interrupted agents with pending
-messages automatically resume as capacity becomes available. A delivered user_message
-Event contains its message_id.
-
-### Configuration
+### Daemon and configuration
 
 ~~~text
+subagent daemon start [--web-ui-port PORT]
+subagent daemon status
+subagent daemon stop
 subagent config list
 subagent config get KEY
 subagent config set KEY VALUE
 ~~~
 
-Keys: base-url, model, max-agents, context-token-budget,
-tool-output-preview-bytes, and stall-notification-seconds. Base URL/model must be
-nonempty; context and preview budgets must be positive. max-agents defaults to 8; set it to 0 only when unlimited
-concurrency is intentional. Restart the daemon after setting only when the returned
-`restart_required` field is true.
+The Web UI is optional and only useful when a human is in the loop. Start it with `--web-ui-port`; set `SUBAGENT_WEB_PASSWORD` at daemon startup for localhost HTTP Basic authentication. Automated coordinators should normally use the JSONL CLI. A separate harness may use the localhost HTTP API documented in the protocol reference.
 
-Precedence is compiled defaults, persisted config, then environment overrides.
-List emits one `config_value` per key; get emits one. Each record separates default,
-persisted, caller-local effective, and running-daemon active values and their sources.
-`active_differs_from_local` reports any difference between the running daemon and the
-calling shell's effective value. `restart_required` is true only for an unmasked
-persisted/default change that the running daemon has not loaded; both are null when no
-daemon is reachable. Set changes persisted values without copying overrides.
+## Selection rules
 
-## Modes and safety
+- Use `agents spawn` for independent new work.
+- Use `sides create` for a one-shot question requiring a parent Agent's context.
+- Use `team list` for a compact complete overview.
+- Use `inbox wait` to block for any high-signal update.
+- Use `messages send` to add context without waking.
+- Use `agents followup` to assign work and wake or resume.
+- Use `agents interrupt` to cancel one turn but retain resumability.
+- Use `agents stop` for a terminal stop.
+- Use `agents logs` for readable transcript history.
+- Use `agents context` only for filtered debugging.
 
-Write agents receive write, edit, and apply_patch. Readonly and side agents do not.
-They still receive Bash and are instructed never to mutate through it. That instruction
-is advisory, not enforced. Bash exists for inspection such as rg, grep, find, cat, and
-non-in-place sed.
-
-Deleting an agent stops its working Side runs and removes daemon metadata, context,
-Events, Messages, Side histories, and stored terminal output. It never deletes or
-reverts the working directory, project files, Git state, commits, or branches.
-
-Every Event has explicit `owner:"agent"|"side"`. Agent Events omit `side_id` and
-`side_ref`; Side Events include both, while `agent_id`/`agent_ref` identify their
-parent. Per-owner mutations are serialized. Exactly one terminal transition wins,
-and terminal metadata has exactly one matching finished/stopped/failed timestamp,
-null deadline/request fields, and the matching terminal phase. On upgrade, protocol 5
-deletes daemon-owned records that already contradict those invariants, including their
-dependent Side histories and notifications; it never touches the project directory.
-
-Graceful daemon shutdown stops accepting mutations, waits for accepted mutations,
-and reports cleanup failure instead of writing a clean-stop marker. Terminal process
-ownership is memory-only: daemon SIGKILL, host crash, or a descendant that escapes its
-process group can leave processes behind. Subagent is not crash-proof OS isolation.
-
-## Choosing a command
-
-- New independent task: agents spawn.
-- List active work: agents list --status working.
-- Coordinate many agents without context rot: inbox list, optionally filtered by agent or
-  priority.
-- Inspect normal conversation: agents logs.
-- Inspect tools/errors: agents logs with --type or --all.
-- Durable instruction: agents send, then messages status.
-- Focused readonly question: sides create, then sides status or sides logs.
-- Debug exact model input: agents context, redirected or filtered.
-- End active work: agents stop.
-- Remove daemon history: agents delete only with explicit authorization.
-
-The v0.1.8 contract uses `protocol_version:5`. The binary reports `version` and
-`protocol_version` in daemon status. Operational CLI
-commands reject an incompatible running daemon with `protocol_mismatch`; restart the
-daemon after replacing the binary. The latest binary, this skill, the protocol
-reference, and the JSON Schema form one contract.
+Always inspect command exit status and stderr. Success JSONL is written to stdout; one structured Error is written to stderr. Streaming commands can emit valid stdout before a later connection error.

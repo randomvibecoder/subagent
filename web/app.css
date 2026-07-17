@@ -382,6 +382,10 @@ main {
   color: var(--blue);
   border-color: #224b6d;
 }
+.status.interrupted {
+  color: #e3b341;
+  border-color: #6a5120;
+}
 .status.failed {
   color: #ff938a;
   border-color: #762b27;
@@ -701,7 +705,7 @@ textarea {
 }
 .chat-composer {
   display: grid;
-  grid-template-columns: 1fr auto;
+  grid-template-columns: auto 1fr auto;
   gap: 10px;
   width: min(860px, calc(100% - 60px));
   margin: 0 auto 20px;
@@ -711,6 +715,35 @@ textarea {
   background: #0d0d0d;
   box-shadow: 0 -16px 42px rgba(0, 0, 0, 0.55);
 }
+.chat-composer select {
+  align-self: end;
+  width: 170px;
+  height: 42px;
+}
+.team-list { display: grid; gap: 7px; }
+.team-member {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  width: 100%;
+  padding: 11px 12px;
+  text-align: left;
+  background: #050505;
+}
+.team-member > span:first-child { display: grid; gap: 3px; }
+.team-member small { color: var(--muted); }
+.final-answer {
+  margin-top: 14px;
+  max-width: 900px;
+  padding: 14px 16px;
+  border: 1px solid #244b6c;
+  border-radius: 9px;
+  background: #06111b;
+  color: #fff;
+  line-height: 1.55;
+}
+.final-answer .eyebrow { display: block; margin-bottom: 7px; }
 .chat-composer textarea {
   min-height: 48px;
   max-height: 140px;
@@ -1099,6 +1132,8 @@ textarea {
   .chat-composer,
   .side-one-shot-composer { width: calc(100% - 24px); margin-bottom: 12px; }
   .side-one-shot-composer textarea { min-height: 52px; }
+  .chat-composer { grid-template-columns: 1fr auto; }
+  .chat-composer select { grid-column: 1/-1; width: 100%; }
   .agent-tabs button {
     flex: 1;
     padding: 12px 6px;

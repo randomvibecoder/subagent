@@ -1,4 +1,4 @@
-# Subagent v0.1.8 Protocol Reference
+# Subagent v0.2.0 / Protocol 6 Reference
 
 This file specifies the current binary. Backward compatibility is not promised. The
 release binary, SKILL.md, this reference, and cli.schema.json must change together.
@@ -15,7 +15,8 @@ release binary, SKILL.md, this reference, and cli.schema.json must change togeth
 8. Side agents
 9. Model API
 10. Agent tools
-11. Storage and security
+11. Optional localhost HTTP API
+12. Storage and security
 
 ## 1. Framing and errors
 
@@ -82,8 +83,9 @@ restart and lifecycle changes and are never reused after deletion; gaps are vali
 
 Local CLI commands accept a short reference or full durable prefixed ID. Agent arguments
 also accept an exact name. Durable IDs and short refs are authoritative before names.
-JSON exposes both forms. Use durable IDs for
-exports, backups, APIs, cross-machine communication, and merged stores; a destination
+JSON exposes both forms. CLI and HTTP paths resolve short refs; Agent paths also resolve
+exact unambiguous names. Use durable IDs for exports, backups, external integrations,
+cross-machine communication, and merged stores; a destination
 import must preserve the ULID and allocate a new local reference.
 
 ### Deadline minutes
@@ -154,15 +156,17 @@ Transitions:
 | --- | --- | --- | --- |
 | none | spawn | working | spawned Event |
 | working | final model turn without tools | finished | none |
+| working | interrupt | interrupted | user_request |
 | working | stop | stopped | user_request |
 | working | deadline | stopped | wall_time |
 | working | fatal worker/API/store error | failed | last_error |
 | working | graceful daemon stop | stopped | daemon_shutdown |
 | persisted working | daemon recovery | stopped | daemon_interrupted |
-| terminal + pending send | scheduler capacity | working | resumed |
+| finished/stopped/failed/interrupted + pending follow-up | scheduler capacity | working | resumed |
 
 Resume increments run_number, sets run_started_at, and clears all terminal timestamps,
-deadline unless supplied by send, stop_reason, and last_error.
+deadline unless supplied by follow-up, stop_reason, last_error, and the current
+final_answer. Historical answers remain in Events and Notifications.
 
 Agent objects include the unique human-readable name. `request_started_at` and
 `provider_request_id` describe only an active provider request and are null in all
@@ -171,7 +175,8 @@ ID. `last_progress_at` advances for provider output, model output, delivered inp
 new terminal output, and meaningful lifecycle/tool activity. An empty terminal poll
 does not advance it.
 
-A refusal or empty final model turn with no tool calls is finished. A nonzero shell
+A no-content/no-tool turn receives one corrective retry. A second consecutive empty
+turn fails with `empty_completion`; it is never silently finished. A nonzero shell
 exit is offered to the model and does not fail the Agent. Failure saves Agent status
 and last_error, then emits one error Event with the identical error string. It does not
 also emit a failed lifecycle Event. If persistence itself fails, metadata and Event
@@ -263,8 +268,9 @@ working_sides and seconds_since_last_event.
 Emits one full Agent, including name, or agent_not_found. Telemetry separates current_phase,
 phase_started_at, request_started_at, last_provider_activity_at, provider_request_id,
 last_provider_request_id, retry_count, last_event_at, last_model_event_at,
-last_tool_event_at, last_state_change_at, and last_progress_at. Phases are starting, processing_messages, requesting_model,
-retrying_model, executing_tool, waiting_terminal, finished, stopped, and failed.
+last_tool_event_at, last_state_change_at, and last_progress_at. Phases are starting,
+processing_messages, requesting_model, retrying_model, executing_tool,
+waiting_terminal, interrupted, finished, stopped, and failed.
 
 Active telemetry invariants:
 
@@ -295,15 +301,37 @@ and is valid in every lifecycle state. It changes no Agent activity timestamp. O
 
 ### agents send
 
-Validates wall time and message, serializes the per-Agent operation, atomically writes
-a pending Message, updates Agent.last_message_at, then emits one message_sent receipt.
-It never waits for model delivery.
+Compatibility alias for `agents followup`. It keeps the historical message_sent
+receipt type while using follow-up wake/resume semantics.
 
-If working, a memory notification wakes the worker at the next model-loop boundary.
-It does not interrupt an API request or tool turn. If terminal and capacity exists,
-the Agent resumes immediately. If capacity is full, the Message remains durable and
-the scheduler resumes it when another Agent exits. While stop cleanup is active, send
-returns retryable conflict and creates no Message.
+### agents followup
+
+Atomically writes a durable followup Message and returns a followup_sent receipt. It
+never waits for model delivery. If working, delivery occurs FIFO at the next safe model
+boundary. If inactive and capacity exists, a new run starts. If capacity is full, the
+Message remains pending with resume_state waiting_for_capacity.
+
+### messages send
+
+Writes a durable Message with intent message. It is delivered at the next safe boundary
+when already working, but never wakes an inactive Agent. The inactive receipt has
+resume_state not_woken.
+
+### agents interrupt
+
+Requires working. Cancels the active turn and Agent-owned terminals, preserves context
+and pending Messages, and transitions to interrupted without a terminal timestamp.
+Only follow-up or the send compatibility alias resumes it.
+
+### team list
+
+Emits one team_member for every Agent and Side followed by one team_summary. Membership
+is flat; Side members include their parent Agent ID/ref only for provenance. Members
+contain task, model, coordination state, progress, pending count, and the complete
+current final_answer. The summary exposes working and available Agent capacity.
+
+While stop or interrupt cleanup is active, input commands return retryable conflict and
+create no Message.
 
 ### agents time
 
@@ -370,13 +398,18 @@ durable acknowledgement watermark to that record; it never moves backward.
 then flushes new matching Notifications as JSONL until disconnected. Without after,
 follow begins after the acknowledgement watermark.
 
+`subagent inbox wait` waits for the first matching Notification and exits. Without
+after, it snapshots the newest sequence at invocation and considers future records
+only. Timeout returns a successful wait_summary with matched false. Agent, priority,
+and repeated type filters are supported.
+
 The visible journal is capped to the newest 10,000 global records. Deleting an Agent
 or Side does not delete its existing Notifications.
 
 ## 5. Notifications
 
 ~~~json
-{"type":"notification","id":"ntf_...","sequence":42,"agent_id":"agt_...","agent_ref":"a_1","agent_name":"Website","side_id":null,"side_ref":null,"timestamp":"RFC3339","event_type":"milestone","priority":2,"status":"working","summary":"Homepage complete","acknowledged":false}
+{"type":"notification","id":"ntf_...","sequence":42,"agent_id":"agt_...","agent_ref":"a_1","agent_name":"Website","side_id":null,"side_ref":null,"timestamp":"RFC3339","event_type":"progress","envelope_type":"PROGRESS","priority":2,"status":"working","summary":"Homepage complete","acknowledged":false}
 ~~~
 
 IDs are ntf_ plus ULID and sequence is globally increasing; gaps are permitted after
@@ -384,9 +417,11 @@ an I/O failure. summary is at most 5,000 Unicode scalar values. Side records con
 the parent Agent ID/name plus a non-null side_id. Agent names are captured at creation
 of each Notification and do not change when the Agent is later renamed.
 
-Automatic mappings are spawned/resumed priority 1, finished priority 2, stopped
-priority 3, and failed priority 4. A finish summary is the final assistant content,
-or a generic completion string when empty, truncated to 5,000 scalar values. Recovery
+Typed envelopes are NEW_TASK, MESSAGE, FOLLOWUP, PROGRESS, INTERRUPTED, FINAL_ANSWER,
+and FAILED. Automatic mappings are spawned/resumed priority 1, finished priority 2,
+interrupted/stopped priority 3, and failed priority 4. FINAL_ANSWER payload contains
+the complete nonempty answer, run number, answer Event ID/ref, and timestamp. The
+summary is capped at 5,000 scalar values. Recovery
 stop Notifications explain daemon interruption.
 
 The watchdog publishes one priority-3 possible_stall notification when a working
@@ -404,7 +439,7 @@ are not copied into it.
 Messages are stored in each Agent directory. Shape:
 
 ~~~json
-{"type":"message","id":"msg_...","ref":"m_1","agent_id":"agt_...","agent_ref":"a_1","content":"text","status":"pending|delivered|cancelled","sent_at":"RFC3339","delivered_at":"RFC3339|null","cancelled_at":"RFC3339|null"}
+{"type":"message","id":"msg_...","ref":"m_1","agent_id":"agt_...","agent_ref":"a_1","content":"text","intent":"message|followup","status":"pending|delivered|cancelled","sent_at":"RFC3339","delivered_at":"RFC3339|null","cancelled_at":"RFC3339|null"}
 ~~~
 
 list emits newest-first or OR-filtered status matches. Limit defaults to 100 and is
@@ -418,8 +453,10 @@ message_id exists, then marks the Message delivered. Recovery uses the marker/Ev
 avoid duplicate context delivery.
 
 Pending Messages survive daemon failure. Recovery first marks interrupted Agents
-stopped daemon_interrupted, then automatically resumes pending Agents oldest-Agent
-first as max-agents capacity permits. Worker exit schedules more pending Agents.
+stopped daemon_interrupted. Only pending `followup` Messages automatically resume
+Agents, oldest-Agent first as max-agents capacity permits; an inactive Agent with only
+`message` intent remains inactive until a later follow-up starts a run. Worker exit
+schedules more pending follow-ups.
 
 For a delivered send Event:
 
@@ -427,10 +464,12 @@ For a delivered send Event:
 {"content":"text","source":"send","message_id":"msg_..."}
 ~~~
 
-The message_sent receipt is an acceptance snapshot and always says queued; polling may
-already show delivered by the time the client receives it. It includes message_id,
-message_ref, agent_id, agent_ref, agent_resumed, run_number, agent_status, and
-resume_state (`not_needed`, `started`, or `waiting_for_capacity`).
+The `message_sent` and `followup_sent` receipts are acceptance snapshots and always
+say queued; polling may already show delivered by the time the client receives one.
+Each includes intent, message_id/ref, agent_id/ref, agent_resumed, run_number,
+agent_status, and resume_state. Resume state is `not_needed`, `started`,
+`waiting_for_capacity`, or `not_woken`; only a non-waking Message may use
+`not_woken`.
 
 ## 7. Events, logs, and context
 
@@ -639,7 +678,8 @@ At most eight live terminal sessions per Agent. list_terminals returns only sess
 whose exit code is still unknown; completed sessions are omitted and removed when
 polled. Sessions are in-memory, Agent-local, unordered, and never survive Agent/daemon
 termination. terminate_terminal returns terminated false if not found/raced.
-terminate_all returns ok true after best-effort TERM/KILL of every owned group.
+terminate_all returns ok true after TERM/KILL and reaping of every owned group; a
+signalling or wait failure returns tool_error instead of claiming cleanup succeeded.
 
 ### read_output
 
@@ -667,7 +707,48 @@ captures the owner's current status. Success returns:
 {"ok":true,"notification_id":"ntf_...","priority":2,"event_type":"milestone"}
 ~~~
 
-## 11. Storage and security
+## 11. Optional localhost HTTP API
+
+Starting with `daemon start --web-ui-port PORT` enables both the human dashboard and
+an automation API on `127.0.0.1`. The Unix socket remains the preferred local CLI
+transport; the HTTP API is useful for a separate harness or browser. When
+`SUBAGENT_WEB_PASSWORD` is set, every asset and API request requires HTTP Basic Auth
+with username `subagent`. State-changing browser requests must also carry a matching
+localhost `Origin` header. Non-browser API clients do not need an Origin header.
+
+Single-resource responses are JSON. Lists and event history are JSONL with the same
+item and summary objects as the CLI. Streams use Server-Sent Events. Errors use the
+shared Error object and an HTTP status: missing resources are 404, authentication is
+401, invalid input is 400, conflict/capacity is 409, and internal errors are 500.
+Agent paths accept a_N refs, durable IDs, or exact unambiguous names; Side, Message,
+and Event paths accept their short ref or durable ID.
+
+Core routes:
+
+~~~text
+GET|POST /api/agents
+GET|DELETE /api/agents/{agent}
+GET /api/team
+POST /api/agents/{agent}/message
+POST /api/agents/{agent}/followup
+POST /api/agents/{agent}/interrupt
+POST /api/agents/{agent}/stop
+GET /api/agents/{agent}/events
+GET /api/agents/{agent}/stream
+GET|POST /api/agents/{agent}/sides
+GET|DELETE /api/sides/{side}
+GET /api/sides/{side}/events
+GET /api/inbox
+GET /api/inbox/follow
+POST /api/inbox/ack/{sequence-or-notification-id}
+~~~
+
+Inbox queries accept `priority`, `agent`, `event_type`, `limit`, `offset`,
+`after_cursor`, and `all`. `event_type` filters the typed envelope before pagination,
+so a page cannot become spuriously empty from client-side filtering. The Web UI does
+not expose daemon startup/configuration or raw model context.
+
+## 12. Storage and security
 
 Config uses XDG_CONFIG_HOME/subagent or HOME/.config/subagent. State uses
 XDG_STATE_HOME/subagent or HOME/.local/state/subagent. Runtime socket/lock use

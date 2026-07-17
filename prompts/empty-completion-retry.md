@@ -1,0 +1,1 @@
+Your previous response contained no assistant content and no tool calls, so it cannot complete the task. Continue working or return a concrete, nonempty final answer. Do not return another empty response.

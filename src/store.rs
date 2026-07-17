@@ -20,6 +20,7 @@ use std::{
 #[serde(rename_all = "snake_case")]
 pub enum AgentStatus {
     Working,
+    Interrupted,
     Finished,
     Stopped,
     Failed,
@@ -29,6 +30,7 @@ impl AgentStatus {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Working => "working",
+            Self::Interrupted => "interrupted",
             Self::Finished => "finished",
             Self::Stopped => "stopped",
             Self::Failed => "failed",
@@ -46,6 +48,7 @@ pub enum AgentPhase {
     RetryingModel,
     ExecutingTool,
     WaitingTerminal,
+    Interrupted,
     Finished,
     Stopped,
     Failed,
@@ -60,6 +63,7 @@ impl AgentPhase {
             Self::RetryingModel => "retrying_model",
             Self::ExecutingTool => "executing_tool",
             Self::WaitingTerminal => "waiting_terminal",
+            Self::Interrupted => "interrupted",
             Self::Finished => "finished",
             Self::Stopped => "stopped",
             Self::Failed => "failed",
@@ -135,8 +139,19 @@ pub struct AgentMetadata {
     pub run_number: u64,
     pub stop_reason: Option<String>,
     pub last_error: Option<String>,
+    #[serde(default)]
+    pub final_answer: Option<FinalAnswer>,
     #[serde(flatten)]
     pub activity: ActivityTelemetry,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FinalAnswer {
+    pub run_number: u64,
+    pub content: String,
+    pub event_id: String,
+    pub event_ref: String,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -209,6 +224,8 @@ pub struct SideMetadata {
     pub tool_calls: usize,
     pub stop_reason: Option<String>,
     pub last_error: Option<String>,
+    #[serde(default)]
+    pub final_answer: Option<FinalAnswer>,
     #[serde(flatten)]
     pub activity: ActivityTelemetry,
 }
@@ -279,10 +296,16 @@ pub struct MessageRecord {
     #[serde(default)]
     pub agent_ref: String,
     pub content: String,
+    #[serde(default = "default_message_intent")]
+    pub intent: String,
     pub status: MessageStatus,
     pub sent_at: DateTime<Utc>,
     pub delivered_at: Option<DateTime<Utc>>,
     pub cancelled_at: Option<DateTime<Utc>>,
+}
+
+fn default_message_intent() -> String {
+    "followup".into()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -321,6 +344,10 @@ pub struct NotificationRecord {
     pub side_ref: Option<String>,
     pub timestamp: DateTime<Utc>,
     pub event_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub envelope_type: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<Value>,
     pub priority: u8,
     pub status: AgentStatus,
     pub summary: String,
@@ -365,6 +392,7 @@ pub struct InboxFilter {
     pub after_cursor: Option<String>,
     pub minimum_priority: u8,
     pub agent_id: Option<String>,
+    pub envelope_type: Option<String>,
     pub include_acknowledged: bool,
 }
 
@@ -403,6 +431,7 @@ impl Store {
         store.purge_corrupt_lifecycle_records()?;
         store.migrate_activity_metadata()?;
         store.migrate_local_references()?;
+        store.migrate_final_answers()?;
         Ok(store)
     }
 
@@ -419,14 +448,17 @@ impl Store {
             }
             let meta: AgentMetadata = serde_json::from_slice(&fs::read(&path)?)
                 .with_context(|| format!("parse {}", path.display()))?;
-            if !lifecycle_is_consistent(
-                &meta.status,
-                &meta.activity.current_phase,
-                [meta.finished_at, meta.stopped_at, meta.failed_at],
-                meta.deadline_at,
-                meta.activity.request_started_at,
-                meta.activity.provider_request_id.as_deref(),
-            ) {
+            if !lifecycle_is_consistent(LifecycleInvariant {
+                status: &meta.status,
+                phase: &meta.activity.current_phase,
+                terminal_timestamps: [meta.finished_at, meta.stopped_at, meta.failed_at],
+                deadline_at: meta.deadline_at,
+                request_started_at: meta.activity.request_started_at,
+                provider_request_id: meta.activity.provider_request_id.as_deref(),
+                stop_reason: meta.stop_reason.as_deref(),
+                last_error: meta.last_error.as_deref(),
+                answer: None,
+            }) {
                 removed_agents.push(meta.id);
                 fs::remove_dir_all(dir)?;
             }
@@ -441,16 +473,23 @@ impl Store {
             }
             let meta: SideMetadata = serde_json::from_slice(&fs::read(&path)?)
                 .with_context(|| format!("parse {}", path.display()))?;
-            let parent_removed = removed_agents.iter().any(|id| id == &meta.agent_id);
+            let parent_removed = removed_agents.iter().any(|id| id == &meta.agent_id)
+                || !self
+                    .agent_dir(&meta.agent_id)
+                    .join("metadata.json")
+                    .exists();
             if parent_removed
-                || !lifecycle_is_consistent(
-                    &meta.status,
-                    &meta.activity.current_phase,
-                    [meta.finished_at, meta.stopped_at, meta.failed_at],
-                    meta.deadline_at,
-                    meta.activity.request_started_at,
-                    meta.activity.provider_request_id.as_deref(),
-                )
+                || !lifecycle_is_consistent(LifecycleInvariant {
+                    status: &meta.status,
+                    phase: &meta.activity.current_phase,
+                    terminal_timestamps: [meta.finished_at, meta.stopped_at, meta.failed_at],
+                    deadline_at: meta.deadline_at,
+                    request_started_at: meta.activity.request_started_at,
+                    provider_request_id: meta.activity.provider_request_id.as_deref(),
+                    stop_reason: meta.stop_reason.as_deref(),
+                    last_error: meta.last_error.as_deref(),
+                    answer: meta.answer.as_deref(),
+                })
             {
                 removed_sides.push(meta.id);
                 fs::remove_dir_all(dir)?;
@@ -463,7 +502,10 @@ impl Store {
             let mut body = Vec::new();
             for notification in self.read_all_notifications()? {
                 if removed_agents.iter().any(|id| id == &notification.agent_id)
-                    || removed_sides.iter().any(|id| id == &notification.agent_id)
+                    || notification
+                        .side_id
+                        .as_ref()
+                        .is_some_and(|id| removed_sides.iter().any(|removed| removed == id))
                 {
                     continue;
                 }
@@ -477,6 +519,77 @@ impl Store {
 
     fn ref_sequence_path(&self, kind: &str) -> PathBuf {
         self.state_root.join(format!("{kind}-ref-sequence"))
+    }
+
+    fn migrate_final_answers(&self) -> Result<()> {
+        for entry in fs::read_dir(&self.agents_root)? {
+            let path = entry?.path().join("metadata.json");
+            if !path.exists() {
+                continue;
+            }
+            let mut meta: AgentMetadata = serde_json::from_slice(&fs::read(&path)?)?;
+            if meta.status == AgentStatus::Finished && meta.final_answer.is_none() {
+                let event = self
+                    .query_events(
+                        &meta.id,
+                        false,
+                        &["assistant_message".into()],
+                        None,
+                        None,
+                        1,
+                    )?
+                    .into_iter()
+                    .next();
+                if let Some((event, content)) = event.and_then(|event| {
+                    let content = event.data.get("content")?.as_str()?.to_string();
+                    (!content.trim().is_empty()).then_some((event, content))
+                }) {
+                    meta.final_answer = Some(FinalAnswer {
+                        run_number: meta.run_number,
+                        content,
+                        event_id: event.event_id,
+                        event_ref: event.local_ref,
+                        created_at: event.timestamp,
+                    });
+                } else {
+                    mark_empty_migrated_agent_failed(&mut meta);
+                }
+                self.save_metadata(&meta)?;
+            }
+        }
+        for entry in fs::read_dir(&self.sides_root)? {
+            let path = entry?.path().join("metadata.json");
+            if !path.exists() {
+                continue;
+            }
+            let mut meta: SideMetadata = serde_json::from_slice(&fs::read(&path)?)?;
+            if meta.status == AgentStatus::Finished && meta.final_answer.is_none() {
+                if let Some(answer) = meta
+                    .answer
+                    .as_ref()
+                    .filter(|answer| !answer.trim().is_empty())
+                {
+                    let event = self
+                        .query_events(&meta.id, true, &["assistant_message".into()], None, None, 1)?
+                        .into_iter()
+                        .next();
+                    if let Some(event) = event {
+                        meta.final_answer = Some(FinalAnswer {
+                            run_number: 1,
+                            content: answer.clone(),
+                            event_id: event.event_id,
+                            event_ref: event.local_ref,
+                            created_at: event.timestamp,
+                        });
+                    }
+                }
+                if meta.final_answer.is_none() {
+                    mark_empty_migrated_side_failed(&mut meta);
+                }
+                self.save_side_metadata(&meta)?;
+            }
+        }
+        Ok(())
     }
 
     fn next_local_ref_locked(&self, kind: &str, prefix: &str) -> Result<String> {
@@ -934,7 +1047,12 @@ impl Store {
         )
     }
 
-    pub fn enqueue_message(&self, id: &str, content: String) -> Result<MessageRecord> {
+    pub fn enqueue_message(
+        &self,
+        id: &str,
+        content: String,
+        intent: &str,
+    ) -> Result<MessageRecord> {
         let _guard = self.write_lock.lock().unwrap();
         let mut messages = self.read_messages(id)?;
         let agent = self.load_metadata(id)?;
@@ -945,6 +1063,7 @@ impl Store {
             agent_id: id.into(),
             agent_ref: agent.local_ref,
             content,
+            intent: intent.into(),
             status: MessageStatus::Pending,
             sent_at: Utc::now(),
             delivered_at: None,
@@ -1067,8 +1186,16 @@ impl Store {
         #[cfg(unix)]
         use std::os::unix::fs::OpenOptionsExt;
         let _guard = self.write_lock.lock().unwrap();
-        let sequence = self.next_sequence(&self.events_path(id), &self.event_sequence_path(id))?;
         let agent = self.load_metadata(id)?;
+        if agent.status != AgentStatus::Working && !matches!(event_type, "lifecycle" | "error") {
+            return Err(coded_error(
+                "conflict",
+                "cannot append progress to a non-working Agent",
+                json!({"agent_id":id,"status":agent.status.as_str(),"event_type":event_type}),
+                true,
+            ));
+        }
+        let sequence = self.next_sequence(&self.events_path(id), &self.event_sequence_path(id))?;
         let event = EventRecord {
             owner: "agent".into(),
             event_id: format!("evt_{}", ulid::Ulid::new()),
@@ -1105,6 +1232,9 @@ impl Store {
     ) -> Result<AgentMetadata> {
         let _guard = self.write_lock.lock().unwrap();
         let mut meta = self.load_metadata(id)?;
+        if meta.status != AgentStatus::Working {
+            return Ok(meta);
+        }
         update(&mut meta.activity);
         self.save_metadata(&meta)?;
         Ok(meta)
@@ -1117,6 +1247,9 @@ impl Store {
     ) -> Result<SideMetadata> {
         let _guard = self.write_lock.lock().unwrap();
         let mut meta = self.load_side_metadata(id)?;
+        if meta.status != AgentStatus::Working {
+            return Ok(meta);
+        }
         update(&mut meta.activity);
         self.save_side_metadata(&meta)?;
         Ok(meta)
@@ -1156,6 +1289,18 @@ impl Store {
         status: AgentStatus,
         summary: impl AsRef<str>,
     ) -> Result<NotificationRecord> {
+        self.append_notification_payload(owner_id, event_type, priority, status, summary, None)
+    }
+
+    pub fn append_notification_payload(
+        &self,
+        owner_id: &str,
+        event_type: &str,
+        priority: u8,
+        status: AgentStatus,
+        summary: impl AsRef<str>,
+        payload: Option<Value>,
+    ) -> Result<NotificationRecord> {
         #[cfg(unix)]
         use std::os::unix::fs::OpenOptionsExt;
         if !(1..=4).contains(&priority) {
@@ -1190,6 +1335,20 @@ impl Store {
             side_ref,
             timestamp: Utc::now(),
             event_type: event_type.to_string(),
+            envelope_type: Some(
+                match event_type {
+                    "spawned" => "NEW_TASK",
+                    "message" => "MESSAGE",
+                    "followup" | "resumed" => "FOLLOWUP",
+                    "progress" | "possible_stall" => "PROGRESS",
+                    "interrupted" => "INTERRUPTED",
+                    "finished" => "FINAL_ANSWER",
+                    "failed" => "FAILED",
+                    _ => "PROGRESS",
+                }
+                .into(),
+            ),
+            payload,
             priority,
             status,
             summary: truncate_chars(summary.as_ref(), 5_000),
@@ -1213,6 +1372,52 @@ impl Store {
         Ok(self.list_notifications_page(filter)?.items)
     }
 
+    pub fn latest_notification_sequence(&self) -> Result<u64> {
+        Ok(self
+            .read_all_notifications()?
+            .into_iter()
+            .map(|notification| notification.sequence)
+            .max()
+            .unwrap_or(0))
+    }
+
+    pub fn first_notification_after(
+        &self,
+        sequence: u64,
+        minimum_priority: u8,
+        agent_id: Option<&str>,
+        event_types: &[String],
+    ) -> Result<Option<NotificationRecord>> {
+        Ok(self
+            .read_all_notifications()?
+            .into_iter()
+            .filter(|notification| notification.sequence > sequence)
+            .filter(|notification| notification.priority >= minimum_priority)
+            .filter(|notification| agent_id.is_none_or(|id| notification.agent_id == id))
+            .filter(|notification| {
+                event_types.is_empty()
+                    || event_types.iter().any(|kind| {
+                        kind == &notification.event_type
+                            || notification.envelope_type.as_ref() == Some(kind)
+                    })
+            })
+            .min_by_key(|notification| notification.sequence))
+    }
+
+    pub fn latest_notification_for_owner(
+        &self,
+        owner_id: &str,
+    ) -> Result<Option<NotificationRecord>> {
+        Ok(self
+            .read_all_notifications()?
+            .into_iter()
+            .filter(|notification| {
+                notification.agent_id == owner_id
+                    || notification.side_id.as_deref() == Some(owner_id)
+            })
+            .max_by_key(|notification| notification.sequence))
+    }
+
     pub fn list_notifications_page(
         &self,
         filter: &InboxFilter,
@@ -1226,9 +1431,10 @@ impl Store {
         }
         let scope = cursor_scope(
             &format!(
-                "{}:{}:{}",
+                "{}:{}:{}:{}",
                 filter.agent_id.as_deref().unwrap_or("*"),
                 filter.minimum_priority,
+                filter.envelope_type.as_deref().unwrap_or("*"),
                 filter.include_acknowledged
             ),
             std::iter::empty(),
@@ -1276,6 +1482,12 @@ impl Store {
                     .agent_id
                     .as_ref()
                     .is_none_or(|id| &notification.agent_id == id)
+            })
+            .filter(|notification| {
+                filter
+                    .envelope_type
+                    .as_ref()
+                    .is_none_or(|envelope| notification.envelope_type.as_ref() == Some(envelope))
             })
             .filter(|notification| {
                 cursor.as_ref().is_none_or(|cursor| {
@@ -1391,6 +1603,7 @@ impl Store {
             after_cursor: None,
             minimum_priority: 1,
             agent_id: None,
+            envelope_type: None,
             include_acknowledged: true,
         })?;
         let mut body = Vec::new();
@@ -1648,6 +1861,14 @@ impl Store {
         use std::os::unix::fs::OpenOptionsExt;
         let _guard = self.write_lock.lock().unwrap();
         let mut meta = self.load_side_metadata(id)?;
+        if meta.status != AgentStatus::Working && !matches!(event_type, "lifecycle" | "error") {
+            return Err(coded_error(
+                "conflict",
+                "cannot append progress to a non-working Side",
+                json!({"side_id":id,"status":meta.status.as_str(),"event_type":event_type}),
+                true,
+            ));
+        }
         let path = self.side_dir(id).join("events.jsonl");
         let sequence = self.next_sequence(&path, &self.event_sequence_path(id))?;
         let event = EventRecord {
@@ -1841,14 +2062,30 @@ impl Store {
     }
 }
 
-fn lifecycle_is_consistent(
-    status: &AgentStatus,
-    phase: &AgentPhase,
+struct LifecycleInvariant<'a> {
+    status: &'a AgentStatus,
+    phase: &'a AgentPhase,
     terminal_timestamps: [Option<DateTime<Utc>>; 3],
     deadline_at: Option<DateTime<Utc>>,
     request_started_at: Option<DateTime<Utc>>,
-    provider_request_id: Option<&str>,
-) -> bool {
+    provider_request_id: Option<&'a str>,
+    stop_reason: Option<&'a str>,
+    last_error: Option<&'a str>,
+    answer: Option<&'a str>,
+}
+
+fn lifecycle_is_consistent(invariant: LifecycleInvariant<'_>) -> bool {
+    let LifecycleInvariant {
+        status,
+        phase,
+        terminal_timestamps,
+        deadline_at,
+        request_started_at,
+        provider_request_id,
+        stop_reason,
+        last_error,
+        answer,
+    } = invariant;
     let [finished_at, stopped_at, failed_at] = terminal_timestamps;
     let terminal_count = usize::from(finished_at.is_some())
         + usize::from(stopped_at.is_some())
@@ -1856,10 +2093,23 @@ fn lifecycle_is_consistent(
     match status {
         AgentStatus::Working => {
             terminal_count == 0
+                && stop_reason.is_none()
+                && last_error.is_none()
+                && answer.is_none()
                 && !matches!(
                     phase,
                     AgentPhase::Finished | AgentPhase::Stopped | AgentPhase::Failed
                 )
+        }
+        AgentStatus::Interrupted => {
+            terminal_count == 0
+                && matches!(phase, AgentPhase::Interrupted)
+                && deadline_at.is_none()
+                && request_started_at.is_none()
+                && provider_request_id.is_none()
+                && stop_reason.is_some()
+                && last_error.is_none()
+                && answer.is_none()
         }
         AgentStatus::Finished => {
             terminal_count == 1
@@ -1868,6 +2118,9 @@ fn lifecycle_is_consistent(
                 && deadline_at.is_none()
                 && request_started_at.is_none()
                 && provider_request_id.is_none()
+                && stop_reason.is_none()
+                && last_error.is_none()
+                && answer.is_none_or(|value| !value.trim().is_empty())
         }
         AgentStatus::Stopped => {
             terminal_count == 1
@@ -1876,6 +2129,9 @@ fn lifecycle_is_consistent(
                 && deadline_at.is_none()
                 && request_started_at.is_none()
                 && provider_request_id.is_none()
+                && stop_reason.is_some()
+                && last_error.is_none()
+                && answer.is_none()
         }
         AgentStatus::Failed => {
             terminal_count == 1
@@ -1884,8 +2140,46 @@ fn lifecycle_is_consistent(
                 && deadline_at.is_none()
                 && request_started_at.is_none()
                 && provider_request_id.is_none()
+                && stop_reason.is_none()
+                && last_error.is_some()
+                && answer.is_none()
         }
     }
+}
+
+fn mark_empty_migrated_agent_failed(meta: &mut AgentMetadata) {
+    let now = Utc::now();
+    meta.status = AgentStatus::Failed;
+    meta.finished_at = None;
+    meta.stopped_at = None;
+    meta.failed_at = Some(now);
+    meta.deadline_at = None;
+    meta.stop_reason = None;
+    meta.last_error = Some("empty_completion: legacy finished run had no final answer".into());
+    meta.final_answer = None;
+    meta.activity.current_phase = AgentPhase::Failed;
+    meta.activity.phase_started_at = Some(now);
+    meta.activity.last_state_change_at = Some(now);
+    meta.activity.request_started_at = None;
+    meta.activity.provider_request_id = None;
+}
+
+fn mark_empty_migrated_side_failed(meta: &mut SideMetadata) {
+    let now = Utc::now();
+    meta.status = AgentStatus::Failed;
+    meta.answer = None;
+    meta.finished_at = None;
+    meta.stopped_at = None;
+    meta.failed_at = Some(now);
+    meta.deadline_at = None;
+    meta.stop_reason = None;
+    meta.last_error = Some("empty_completion: legacy finished Side had no final answer".into());
+    meta.final_answer = None;
+    meta.activity.current_phase = AgentPhase::Failed;
+    meta.activity.phase_started_at = Some(now);
+    meta.activity.last_state_change_at = Some(now);
+    meta.activity.request_started_at = None;
+    meta.activity.provider_request_id = None;
 }
 
 fn parse_time(v: &Option<String>) -> Result<Option<DateTime<Utc>>> {
@@ -1924,6 +2218,7 @@ fn migrate_terminal_activity(
 ) {
     let (phase, changed_at) = match status {
         AgentStatus::Working => (AgentPhase::Starting, created_at),
+        AgentStatus::Interrupted => (AgentPhase::Interrupted, created_at),
         AgentStatus::Finished => (AgentPhase::Finished, finished_at.unwrap_or(created_at)),
         AgentStatus::Stopped => (AgentPhase::Stopped, stopped_at.unwrap_or(created_at)),
         AgentStatus::Failed => (AgentPhase::Failed, failed_at.unwrap_or(created_at)),
@@ -2267,6 +2562,7 @@ mod name_tests {
             run_number: 1,
             stop_reason: None,
             last_error: None,
+            final_answer: None,
             activity: finished_activity,
         };
         store.create(&agent, &ContextSnapshot::default()).unwrap();
@@ -2305,6 +2601,7 @@ mod name_tests {
             tool_calls: 0,
             stop_reason: None,
             last_error: None,
+            final_answer: None,
             activity: ActivityTelemetry::new(now),
         };
         store
@@ -2360,6 +2657,7 @@ mod name_tests {
                 after_cursor: None,
                 minimum_priority: 2,
                 agent_id: Some(agent.id.clone()),
+                envelope_type: None,
                 include_acknowledged: false,
             })
             .unwrap();
@@ -2377,6 +2675,7 @@ mod name_tests {
                     after_cursor: None,
                     minimum_priority: 1,
                     agent_id: Some(agent.id.clone()),
+                    envelope_type: None,
                     include_acknowledged: false,
                 })
                 .unwrap()
@@ -2406,6 +2705,7 @@ mod name_tests {
                     after_cursor: None,
                     minimum_priority: 1,
                     agent_id: Some(agent.id.clone()),
+                    envelope_type: None,
                     include_acknowledged: true,
                 })
                 .unwrap()
@@ -2465,6 +2765,7 @@ mod name_tests {
             run_number: 1,
             stop_reason: None,
             last_error: None,
+            final_answer: None,
             activity,
         };
         store.create(&agent, &ContextSnapshot::default()).unwrap();
@@ -2518,6 +2819,8 @@ mod name_tests {
                     side_ref: None,
                     timestamp: Utc::now(),
                     event_type: "progress".into(),
+                    envelope_type: Some("PROGRESS".into()),
+                    payload: None,
                     priority: 1,
                     status: AgentStatus::Working,
                     summary: sequence.to_string(),
@@ -2535,6 +2838,7 @@ mod name_tests {
                 after_cursor: None,
                 minimum_priority: 1,
                 agent_id: None,
+                envelope_type: None,
                 include_acknowledged: true,
             })
             .unwrap();

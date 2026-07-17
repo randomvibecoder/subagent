@@ -86,7 +86,7 @@ impl ToolRuntime {
             "list_terminals" => Ok(ToolResult::plain(self.terminals.list())),
             "terminate_terminal" => self.terminate_terminal(&args).await,
             "terminate_all_terminals" => {
-                self.terminals.terminate_all().await;
+                self.terminals.terminate_all().await?;
                 Ok(ToolResult::plain(json!({"ok":true})))
             }
             "view_image" => self.view_image(&args),
@@ -124,12 +124,13 @@ impl ToolRuntime {
         } else {
             self.store.load_metadata(&self.agent_id)?.status
         };
-        let notification = self.store.append_notification(
+        let notification = self.store.append_notification_payload(
             &self.agent_id,
             event_type,
             priority,
             status,
             summary,
+            Some(json!({"summary":summary})),
         )?;
         Ok(ToolResult::plain(json!({
             "ok":true,
@@ -365,7 +366,7 @@ impl ToolRuntime {
     async fn terminate_terminal(&self, args: &Value) -> Result<ToolResult> {
         let id = required_str(args, "terminal_id")?;
         Ok(ToolResult::plain(
-            json!({"ok":true,"terminated":self.terminals.terminate(id).await}),
+            json!({"ok":true,"terminated":self.terminals.terminate(id).await?}),
         ))
     }
 
@@ -588,23 +589,35 @@ impl TerminalManager {
 
     pub fn list(&self) -> Value {
         let sessions = self.sessions.lock().unwrap();
-        let data:Vec<_>=sessions.values().filter(|s|s.exit_code.lock().unwrap().is_none()).map(|s|json!({"terminal_id":s.id,"command":s.command,"cwd":s.cwd,"pid":s.pid,"output_ref":s.output_ref})).collect();
+        let data: Vec<_> = sessions
+            .values()
+            .filter(|session| session.exit_code.lock().unwrap().is_none())
+            .map(|session| {
+                json!({
+                    "terminal_id": session.id,
+                    "command": session.command,
+                    "cwd": session.cwd,
+                    "pid": session.pid,
+                    "output_ref": session.output_ref,
+                })
+            })
+            .collect();
         json!({"ok":true,"terminals":data,"count":data.len(),"limit":MAX_TERMINALS})
     }
 
-    pub async fn terminate(&self, id: &str) -> bool {
+    pub async fn terminate(&self, id: &str) -> Result<bool> {
         let session = self.sessions.lock().unwrap().remove(id);
         if let Some(s) = session {
             s.cancelled.store(true, Ordering::Release);
             s.cancellation.notify_waiters();
-            terminate_sessions(&[s]).await;
-            true
+            terminate_sessions(&[s]).await?;
+            Ok(true)
         } else {
-            false
+            Ok(false)
         }
     }
 
-    pub async fn terminate_all(&self) {
+    pub async fn terminate_all(&self) -> Result<()> {
         let sessions: Vec<_> = self
             .sessions
             .lock()
@@ -616,7 +629,7 @@ impl TerminalManager {
             s.cancelled.store(true, Ordering::Release);
             s.cancellation.notify_waiters();
         }
-        terminate_sessions(&sessions).await;
+        terminate_sessions(&sessions).await
     }
 
     fn running_count(&self) -> usize {
@@ -708,31 +721,42 @@ async fn refresh_exit_code(session: &TerminalSession) -> Option<i32> {
     }
 }
 
-async fn signal_if_running(session: &TerminalSession, signal: i32) -> bool {
+async fn signal_if_running(session: &TerminalSession, signal: i32) -> Result<bool> {
     let mut child = session.child.lock().await;
     if let Some(status) = child.try_wait().ok().flatten() {
         *session.exit_code.lock().unwrap() = Some(status.code().unwrap_or(-1));
-        return false;
+        return Ok(false);
     }
     // The child cannot be reaped or have its PID reused while the Child lock is held.
-    unsafe {
-        libc::kill(-session.pid, signal);
+    let result = unsafe { libc::kill(-session.pid, signal) };
+    if result != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(error.into());
+        }
     }
-    true
+    Ok(true)
 }
 
-async fn terminate_sessions(sessions: &[Arc<TerminalSession>]) {
+async fn terminate_sessions(sessions: &[Arc<TerminalSession>]) -> Result<()> {
     let mut signalled = false;
     for session in sessions {
-        signalled |= signal_if_running(session, libc::SIGTERM).await;
+        signalled |= signal_if_running(session, libc::SIGTERM).await?;
     }
     if !signalled {
-        return;
+        return Ok(());
     }
     tokio::time::sleep(Duration::from_millis(500)).await;
     for session in sessions {
-        signal_if_running(session, libc::SIGKILL).await;
+        signal_if_running(session, libc::SIGKILL).await?;
+        let mut child = session.child.lock().await;
+        let status = match child.try_wait()? {
+            Some(status) => status,
+            None => child.wait().await?,
+        };
+        *session.exit_code.lock().unwrap() = Some(status.code().unwrap_or(-1));
     }
+    Ok(())
 }
 
 fn apply_openai_patch(root: &Path, patch: &str) -> Result<Vec<String>> {
@@ -1023,7 +1047,7 @@ mod tests {
                 .unwrap()
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
-        runtime.terminals.terminate_all().await;
+        runtime.terminals.terminate_all().await.unwrap();
         let result = tokio::time::timeout(Duration::from_secs(2), task)
             .await
             .expect("cancelled exec should wake before yield timeout")

@@ -66,15 +66,14 @@ subagent agents spawn \
 Coordinate several workers without importing their raw transcripts:
 
 ```sh
-subagent agents list --status working
-subagent inbox list --priority 2
-subagent agents logs a_1
-subagent agents send a_1 --message "Also check token refresh behavior."
+subagent team list
+subagent inbox wait --timeout-seconds 300
+subagent agents followup a_1 --message "Also check token refresh behavior."
 ```
 
-`send` durably queues the message and returns immediately. A finished, stopped, or
-failed agent resumes as a new run; a working agent consumes it at the next model
-boundary.
+`followup` durably queues work and returns immediately. It wakes or resumes an inactive
+Agent; `messages send` stores context without waking. Successful runs automatically
+publish a typed, durable final answer.
 
 ## Why a daemon?
 
@@ -100,12 +99,15 @@ may work concurrently by default; configure another limit with `max-agents` or
 | --- | --- |
 | `daemon start\|status\|stop` | Operate the per-user daemon |
 | `agents spawn\|list\|status\|rename` | Create and inspect persistent agents |
+| `team list` | Inspect every Agent and Side plus available capacity |
 | `agents logs ID` | Read the newest 20 transcript events or select/follow other types |
-| `agents send ID` | Durably steer or resume an agent |
+| `agents followup ID` | Durably assign work and wake or resume an Agent |
+| `messages send ID` | Add durable context without waking an inactive Agent |
+| `agents interrupt ID` | Cancel one turn while preserving resumability |
 | `agents time\|stop\|delete ID` | Manage lifecycle and cleanup |
 | `sides create\|list\|status\|logs\|stop\|delete` | Run saved one-shot Side questions |
 | `messages list\|status\|cancel` | Inspect durable queued messages |
-| `inbox list`, `inbox ack`, `inbox follow` | Read, acknowledge, or stream high-signal notifications |
+| `inbox wait\|list\|ack\|follow` | Wait for, read, acknowledge, or stream typed notifications |
 | `config list\|get\|set` | Manage non-secret configuration |
 
 Run any command with `--help` for exact flags. [`SKILL.md`](SKILL.md) is the compact
@@ -200,5 +202,7 @@ cargo test --locked
 
 The portable release uses the `x86_64-unknown-linux-musl` target. See
 [`CONTRIBUTING.md`](CONTRIBUTING.md) for the complete validation and release workflow.
+All model system prompts live as reviewable Markdown in [`prompts/`](prompts/) and are
+embedded at compile time. Runtime substitutions use strict `{{name}}` placeholders.
 
 Licensed under [Apache-2.0](LICENSE).

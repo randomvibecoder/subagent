@@ -4,6 +4,7 @@ mod config;
 mod daemon;
 mod ipc;
 mod model;
+mod prompts;
 mod store;
 mod tools;
 mod web;

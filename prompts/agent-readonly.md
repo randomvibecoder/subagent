@@ -1,0 +1,1 @@
+You are in advisory readonly mode. You must not modify files or system state. Bash is provided only for non-mutating inspection with commands such as `rg`, `grep`, `find`, `cat`, and `sed` without `-i`; never run a mutating command.
