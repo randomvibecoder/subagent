@@ -269,10 +269,10 @@ async fn inbox(
             false,
         )));
     }
-    if !(1..=5).contains(&priority) {
+    if !(1..=4).contains(&priority) {
         return Err(ApiError(coded_error(
             "invalid_argument",
-            "priority must be from 1 through 5",
+            "priority must be from 1 through 4",
             json!({"field":"priority"}),
             false,
         )));
@@ -319,6 +319,7 @@ async fn ack_inbox(
     Path(identifier): Path<String>,
 ) -> ApiResult<Json<Value>> {
     authorize(&state, &headers, true)?;
+    let _mutation = state.manager.begin_mutation()?;
     Ok(Json(state.store.acknowledge_notifications(&identifier)?))
 }
 
@@ -329,10 +330,10 @@ async fn follow_inbox(
 ) -> ApiResult<Sse<impl futures_util::Stream<Item = std::result::Result<Event, Infallible>>>> {
     authorize(&state, &headers, false)?;
     let minimum_priority = query.priority.unwrap_or(2);
-    if !(1..=5).contains(&minimum_priority) {
+    if !(1..=4).contains(&minimum_priority) {
         return Err(ApiError(coded_error(
             "invalid_argument",
-            "priority must be from 1 through 5",
+            "priority must be from 1 through 4",
             json!({"field":"priority"}),
             false,
         )));
@@ -380,6 +381,7 @@ async fn spawn_agent(
     Json(body): Json<SpawnBody>,
 ) -> ApiResult<Json<Value>> {
     authorize(&state, &headers, true)?;
+    let _mutation = state.manager.begin_mutation()?;
     let meta = state.manager.spawn(
         body.dir,
         body.message,
@@ -411,7 +413,8 @@ async fn rename_agent(
     Json(body): Json<RenameBody>,
 ) -> ApiResult<Json<Value>> {
     authorize(&state, &headers, true)?;
-    Ok(Json(state.manager.rename(&id, body.name)?))
+    let _mutation = state.manager.begin_mutation()?;
+    Ok(Json(state.manager.rename(&id, body.name).await?))
 }
 
 async fn delete_agent(
@@ -420,6 +423,7 @@ async fn delete_agent(
     Path(id): Path<String>,
 ) -> ApiResult<Json<Value>> {
     authorize(&state, &headers, true)?;
+    let _mutation = state.manager.begin_mutation()?;
     Ok(Json(state.manager.delete_agent(&id).await?))
 }
 
@@ -591,11 +595,13 @@ async fn send_message(
     Json(body): Json<MessageBody>,
 ) -> ApiResult<Json<Value>> {
     authorize(&state, &headers, true)?;
-    Ok(Json(state.manager.send(
-        &id,
-        body.message,
-        body.wall_time_minutes,
-    )?))
+    let _mutation = state.manager.begin_mutation()?;
+    Ok(Json(
+        state
+            .manager
+            .send(&id, body.message, body.wall_time_minutes)
+            .await?,
+    ))
 }
 async fn side_question(
     State(state): State<WebState>,
@@ -604,12 +610,18 @@ async fn side_question(
     Json(body): Json<MessageBody>,
 ) -> ApiResult<Json<Value>> {
     authorize(&state, &headers, true)?;
-    Ok(Json(state.manager.create_side(
-        &id,
-        body.message,
-        body.model,
-        body.wall_time_minutes.or(Some(2)),
-    )?))
+    let _mutation = state.manager.begin_mutation()?;
+    Ok(Json(
+        state
+            .manager
+            .create_side(
+                &id,
+                body.message,
+                body.model,
+                body.wall_time_minutes.or(Some(2)),
+            )
+            .await?,
+    ))
 }
 
 #[derive(Default, Deserialize)]
@@ -673,12 +685,18 @@ async fn create_side(
     Json(body): Json<MessageBody>,
 ) -> ApiResult<Json<Value>> {
     authorize(&state, &headers, true)?;
-    Ok(Json(state.manager.create_side(
-        &id,
-        body.message,
-        body.model,
-        body.wall_time_minutes.or(Some(2)),
-    )?))
+    let _mutation = state.manager.begin_mutation()?;
+    Ok(Json(
+        state
+            .manager
+            .create_side(
+                &id,
+                body.message,
+                body.model,
+                body.wall_time_minutes.or(Some(2)),
+            )
+            .await?,
+    ))
 }
 
 async fn side_status(
@@ -696,6 +714,7 @@ async fn stop_side(
     Path(id): Path<String>,
 ) -> ApiResult<Json<crate::store::SideMetadata>> {
     authorize(&state, &headers, true)?;
+    let _mutation = state.manager.begin_mutation()?;
     Ok(Json(state.manager.stop_side(&id, "user_request").await?))
 }
 
@@ -705,8 +724,8 @@ async fn delete_side(
     Path(id): Path<String>,
 ) -> ApiResult<Json<Value>> {
     authorize(&state, &headers, true)?;
-    state.store.delete_side(&id)?;
-    Ok(Json(json!({"type":"side_deleted","id":id})))
+    let _mutation = state.manager.begin_mutation()?;
+    Ok(Json(state.manager.delete_side(&id).await?))
 }
 
 async fn side_events(
@@ -778,8 +797,9 @@ async fn set_time(
     Json(body): Json<TimeBody>,
 ) -> ApiResult<Json<Value>> {
     authorize(&state, &headers, true)?;
+    let _mutation = state.manager.begin_mutation()?;
     Ok(Json(agent_value(
-        state.manager.update_time(&id, body.minutes)?,
+        state.manager.update_time(&id, body.minutes).await?,
     )?))
 }
 async fn stop_agent(
@@ -788,6 +808,7 @@ async fn stop_agent(
     Path(id): Path<String>,
 ) -> ApiResult<Json<Value>> {
     authorize(&state, &headers, true)?;
+    let _mutation = state.manager.begin_mutation()?;
     Ok(Json(agent_value(
         state.manager.stop(&id, "user_request").await?,
     )?))
@@ -851,6 +872,7 @@ async fn cancel_message(
     Path((id, message_id)): Path<(String, String)>,
 ) -> ApiResult<Json<Value>> {
     authorize(&state, &headers, true)?;
+    let _mutation = state.manager.begin_mutation()?;
     Ok(Json(serde_json::to_value(
         state.manager.cancel_message(&id, &message_id)?,
     )?))
@@ -869,6 +891,7 @@ mod tests {
 
     fn event(event_type: &str, data: serde_json::Value) -> EventRecord {
         EventRecord {
+            owner: "agent".into(),
             event_id: "evt_test".into(),
             local_ref: "e_1".into(),
             agent_id: "agt_test".into(),

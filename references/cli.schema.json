@@ -197,10 +197,16 @@
         }
       },
       "allOf": [
+        {"if": {"properties": {"side_id": {"type": "string"}}}, "then": {"properties": {"side_ref": {"type": "string"}}}, "else": {"properties": {"side_ref": {"type": "null"}}}},
+        {"if": {"properties": {"side_ref": {"type": "string"}}}, "then": {"properties": {"side_id": {"type": "string"}}}, "else": {"properties": {"side_id": {"type": "null"}}}},
         {"if": {"properties": {"event_type": {"enum": ["spawned", "resumed", "progress"]}}}, "then": {"properties": {"priority": {"const": 1}}}},
         {"if": {"properties": {"event_type": {"enum": ["milestone", "finished"]}}}, "then": {"properties": {"priority": {"const": 2}}}},
         {"if": {"properties": {"event_type": {"enum": ["input_required", "possible_stall", "stopped"]}}}, "then": {"properties": {"priority": {"const": 3}}}},
-        {"if": {"properties": {"event_type": {"enum": ["blocked", "failed"]}}}, "then": {"properties": {"priority": {"const": 4}}}}
+        {"if": {"properties": {"event_type": {"enum": ["blocked", "failed"]}}}, "then": {"properties": {"priority": {"const": 4}}}},
+        {"if": {"properties": {"event_type": {"enum": ["spawned", "resumed", "progress", "milestone", "input_required", "blocked", "possible_stall"]}}}, "then": {"properties": {"status": {"const": "working"}}}},
+        {"if": {"properties": {"event_type": {"const": "finished"}}}, "then": {"properties": {"status": {"const": "finished"}}}},
+        {"if": {"properties": {"event_type": {"const": "stopped"}}}, "then": {"properties": {"status": {"const": "stopped"}}}},
+        {"if": {"properties": {"event_type": {"const": "failed"}}}, "then": {"properties": {"status": {"const": "failed"}}}}
       ]
     },
     "Agent": {
@@ -381,7 +387,15 @@
         "last_progress_at": {
           "$ref": "#/$defs/NullableTimestamp"
         }
-      }
+      },
+      "allOf": [
+        {"if": {"properties": {"mode": {"const": "readonly"}}}, "then": {"properties": {"advisory_readonly": {"const": true}}}},
+        {"if": {"properties": {"mode": {"const": "write"}}}, "then": {"properties": {"advisory_readonly": {"const": false}}}},
+        {"if": {"properties": {"status": {"const": "working"}}}, "then": {"properties": {"finished_at": {"type": "null"}, "stopped_at": {"type": "null"}, "failed_at": {"type": "null"}, "stop_reason": {"type": "null"}, "last_error": {"type": "null"}, "current_phase": {"enum": ["starting", "processing_messages", "requesting_model", "retrying_model", "executing_tool", "waiting_terminal"]}}}},
+        {"if": {"properties": {"status": {"const": "finished"}}}, "then": {"properties": {"finished_at": {"$ref": "#/$defs/Timestamp"}, "stopped_at": {"type": "null"}, "failed_at": {"type": "null"}, "deadline_at": {"type": "null"}, "stop_reason": {"type": "null"}, "last_error": {"type": "null"}, "current_phase": {"const": "finished"}, "request_started_at": {"type": "null"}, "provider_request_id": {"type": "null"}}}},
+        {"if": {"properties": {"status": {"const": "stopped"}}}, "then": {"properties": {"finished_at": {"type": "null"}, "stopped_at": {"$ref": "#/$defs/Timestamp"}, "failed_at": {"type": "null"}, "deadline_at": {"type": "null"}, "stop_reason": {"type": "string"}, "last_error": {"type": "null"}, "current_phase": {"const": "stopped"}, "request_started_at": {"type": "null"}, "provider_request_id": {"type": "null"}}}},
+        {"if": {"properties": {"status": {"const": "failed"}}}, "then": {"properties": {"finished_at": {"type": "null"}, "stopped_at": {"type": "null"}, "failed_at": {"$ref": "#/$defs/Timestamp"}, "deadline_at": {"type": "null"}, "stop_reason": {"type": "null"}, "last_error": {"type": "string"}, "current_phase": {"const": "failed"}, "request_started_at": {"type": "null"}, "provider_request_id": {"type": "null"}}}}
+      ]
     },
     "AgentListItem": {
       "type": "object",
@@ -775,7 +789,12 @@
         "cancelled_at": {
           "$ref": "#/$defs/NullableTimestamp"
         }
-      }
+      },
+      "allOf": [
+        {"if": {"properties": {"status": {"const": "pending"}}}, "then": {"properties": {"delivered_at": {"type": "null"}, "cancelled_at": {"type": "null"}}}},
+        {"if": {"properties": {"status": {"const": "delivered"}}}, "then": {"properties": {"delivered_at": {"$ref": "#/$defs/Timestamp"}, "cancelled_at": {"type": "null"}}}},
+        {"if": {"properties": {"status": {"const": "cancelled"}}}, "then": {"properties": {"delivered_at": {"type": "null"}, "cancelled_at": {"$ref": "#/$defs/Timestamp"}}}}
+      ]
     },
     "MessageSent": {
       "type": "object",
@@ -841,7 +860,11 @@
             "waiting_for_capacity"
           ]
         }
-      }
+      },
+      "allOf": [
+        {"if": {"properties": {"agent_resumed": {"const": false}}}, "then": {"properties": {"resume_state": {"const": "not_needed"}, "agent_status": {"const": "working"}}}},
+        {"if": {"properties": {"agent_resumed": {"const": true}}}, "then": {"properties": {"resume_state": {"enum": ["started", "waiting_for_capacity"]}, "agent_status": {"const": "working"}}}}
+      ]
     },
     "EventBase": {
       "type": "object",
@@ -850,6 +873,7 @@
         "side_ref": ["side_id"]
       },
       "required": [
+        "owner",
         "event_id",
         "ref",
         "agent_id",
@@ -860,6 +884,9 @@
         "data"
       ],
       "properties": {
+        "owner": {
+          "enum": ["agent", "side"]
+        },
         "event_id": {
           "type": "string",
           "pattern": "^evt_[0-9A-HJKMNP-TV-Z]{26}$"
@@ -891,7 +918,11 @@
         "timestamp": {
           "$ref": "#/$defs/Timestamp"
         }
-      }
+      },
+      "allOf": [
+        {"if": {"properties": {"owner": {"const": "agent"}}}, "then": {"not": {"anyOf": [{"required": ["side_id"]}, {"required": ["side_ref"]}]}}},
+        {"if": {"properties": {"owner": {"const": "side"}}}, "then": {"required": ["side_id", "side_ref"]}}
+      ]
     },
     "Event": {
       "oneOf": [
@@ -1282,6 +1313,12 @@
           ],
           "unevaluatedProperties": false
         }
+      ],
+      "allOf": [
+        {"if": {"properties": {"type": {"const": "user_message"}, "data": {"required": ["source"], "properties": {"source": {"const": "create"}}}}}, "then": {"properties": {"owner": {"const": "side"}}}},
+        {"if": {"properties": {"type": {"const": "user_message"}, "data": {"required": ["source"], "properties": {"source": {"enum": ["spawn", "send"]}}}}}, "then": {"properties": {"owner": {"const": "agent"}}}},
+        {"if": {"properties": {"type": {"const": "lifecycle"}, "data": {"required": ["reason"], "properties": {"reason": {"const": "created"}}}}}, "then": {"properties": {"owner": {"const": "side"}}}},
+        {"if": {"properties": {"type": {"const": "lifecycle"}, "data": {"required": ["reason"], "properties": {"reason": {"enum": ["spawned", "resumed", "deadline_updated"]}}}}}, "then": {"properties": {"owner": {"const": "agent"}}}}
       ]
     },
     "ToolFailure": {
@@ -1665,11 +1702,15 @@
             },
             {
               "if": {"properties": {"status": {"const": "completed"}, "exit_code": {"const": 0}}},
-              "then": {"properties": {"ok": {"const": true}}}
+              "then": {"properties": {"ok": {"const": true}, "exit_code": {"type": "integer"}}}
             },
             {
               "if": {"properties": {"status": {"const": "completed"}, "exit_code": {"type": "integer", "not": {"const": 0}}}},
-              "then": {"properties": {"ok": {"const": false}}}
+              "then": {"properties": {"ok": {"const": false}, "exit_code": {"type": "integer"}}}
+            },
+            {
+              "if": {"properties": {"status": {"const": "completed"}}},
+              "then": {"properties": {"exit_code": {"type": "integer"}}}
             }
           ]
         },
@@ -1976,7 +2017,7 @@
           "type": "string"
         },
         "protocol_version": {
-          "const": 4
+          "const": 5
         },
         "pid": {
           "type": "integer",
@@ -2251,7 +2292,13 @@
         "last_progress_at": {
           "$ref": "#/$defs/NullableTimestamp"
         }
-      }
+      },
+      "allOf": [
+        {"if": {"properties": {"status": {"const": "working"}}}, "then": {"properties": {"finished_at": {"type": "null"}, "stopped_at": {"type": "null"}, "failed_at": {"type": "null"}, "stop_reason": {"type": "null"}, "last_error": {"type": "null"}, "current_phase": {"enum": ["starting", "processing_messages", "requesting_model", "retrying_model", "executing_tool", "waiting_terminal"]}}}},
+        {"if": {"properties": {"status": {"const": "finished"}}}, "then": {"properties": {"finished_at": {"$ref": "#/$defs/Timestamp"}, "stopped_at": {"type": "null"}, "failed_at": {"type": "null"}, "deadline_at": {"type": "null"}, "stop_reason": {"type": "null"}, "last_error": {"type": "null"}, "current_phase": {"const": "finished"}, "request_started_at": {"type": "null"}, "provider_request_id": {"type": "null"}}}},
+        {"if": {"properties": {"status": {"const": "stopped"}}}, "then": {"properties": {"finished_at": {"type": "null"}, "stopped_at": {"$ref": "#/$defs/Timestamp"}, "failed_at": {"type": "null"}, "deadline_at": {"type": "null"}, "stop_reason": {"type": "string"}, "last_error": {"type": "null"}, "current_phase": {"const": "stopped"}, "request_started_at": {"type": "null"}, "provider_request_id": {"type": "null"}}}},
+        {"if": {"properties": {"status": {"const": "failed"}}}, "then": {"properties": {"finished_at": {"type": "null"}, "stopped_at": {"type": "null"}, "failed_at": {"$ref": "#/$defs/Timestamp"}, "deadline_at": {"type": "null"}, "stop_reason": {"type": "null"}, "last_error": {"type": "string"}, "current_phase": {"const": "failed"}, "request_started_at": {"type": "null"}, "provider_request_id": {"type": "null"}}}}
+      ]
     },
     "SideListItem": {
       "type": "object",

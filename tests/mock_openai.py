@@ -227,7 +227,7 @@ class Handler(BaseHTTPRequestHandler):
                         0,
                         "exec_command",
                         {
-                            "command": "sleep 30",
+                            "command": "exec python3 -c 'import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(30)'",
                             "yield_time_ms": 30000,
                         },
                     )

@@ -1,4 +1,4 @@
-# Subagent v0.1.7 Protocol Reference
+# Subagent v0.1.8 Protocol Reference
 
 This file specifies the current binary. Backward compatibility is not promised. The
 release binary, SKILL.md, this reference, and cli.schema.json must change together.
@@ -48,7 +48,7 @@ object. Current semantic codes:
 - agent_not_found, side_not_found, event_not_found, message_not_found,
   notification_not_found.
 - invalid_argument, file_too_large.
-- capacity_exceeded: spawn rejected; retryable true.
+- capacity_exceeded: Agent spawn or Side creation rejected at capacity; retryable true.
 - conflict: current entity state forbids the command.
 - timeout: reserved for synchronous bounded operations; retryable true. Side deadline
   expiry is persisted as stopped wall_time instead of returning this Error.
@@ -99,7 +99,7 @@ x86-64 build. Negative values, fractions, underscores, and overflow are rejected
 Leading plus and leading zero behavior follows Rust FromStr; do not emit either.
 Agent and Side list limits are 1 through 1000 and default to 100. Log limit is
 explicitly 1 through 10000. Tool-specific limits are below.
-Inbox limit is 1 through 100 and priority is 1 through 5.
+Inbox limit is 1 through 100 and priority is 1 through 4.
 
 ### RFC3339
 
@@ -213,9 +213,10 @@ and returns protocol_mismatch instead of sending a request to an older daemon.
 
 ### daemon stop
 
-Emits status stopping immediately. The daemon then stops active Agents, terminates
-their owned process groups, records a clean shutdown, and removes socket/lock. Poll
-status until daemon_stopped to observe completion.
+Emits status stopping immediately. The daemon stops accepting mutations, waits for
+already accepted mutations, stops active Agents/Sides, and propagates cleanup errors.
+It records a clean shutdown and removes socket/lock only after successful cleanup.
+Poll status until daemon_stopped to observe completion.
 
 ### agents spawn
 
@@ -352,7 +353,7 @@ Empty API key is rejected. Credentials are not validated until a model request.
 
 ### inbox
 
-`subagent inbox` reads unread records from the durable global notification journal. It emits compact
+`subagent inbox list` reads unread records from the durable global notification journal. It emits compact
 Notification JSONL newest-first followed by exactly one
 `{"type":"inbox_summary","count":N,"acknowledged_through":SEQUENCE,"next_cursor":CURSOR_OR_NULL}` record.
 Defaults are limit 20, offset zero, and minimum
@@ -360,12 +361,12 @@ priority 2. Limit is 1 through 100. `--priority N` includes N and higher. `--age
 accepts an Agent ref, durable ID, or exact name and includes that Agent's Side
 notifications. `--all` also includes acknowledged records. A cursor continues toward
 older records and binds Agent, priority, and acknowledgement filters. Offset remains
-for compatibility and must be zero in cursor mode. Global `--agent` and `--priority`
-work identically before or after `follow`.
+for compatibility and must be zero in cursor mode. List-only flags are rejected by
+ack and follow rather than silently ignored.
 
 `subagent inbox ack <SEQUENCE|NOTIFICATION_ID>` advances one installation-local,
 durable acknowledgement watermark to that record; it never moves backward.
-`subagent inbox follow [--after SEQUENCE]` emits matching unread history oldest-first,
+`subagent inbox follow [--after SEQUENCE] [--priority N] [--agent AGENT]` emits matching unread history oldest-first,
 then flushes new matching Notifications as JSONL until disconnected. Without after,
 follow begins after the acknowledgement watermark.
 
@@ -394,7 +395,7 @@ stall-notification-seconds. It deduplicates until progress advances and never pe
 automatic recovery.
 
 The notify tool publishes progress priority 1, milestone priority 2, input_required
-priority 3, or blocked priority 4. Priority 5 is reserved. Notifications are a
+priority 3, or blocked priority 4. Notifications are a
 high-signal coordination feed; model messages, reasoning, tool calls, and tool results
 are not copied into it.
 
@@ -482,7 +483,7 @@ system/question messages, durably creates a working Side, and immediately emits:
 {"type":"side_created","id":"side_...","ref":"s_1","agent_id":"agt_...","agent_ref":"a_1","status":"working","created_at":"RFC3339"}
 ~~~
 
-`agents side AGENT` is the sole Agent-context creation command. Side is one-shot: it accepts no
+`sides create AGENT` is the sole Agent-context creation command. Side is one-shot: it accepts no
 follow-up messages. At most two Side runs may be working for one parent. This limit is
 independent of max-agents; a third creation returns capacity_exceeded and creates
 nothing.
@@ -696,3 +697,8 @@ obsolete Agents to reclaim their daemon-managed history and output files.
 Readonly removes structured write/edit/apply_patch definitions but does not constrain
 Bash, absolute paths, network, credentials, or other Agents. It is not a security
 boundary. Use trusted prompts and directories.
+
+Terminal ownership is held in daemon memory. Graceful stop sends TERM and then KILL
+to still-live owned process groups, but an ungraceful daemon SIGKILL, host crash, or a
+descendant that deliberately escapes its process group can leave processes behind.
+The daemon does not claim OS-level isolation or crash-proof descendant cleanup.

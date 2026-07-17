@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import json
 import pathlib
+from datetime import datetime
 
 import jsonschema
 
@@ -35,12 +36,26 @@ assert "active_differs_from_local" in schema["$defs"]["ConfigValue"]["required"]
 assert {"$ref": "#/$defs/InboxSummary"} in schema["oneOf"]
 assert {"$ref": "#/$defs/LogsSummary"} in schema["oneOf"]
 assert schema["$defs"]["DaemonRunning"]["properties"]["protocol_version"] == {
-    "const": 4
+    "const": 5
 }
 codes = set(schema["$defs"]["Error"]["properties"]["code"]["enum"])
 assert {"side_not_found", "protocol_mismatch"} <= codes
 
-validator = jsonschema.Draft202012Validator(schema)
+format_checker = jsonschema.FormatChecker()
+
+
+@format_checker.checks("date-time")
+def is_rfc3339(value):
+    if not isinstance(value, str):
+        return True
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return "T" in value and parsed.tzinfo is not None
+    except ValueError:
+        return False
+
+
+validator = jsonschema.Draft202012Validator(schema, format_checker=format_checker)
 
 
 def assert_invalid(value):
@@ -48,6 +63,7 @@ def assert_invalid(value):
 
 
 base_event = {
+    "owner": "agent",
     "event_id": "evt_01ARZ3NDEKTSV4RRFFQ69G5FAV",
     "ref": "e_1",
     "agent_id": "agt_01ARZ3NDEKTSV4RRFFQ69G5FAV",
@@ -55,9 +71,42 @@ base_event = {
     "sequence": 1,
     "timestamp": "2026-07-16T00:00:00Z",
     "type": "user_message",
-    "data": {"content": "question", "source": "create"},
+    "data": {"content": "question", "source": "spawn"},
 }
+assert not list(validator.iter_errors(base_event))
 assert_invalid({**base_event, "side_id": "side_01ARZ3NDEKTSV4RRFFQ69G5FAV"})
+assert_invalid({**base_event, "owner": "agent", "side_id": "side_01ARZ3NDEKTSV4RRFFQ69G5FAV", "side_ref": "s_1"})
+assert_invalid({**base_event, "owner": "side", "side_id": "side_01ARZ3NDEKTSV4RRFFQ69G5FAV", "data": {"content": "question", "source": "create"}})
+assert_invalid({**base_event, "timestamp": "definitely-not-a-date"})
+assert_invalid(
+    {
+        "type": "message",
+        "id": "msg_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "ref": "m_1",
+        "agent_id": "agt_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "agent_ref": "a_1",
+        "content": "queued",
+        "status": "pending",
+        "sent_at": "2026-07-16T00:00:00Z",
+        "delivered_at": "2026-07-16T00:00:01Z",
+        "cancelled_at": None,
+    }
+)
+assert_invalid(
+    {
+        "type": "message_sent",
+        "message_id": "msg_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "message_ref": "m_1",
+        "agent_id": "agt_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "agent_ref": "a_1",
+        "status": "queued",
+        "sent_at": "2026-07-16T00:00:00Z",
+        "agent_resumed": False,
+        "run_number": 1,
+        "agent_status": "failed",
+        "resume_state": "started",
+    }
+)
 assert_invalid(
     {
         "type": "config_value",
@@ -102,6 +151,18 @@ assert_invalid_tool(
         "exit_code": 0,
         "output": preview,
         "output_ref": "out_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "truncated": False,
+    }
+)
+assert_invalid_tool(
+    {
+        "ok": True,
+        "terminal_id": "term_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "status": "completed",
+        "exit_code": None,
+        "output": "",
+        "output_ref": "out_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+        "next_offset": 0,
         "truncated": False,
     }
 )

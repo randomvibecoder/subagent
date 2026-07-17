@@ -13,9 +13,10 @@ use chrono::{Duration as ChronoDuration, Utc};
 use serde_json::{Value, json};
 use std::{
     collections::{HashMap, HashSet},
+    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
     sync::{Arc, Mutex},
 };
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc, oneshot, watch};
 
 #[derive(Clone)]
 pub struct AgentManager {
@@ -24,8 +25,29 @@ pub struct AgentManager {
     active: Arc<Mutex<HashMap<String, AgentControl>>>,
     active_sides: Arc<Mutex<HashMap<String, SideControl>>>,
     stopping_agents: Arc<Mutex<HashSet<String>>>,
+    stopping_sides: Arc<Mutex<HashSet<String>>>,
+    owner_locks: Arc<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
     operations: Arc<Mutex<()>>,
     stall_notified: Arc<Mutex<HashMap<String, chrono::DateTime<Utc>>>>,
+    mutation_gate: Arc<MutationGate>,
+}
+
+struct MutationGate {
+    accepting: AtomicBool,
+    active: AtomicUsize,
+    idle: Notify,
+}
+
+pub struct MutationPermit {
+    gate: Arc<MutationGate>,
+}
+
+impl Drop for MutationPermit {
+    fn drop(&mut self) {
+        if self.gate.active.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.gate.idle.notify_waiters();
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -53,9 +75,56 @@ impl AgentManager {
             active: Default::default(),
             active_sides: Default::default(),
             stopping_agents: Default::default(),
+            stopping_sides: Default::default(),
+            owner_locks: Default::default(),
             operations: Default::default(),
             stall_notified: Default::default(),
+            mutation_gate: Arc::new(MutationGate {
+                accepting: AtomicBool::new(true),
+                active: AtomicUsize::new(0),
+                idle: Notify::new(),
+            }),
         }
+    }
+
+    pub fn begin_mutation(&self) -> Result<MutationPermit> {
+        if !self.mutation_gate.accepting.load(Ordering::Acquire) {
+            return Err(daemon_stopping_error());
+        }
+        self.mutation_gate.active.fetch_add(1, Ordering::AcqRel);
+        if !self.mutation_gate.accepting.load(Ordering::Acquire) {
+            self.mutation_gate.active.fetch_sub(1, Ordering::AcqRel);
+            return Err(daemon_stopping_error());
+        }
+        Ok(MutationPermit {
+            gate: self.mutation_gate.clone(),
+        })
+    }
+
+    fn track_internal_mutation(&self) -> MutationPermit {
+        self.mutation_gate.active.fetch_add(1, Ordering::AcqRel);
+        MutationPermit {
+            gate: self.mutation_gate.clone(),
+        }
+    }
+
+    pub fn begin_shutdown(&self) {
+        self.mutation_gate.accepting.store(false, Ordering::Release);
+    }
+
+    pub async fn wait_for_mutations(&self) {
+        while self.mutation_gate.active.load(Ordering::Acquire) != 0 {
+            self.mutation_gate.idle.notified().await;
+        }
+    }
+
+    fn owner_lock(&self, id: &str) -> Arc<AsyncMutex<()>> {
+        self.owner_locks
+            .lock()
+            .unwrap()
+            .entry(id.to_string())
+            .or_default()
+            .clone()
     }
 
     pub fn check_stalls(&self) -> Result<()> {
@@ -239,7 +308,14 @@ impl AgentManager {
         Ok(meta)
     }
 
-    pub fn send(&self, id: &str, message: String, wall_time_minutes: Option<u64>) -> Result<Value> {
+    pub async fn send(
+        &self,
+        id: &str,
+        message: String,
+        wall_time_minutes: Option<u64>,
+    ) -> Result<Value> {
+        let owner_lock = self.owner_lock(id);
+        let _owner = owner_lock.lock().await;
         let _operation = self.operations.lock().unwrap();
         if self.stopping_agents.lock().unwrap().contains(id) {
             return Err(coded_error(
@@ -255,7 +331,23 @@ impl AgentManager {
         if current.status == AgentStatus::Working
             && let Some(minutes) = wall_time_minutes
         {
-            self.update_time(id, minutes)?;
+            let deadline = Utc::now() + ChronoDuration::minutes(minutes as i64);
+            if let Some(control) = self.active.lock().unwrap().get(id).cloned() {
+                *control.deadline.lock().unwrap() = Some(deadline);
+            }
+            self.store.mutate_metadata(id, |meta| {
+                if meta.status != AgentStatus::Working {
+                    return Err(agent_state_conflict(id, meta.status.as_str()));
+                }
+                meta.deadline_at = Some(deadline);
+                meta.updated_at = Utc::now();
+                Ok(())
+            })?;
+            self.store.append_event(
+                id,
+                "lifecycle",
+                json!({"status":"working","reason":"deadline_updated","deadline_at":deadline}),
+            )?;
         }
         let message = self.store.enqueue_message(id, message)?;
         let (current_after_send, resume_state, agent_resumed) =
@@ -355,7 +447,9 @@ impl AgentManager {
         Ok(())
     }
 
-    pub fn rename(&self, id: &str, name: String) -> Result<Value> {
+    pub async fn rename(&self, id: &str, name: String) -> Result<Value> {
+        let owner_lock = self.owner_lock(id);
+        let _owner = owner_lock.lock().await;
         let _operation = self.operations.lock().unwrap();
         let name = normalize_agent_name(&name).map_err(|error| {
             coded_error(
@@ -366,13 +460,14 @@ impl AgentManager {
             )
         })?;
         self.ensure_name_available(&name, Some(id))?;
-        let mut meta = self.store.load_metadata(id)?;
-        meta.name = name.clone();
-        self.store.save_metadata(&meta)?;
+        let local_ref = self.store.mutate_metadata(id, |meta| {
+            meta.name = name.clone();
+            Ok(meta.local_ref.clone())
+        })?;
         Ok(json!({
             "type":"agent_renamed",
             "id":id,
-            "ref":meta.local_ref,
+            "ref":local_ref,
             "name":name,
             "renamed_at":Utc::now(),
         }))
@@ -412,8 +507,7 @@ impl AgentManager {
             .collect()
     }
 
-    pub fn schedule_pending(&self) -> Result<()> {
-        let _operation = self.operations.lock().unwrap();
+    pub async fn schedule_pending(&self) -> Result<()> {
         let filter = crate::ipc::ListFilter {
             limit: usize::MAX,
             sort: "spawned_at".into(),
@@ -421,6 +515,9 @@ impl AgentManager {
             ..Default::default()
         };
         for meta in self.store.list(&filter)? {
+            let owner_lock = self.owner_lock(&meta.id);
+            let _owner = owner_lock.lock().await;
+            let _operation = self.operations.lock().unwrap();
             if !self.has_capacity() {
                 break;
             }
@@ -454,6 +551,7 @@ impl AgentManager {
         let id = meta.id.clone();
         let run_number = meta.run_number;
         let cleanup_terminals = terminals.clone();
+        let owner_lock = self.owner_lock(&id);
         tokio::spawn(async move {
             let outcome = run_worker(
                 manager.cfg.clone(),
@@ -465,22 +563,25 @@ impl AgentManager {
                 deadline,
                 terminals,
                 manager.operations.clone(),
+                owner_lock.clone(),
             )
             .await;
             cleanup_terminals.terminate_all().await;
-            let mut active = manager.active.lock().unwrap();
-            if active
-                .get(&id)
-                .is_some_and(|control| control.run_number == run_number)
             {
-                active.remove(&id);
+                let mut active = manager.active.lock().unwrap();
+                if active
+                    .get(&id)
+                    .is_some_and(|control| control.run_number == run_number)
+                {
+                    active.remove(&id);
+                }
             }
-            drop(active);
             if let Err(e) = outcome {
+                let _owner = owner_lock.lock().await;
                 let _ = mark_failed(&manager.store, &id, format!("{e:#}"));
             }
             completed_tx.send(true).ok();
-            let _ = manager.schedule_pending();
+            let _ = manager.schedule_pending().await;
         });
         Ok(())
     }
@@ -511,35 +612,57 @@ impl AgentManager {
                     )
                 })?;
             self.stopping_agents.lock().unwrap().insert(id.to_string());
-            if let Err(error) = self.store.cancel_pending_messages(id) {
-                self.stopping_agents.lock().unwrap().remove(id);
-                return Err(error);
-            }
-            control.stop.send(true).ok();
             control
         };
-        control.terminals.terminate_all().await;
-        let mut completed = control.completed.clone();
-        let cleanup = if !*completed.borrow() {
-            completed.changed().await.map_err(|_| {
-                coded_error(
-                    "internal_error",
-                    "agent worker ended without completing stop cleanup",
-                    json!({"agent_id":id}),
-                    true,
-                )
-            })
-        } else {
-            Ok(())
-        };
-        let _operation = self.operations.lock().unwrap();
-        let result = cleanup.and_then(|()| {
-            self.store.cancel_pending_messages(id)?;
-            mark_stopped(&self.store, id, reason)?;
-            self.store.load_metadata(id)
+        let manager = self.clone();
+        let id = id.to_string();
+        let wait_id = id.clone();
+        let reason = reason.to_string();
+        let (result_tx, result_rx) = oneshot::channel();
+        let finalizer_permit = self.track_internal_mutation();
+        tokio::spawn(async move {
+            let _finalizer_permit = finalizer_permit;
+            let result = async {
+                let owner_lock = manager.owner_lock(&id);
+                let owner = owner_lock.lock().await;
+                let current = manager.store.load_metadata(&id)?;
+                if current.status != AgentStatus::Working {
+                    return Err(agent_state_conflict(&id, current.status.as_str()));
+                }
+                manager.store.cancel_pending_messages(&id)?;
+                control.stop.send(true).ok();
+                control.terminals.terminate_all().await;
+                if !mark_stopped(&manager.store, &id, &reason)? {
+                    let current = manager.store.load_metadata(&id)?;
+                    return Err(agent_state_conflict(&id, current.status.as_str()));
+                }
+                let result = manager.store.load_metadata(&id)?;
+                drop(owner);
+                let mut completed = control.completed.clone();
+                if !*completed.borrow() {
+                    completed.changed().await.map_err(|_| {
+                        coded_error(
+                            "internal_error",
+                            "agent worker ended without completing stop cleanup",
+                            json!({"agent_id":id}),
+                            true,
+                        )
+                    })?;
+                }
+                Ok(result)
+            }
+            .await;
+            manager.stopping_agents.lock().unwrap().remove(&id);
+            let _ = result_tx.send(result);
         });
-        self.stopping_agents.lock().unwrap().remove(id);
-        result
+        result_rx.await.map_err(|_| {
+            coded_error(
+                "internal_error",
+                "agent stop finalizer ended without a result",
+                json!({"agent_id":wait_id}),
+                true,
+            )
+        })?
     }
 
     pub fn cancel_message(&self, id: &str, message_id: &str) -> Result<MessageRecord> {
@@ -547,7 +670,7 @@ impl AgentManager {
         self.store.cancel_message(id, message_id)
     }
 
-    pub fn update_time(&self, id: &str, minutes: u64) -> Result<AgentMetadata> {
+    pub async fn update_time(&self, id: &str, minutes: u64) -> Result<AgentMetadata> {
         if !(1..=6000).contains(&minutes) {
             return Err(coded_error(
                 "invalid_argument",
@@ -556,6 +679,8 @@ impl AgentManager {
                 false,
             ));
         }
+        let owner_lock = self.owner_lock(id);
+        let _owner = owner_lock.lock().await;
         let control = self
             .active
             .lock()
@@ -572,10 +697,14 @@ impl AgentManager {
             })?;
         let deadline = Utc::now() + ChronoDuration::minutes(minutes as i64);
         *control.deadline.lock().unwrap() = Some(deadline);
-        let mut meta = self.store.load_metadata(id)?;
-        meta.deadline_at = Some(deadline);
-        meta.updated_at = Utc::now();
-        self.store.save_metadata(&meta)?;
+        let meta = self.store.mutate_metadata(id, |meta| {
+            if meta.status != AgentStatus::Working {
+                return Err(agent_state_conflict(id, meta.status.as_str()));
+            }
+            meta.deadline_at = Some(deadline);
+            meta.updated_at = Utc::now();
+            Ok(meta.clone())
+        })?;
         self.store.append_event(
             id,
             "lifecycle",
@@ -584,13 +713,15 @@ impl AgentManager {
         Ok(meta)
     }
 
-    pub fn create_side(
+    pub async fn create_side(
         &self,
         id: &str,
         message: String,
         model: Option<String>,
         wall_time_minutes: Option<u64>,
     ) -> Result<Value> {
+        let owner_lock = self.owner_lock(id);
+        let _owner = owner_lock.lock().await;
         let _operation = self.operations.lock().unwrap();
         validate_message(&message)?;
         let meta = self.store.load_metadata(id)?;
@@ -677,6 +808,7 @@ impl AgentManager {
         );
         let manager = self.clone();
         let run_id = side_id.clone();
+        let side_owner_lock = self.owner_lock(&side_id);
         tokio::spawn(async move {
             let result = run_side(
                 manager.cfg.clone(),
@@ -686,13 +818,15 @@ impl AgentManager {
                 context,
                 stop_rx,
                 terminals.clone(),
+                side_owner_lock.clone(),
             )
             .await;
             terminals.terminate_all().await;
+            manager.active_sides.lock().unwrap().remove(&run_id);
             if let Err(error) = result {
+                let _owner = side_owner_lock.lock().await;
                 let _ = mark_side_failed(&manager.store, &run_id, format!("{error:#}"));
             }
-            manager.active_sides.lock().unwrap().remove(&run_id);
             completed_tx.send(true).ok();
         });
         Ok(
@@ -718,38 +852,106 @@ impl AgentManager {
     }
 
     pub async fn stop_side(&self, id: &str, reason: &str) -> Result<SideMetadata> {
-        let control = self
-            .active_sides
-            .lock()
-            .unwrap()
-            .get(id)
-            .cloned()
-            .ok_or_else(|| {
-                coded_error(
+        let control = {
+            if self.stopping_sides.lock().unwrap().contains(id) {
+                return Err(coded_error(
                     "conflict",
-                    "side is not working",
-                    json!({"side_id":id}),
-                    false,
-                )
-            })?;
-        control.stop.send(true).ok();
-        control.terminals.terminate_all().await;
-        let mut completed = control.completed.clone();
-        if !*completed.borrow() {
-            completed.changed().await.map_err(|_| {
-                coded_error(
-                    "internal_error",
-                    "Side worker ended without completing stop cleanup",
-                    json!({"side_id":id}),
+                    "side is already stopping",
+                    json!({"side_id":id,"status":"stopping"}),
                     true,
-                )
-            })?;
-        }
-        mark_side_stopped(&self.store, id, reason)?;
-        self.store.load_side_metadata(id)
+                ));
+            }
+            let control = self
+                .active_sides
+                .lock()
+                .unwrap()
+                .get(id)
+                .cloned()
+                .ok_or_else(|| {
+                    coded_error(
+                        "conflict",
+                        "side is not working",
+                        json!({"side_id":id}),
+                        false,
+                    )
+                })?;
+            self.stopping_sides.lock().unwrap().insert(id.to_string());
+            control
+        };
+        let manager = self.clone();
+        let id = id.to_string();
+        let wait_id = id.clone();
+        let reason = reason.to_string();
+        let (result_tx, result_rx) = oneshot::channel();
+        let finalizer_permit = self.track_internal_mutation();
+        tokio::spawn(async move {
+            let _finalizer_permit = finalizer_permit;
+            let result = async {
+                let owner_lock = manager.owner_lock(&id);
+                let owner = owner_lock.lock().await;
+                let current = manager.store.load_side_metadata(&id)?;
+                if current.status != AgentStatus::Working {
+                    return Err(side_state_conflict(&id, current.status.as_str()));
+                }
+                control.stop.send(true).ok();
+                control.terminals.terminate_all().await;
+                if !mark_side_stopped(&manager.store, &id, &reason)? {
+                    let current = manager.store.load_side_metadata(&id)?;
+                    return Err(side_state_conflict(&id, current.status.as_str()));
+                }
+                let result = manager.store.load_side_metadata(&id)?;
+                drop(owner);
+                let mut completed = control.completed.clone();
+                if !*completed.borrow() {
+                    completed.changed().await.map_err(|_| {
+                        coded_error(
+                            "internal_error",
+                            "Side worker ended without completing stop cleanup",
+                            json!({"side_id":id}),
+                            true,
+                        )
+                    })?;
+                }
+                Ok(result)
+            }
+            .await;
+            manager.stopping_sides.lock().unwrap().remove(&id);
+            let _ = result_tx.send(result);
+        });
+        result_rx.await.map_err(|_| {
+            coded_error(
+                "internal_error",
+                "Side stop finalizer ended without a result",
+                json!({"side_id":wait_id}),
+                true,
+            )
+        })?
     }
 
     pub async fn delete_agent(&self, id: &str) -> Result<Value> {
+        let manager = self.clone();
+        let id = id.to_string();
+        let wait_id = id.clone();
+        let (result_tx, result_rx) = oneshot::channel();
+        let finalizer_permit = self.track_internal_mutation();
+        tokio::spawn(async move {
+            let _finalizer_permit = finalizer_permit;
+            let result = manager.delete_agent_finalizer(&id).await;
+            let _ = result_tx.send(result);
+        });
+        result_rx.await.map_err(|_| {
+            coded_error(
+                "internal_error",
+                "agent delete finalizer ended without a result",
+                json!({"agent_id":wait_id}),
+                true,
+            )
+        })?
+    }
+
+    async fn delete_agent_finalizer(&self, id: &str) -> Result<Value> {
+        let owner_lock = self.owner_lock(id);
+        let _owner = owner_lock.lock().await;
         let meta = self.store.load_metadata(id)?;
         if meta.status == AgentStatus::Working {
             return Err(coded_error(
@@ -774,15 +976,29 @@ impl AgentManager {
         Ok(json!({"type":"agent_deleted","id":id,"ref":meta.local_ref}))
     }
 
-    pub async fn stop_all(&self, reason: &str) {
+    pub async fn delete_side(&self, id: &str) -> Result<Value> {
+        let owner_lock = self.owner_lock(id);
+        let _owner = owner_lock.lock().await;
+        let side = self.store.load_side_metadata(id)?;
+        if side.status == AgentStatus::Working {
+            return Err(side_state_conflict(id, side.status.as_str()));
+        }
+        self.store.delete_side(id)?;
+        Ok(
+            json!({"type":"side_deleted","id":id,"ref":side.local_ref,"agent_id":side.agent_id,"agent_ref":side.agent_ref}),
+        )
+    }
+
+    pub async fn stop_all(&self, reason: &str) -> Result<()> {
         let ids: Vec<_> = self.active.lock().unwrap().keys().cloned().collect();
         for id in ids {
-            let _ = self.stop(&id, reason).await;
+            self.stop(&id, reason).await?;
         }
         let side_ids: Vec<_> = self.active_sides.lock().unwrap().keys().cloned().collect();
         for id in side_ids {
-            let _ = self.stop_side(&id, reason).await;
+            self.stop_side(&id, reason).await?;
         }
+        Ok(())
     }
 }
 
@@ -795,6 +1011,7 @@ async fn run_side(
     mut context: ContextSnapshot,
     mut stop: watch::Receiver<bool>,
     terminals: TerminalManager,
+    owner_lock: Arc<AsyncMutex<()>>,
 ) -> Result<()> {
     set_side_phase(
         &store,
@@ -833,7 +1050,11 @@ async fn run_side(
                 _ = stop.changed() => return Ok(()),
                 result = tokio::time::timeout(remaining, completion) => match result {
                     Ok(value) => value?,
-                    Err(_) => { mark_side_stopped(&store, &side.id, "wall_time")?; return Ok(()); }
+                    Err(_) => {
+                        let _owner = owner_lock.lock().await;
+                        mark_side_stopped(&store, &side.id, "wall_time")?;
+                        return Ok(());
+                    }
                 }
             }
         } else {
@@ -854,32 +1075,8 @@ async fn run_side(
                 "assistant_message",
                 json!({"content":turn.content,"usage":turn.usage}),
             )?;
-            side = store.load_side_metadata(&side.id)?;
-            if side.status != AgentStatus::Working {
-                return Ok(());
-            }
-            let now = Utc::now();
-            side.status = AgentStatus::Finished;
-            side.answer = Some(turn.content);
-            side.updated_at = now;
-            side.finished_at = Some(now);
-            side.deadline_at = None;
-            side.activity.current_phase = crate::store::AgentPhase::Finished;
-            side.activity.phase_started_at = Some(now);
-            side.activity.last_state_change_at = Some(now);
-            clear_active_request(&mut side.activity);
-            store.save_side_metadata(&side)?;
-            store.append_side_event(&side.id, "lifecycle", json!({"status":"finished"}))?;
-            store.append_notification(
-                &side.id,
-                "finished",
-                2,
-                AgentStatus::Finished,
-                side.answer
-                    .as_deref()
-                    .filter(|answer| !answer.is_empty())
-                    .unwrap_or("Side agent finished"),
-            )?;
+            let _owner = owner_lock.lock().await;
+            mark_side_finished(&store, &side.id, turn.content)?;
             return Ok(());
         }
         let mut image_messages = Vec::new();
@@ -964,6 +1161,7 @@ async fn run_worker(
     deadline: Arc<Mutex<Option<chrono::DateTime<Utc>>>>,
     terminals: TerminalManager,
     operations: Arc<Mutex<()>>,
+    owner_lock: Arc<AsyncMutex<()>>,
 ) -> Result<()> {
     set_agent_phase(
         &store,
@@ -998,6 +1196,7 @@ async fn run_worker(
         }
         if deadline.lock().unwrap().is_some_and(|d| Utc::now() >= d) {
             terminals.terminate_all().await;
+            let _owner = owner_lock.lock().await;
             mark_stopped(&store, &meta.id, "wall_time")?;
             return Ok(());
         }
@@ -1012,7 +1211,7 @@ async fn run_worker(
             tokio::select! {
                 result=&mut turn_future=>break result?,
                 changed=stop_rx.changed()=>{if changed.is_ok()&&*stop_rx.borrow(){terminals.terminate_all().await;return Ok(())}},
-                _=tokio::time::sleep(std::time::Duration::from_secs(1))=>{if deadline.lock().unwrap().is_some_and(|d|Utc::now()>=d){terminals.terminate_all().await;mark_stopped(&store,&meta.id,"wall_time")?;return Ok(())}}
+                _=tokio::time::sleep(std::time::Duration::from_secs(1))=>{if deadline.lock().unwrap().is_some_and(|d|Utc::now()>=d){terminals.terminate_all().await;let _owner=owner_lock.lock().await;mark_stopped(&store,&meta.id,"wall_time")?;return Ok(())}}
             }
         };
         complete_agent_model_request(&store, &meta.id)?;
@@ -1038,6 +1237,7 @@ async fn run_worker(
             }
             store.save_context(&meta.id, &context)?;
             terminals.terminate_all().await;
+            let _owner = owner_lock.lock().await;
             mark_finished(&store, &meta.id, &turn.content)?;
             return Ok(());
         }
@@ -1410,18 +1610,18 @@ fn estimated_tokens(messages: &[Value]) -> usize {
         .unwrap_or(0)
 }
 
-fn mark_finished(store: &Store, id: &str, final_message: &str) -> Result<()> {
-    let mut m = store.load_metadata(id)?;
-    let now = Utc::now();
-    m.status = AgentStatus::Finished;
-    m.updated_at = now;
-    m.finished_at = Some(now);
-    m.deadline_at = None;
-    m.activity.current_phase = crate::store::AgentPhase::Finished;
-    m.activity.phase_started_at = Some(now);
-    m.activity.last_state_change_at = Some(now);
-    clear_active_request(&mut m.activity);
-    store.save_metadata(&m)?;
+fn mark_finished(store: &Store, id: &str, final_message: &str) -> Result<bool> {
+    let transitioned = store.mutate_metadata(id, |m| {
+        if m.status != AgentStatus::Working {
+            return Ok(false);
+        }
+        let now = Utc::now();
+        set_agent_terminal(m, AgentStatus::Finished, now);
+        Ok(true)
+    })?;
+    if !transitioned {
+        return Ok(false);
+    }
     store.append_event(id, "lifecycle", json!({"status":"finished"}))?;
     store.append_notification(
         id,
@@ -1434,21 +1634,21 @@ fn mark_finished(store: &Store, id: &str, final_message: &str) -> Result<()> {
             final_message
         },
     )?;
-    Ok(())
+    Ok(true)
 }
-fn mark_stopped(store: &Store, id: &str, reason: &str) -> Result<()> {
-    let mut m = store.load_metadata(id)?;
-    let now = Utc::now();
-    m.status = AgentStatus::Stopped;
-    m.updated_at = now;
-    m.stopped_at = Some(now);
-    m.stop_reason = Some(reason.into());
-    m.deadline_at = None;
-    m.activity.current_phase = crate::store::AgentPhase::Stopped;
-    m.activity.phase_started_at = Some(now);
-    m.activity.last_state_change_at = Some(now);
-    clear_active_request(&mut m.activity);
-    store.save_metadata(&m)?;
+fn mark_stopped(store: &Store, id: &str, reason: &str) -> Result<bool> {
+    let transitioned = store.mutate_metadata(id, |m| {
+        if m.status != AgentStatus::Working {
+            return Ok(false);
+        }
+        let now = Utc::now();
+        set_agent_terminal(m, AgentStatus::Stopped, now);
+        m.stop_reason = Some(reason.into());
+        Ok(true)
+    })?;
+    if !transitioned {
+        return Ok(false);
+    }
     store.append_event(id, "lifecycle", json!({"status":"stopped","reason":reason}))?;
     store.append_notification(
         id,
@@ -1457,45 +1657,62 @@ fn mark_stopped(store: &Store, id: &str, reason: &str) -> Result<()> {
         AgentStatus::Stopped,
         format!("Agent stopped: {reason}"),
     )?;
-    Ok(())
+    Ok(true)
 }
-fn mark_failed(store: &Store, id: &str, error: String) -> Result<()> {
-    let mut m = store.load_metadata(id)?;
-    if m.status != AgentStatus::Working {
-        return Ok(());
+fn mark_failed(store: &Store, id: &str, error: String) -> Result<bool> {
+    let transitioned = store.mutate_metadata(id, |m| {
+        if m.status != AgentStatus::Working {
+            return Ok(false);
+        }
+        let now = Utc::now();
+        set_agent_terminal(m, AgentStatus::Failed, now);
+        m.last_error = Some(error.clone());
+        Ok(true)
+    })?;
+    if !transitioned {
+        return Ok(false);
     }
-    let now = Utc::now();
-    m.status = AgentStatus::Failed;
-    m.updated_at = now;
-    m.failed_at = Some(now);
-    m.last_error = Some(error.clone());
-    m.deadline_at = None;
-    m.activity.current_phase = crate::store::AgentPhase::Failed;
-    m.activity.phase_started_at = Some(now);
-    m.activity.last_state_change_at = Some(now);
-    clear_active_request(&mut m.activity);
-    store.save_metadata(&m)?;
     store.append_event(id, "error", json!({"status":"failed","error":error}))?;
     store.append_notification(id, "failed", 4, AgentStatus::Failed, &error)?;
-    Ok(())
+    Ok(true)
 }
 
-fn mark_side_stopped(store: &Store, id: &str, reason: &str) -> Result<()> {
-    let mut meta = store.load_side_metadata(id)?;
-    if meta.status != AgentStatus::Working {
-        return Ok(());
+fn mark_side_finished(store: &Store, id: &str, answer: String) -> Result<bool> {
+    let summary = if answer.is_empty() {
+        "Side agent finished".to_string()
+    } else {
+        answer.clone()
+    };
+    let transitioned = store.mutate_side_metadata(id, |meta| {
+        if meta.status != AgentStatus::Working {
+            return Ok(false);
+        }
+        let now = Utc::now();
+        set_side_terminal(meta, AgentStatus::Finished, now);
+        meta.answer = Some(answer);
+        Ok(true)
+    })?;
+    if !transitioned {
+        return Ok(false);
     }
-    let now = Utc::now();
-    meta.status = AgentStatus::Stopped;
-    meta.updated_at = now;
-    meta.stopped_at = Some(now);
-    meta.deadline_at = None;
-    meta.stop_reason = Some(reason.into());
-    meta.activity.current_phase = crate::store::AgentPhase::Stopped;
-    meta.activity.phase_started_at = Some(now);
-    meta.activity.last_state_change_at = Some(now);
-    clear_active_request(&mut meta.activity);
-    store.save_side_metadata(&meta)?;
+    store.append_side_event(id, "lifecycle", json!({"status":"finished"}))?;
+    store.append_notification(id, "finished", 2, AgentStatus::Finished, summary)?;
+    Ok(true)
+}
+
+fn mark_side_stopped(store: &Store, id: &str, reason: &str) -> Result<bool> {
+    let transitioned = store.mutate_side_metadata(id, |meta| {
+        if meta.status != AgentStatus::Working {
+            return Ok(false);
+        }
+        let now = Utc::now();
+        set_side_terminal(meta, AgentStatus::Stopped, now);
+        meta.stop_reason = Some(reason.into());
+        Ok(true)
+    })?;
+    if !transitioned {
+        return Ok(false);
+    }
     store.append_side_event(id, "lifecycle", json!({"status":"stopped","reason":reason}))?;
     store.append_notification(
         id,
@@ -1504,28 +1721,65 @@ fn mark_side_stopped(store: &Store, id: &str, reason: &str) -> Result<()> {
         AgentStatus::Stopped,
         format!("Side agent stopped: {reason}"),
     )?;
-    Ok(())
+    Ok(true)
 }
 
-fn mark_side_failed(store: &Store, id: &str, error: String) -> Result<()> {
-    let mut meta = store.load_side_metadata(id)?;
-    if meta.status != AgentStatus::Working {
-        return Ok(());
+fn mark_side_failed(store: &Store, id: &str, error: String) -> Result<bool> {
+    let transitioned = store.mutate_side_metadata(id, |meta| {
+        if meta.status != AgentStatus::Working {
+            return Ok(false);
+        }
+        let now = Utc::now();
+        set_side_terminal(meta, AgentStatus::Failed, now);
+        meta.last_error = Some(error.clone());
+        Ok(true)
+    })?;
+    if !transitioned {
+        return Ok(false);
     }
-    let now = Utc::now();
-    meta.status = AgentStatus::Failed;
+    store.append_side_event(id, "error", json!({"status":"failed","error":error}))?;
+    store.append_notification(id, "failed", 4, AgentStatus::Failed, &error)?;
+    Ok(true)
+}
+
+fn set_agent_terminal(meta: &mut AgentMetadata, status: AgentStatus, now: chrono::DateTime<Utc>) {
+    meta.status = status.clone();
     meta.updated_at = now;
-    meta.failed_at = Some(now);
+    meta.finished_at = (status == AgentStatus::Finished).then_some(now);
+    meta.stopped_at = (status == AgentStatus::Stopped).then_some(now);
+    meta.failed_at = (status == AgentStatus::Failed).then_some(now);
     meta.deadline_at = None;
-    meta.last_error = Some(error.clone());
-    meta.activity.current_phase = crate::store::AgentPhase::Failed;
+    meta.stop_reason = None;
+    meta.last_error = None;
+    meta.activity.current_phase = match status {
+        AgentStatus::Finished => crate::store::AgentPhase::Finished,
+        AgentStatus::Stopped => crate::store::AgentPhase::Stopped,
+        AgentStatus::Failed => crate::store::AgentPhase::Failed,
+        AgentStatus::Working => unreachable!(),
+    };
     meta.activity.phase_started_at = Some(now);
     meta.activity.last_state_change_at = Some(now);
     clear_active_request(&mut meta.activity);
-    store.save_side_metadata(&meta)?;
-    store.append_side_event(id, "error", json!({"status":"failed","error":error}))?;
-    store.append_notification(id, "failed", 4, AgentStatus::Failed, &error)?;
-    Ok(())
+}
+
+fn set_side_terminal(meta: &mut SideMetadata, status: AgentStatus, now: chrono::DateTime<Utc>) {
+    meta.status = status.clone();
+    meta.updated_at = now;
+    meta.finished_at = (status == AgentStatus::Finished).then_some(now);
+    meta.stopped_at = (status == AgentStatus::Stopped).then_some(now);
+    meta.failed_at = (status == AgentStatus::Failed).then_some(now);
+    meta.deadline_at = None;
+    meta.stop_reason = None;
+    meta.last_error = None;
+    meta.activity.current_phase = match status {
+        AgentStatus::Finished => crate::store::AgentPhase::Finished,
+        AgentStatus::Stopped => crate::store::AgentPhase::Stopped,
+        AgentStatus::Failed => crate::store::AgentPhase::Failed,
+        AgentStatus::Working => unreachable!(),
+    };
+    meta.activity.phase_started_at = Some(now);
+    meta.activity.last_state_change_at = Some(now);
+    clear_active_request(&mut meta.activity);
 }
 
 fn clear_active_request(activity: &mut crate::store::ActivityTelemetry) {
@@ -1534,6 +1788,33 @@ fn clear_active_request(activity: &mut crate::store::ActivityTelemetry) {
     }
     activity.request_started_at = None;
     activity.provider_request_id = None;
+}
+
+fn agent_state_conflict(id: &str, status: &str) -> anyhow::Error {
+    coded_error(
+        "conflict",
+        format!("agent is not working: {status}"),
+        json!({"agent_id":id,"status":status}),
+        false,
+    )
+}
+
+fn side_state_conflict(id: &str, status: &str) -> anyhow::Error {
+    coded_error(
+        "conflict",
+        format!("side is not working: {status}"),
+        json!({"side_id":id,"status":status}),
+        false,
+    )
+}
+
+fn daemon_stopping_error() -> anyhow::Error {
+    coded_error(
+        "conflict",
+        "daemon is stopping and no longer accepts mutations",
+        json!({"status":"stopping"}),
+        true,
+    )
 }
 
 fn normalize_model(value: &str) -> Result<String> {

@@ -63,8 +63,11 @@ enum TopCommand {
         about = "Inspect and cancel durable agent messages. Output: JSONL."
     )]
     Messages(MessagesCommand),
-    #[command(about = "Read the durable high-signal notification journal. Output: JSONL.")]
-    Inbox(InboxArgs),
+    #[command(
+        subcommand,
+        about = "Read the durable high-signal notification journal. Output: JSONL."
+    )]
+    Inbox(InboxCommand),
     #[command(subcommand, about = "Manage non-secret configuration. Output: JSONL.")]
     Config(ConfigCommand),
     #[command(name = "__serve", hide = true)]
@@ -164,7 +167,7 @@ enum SidesCommand {
     Create(CreateSideArgs),
     #[command(
         about = "List persisted Side runs for one parent Agent.",
-        after_help = "JSONL output: zero or more side_list_item records followed by one list_summary with nullable next_cursor.\n\nExample:\n  subagent sides list a_7 --status working --limit 20"
+        after_help = "JSONL output: zero or more side_list_item records followed by one list_summary with nullable next_cursor. --after-cursor may be combined only with omitted --offset or --offset 0.\n\nExample:\n  subagent sides list a_7 --status working --limit 20"
     )]
     List {
         /// Parent Agent a_N ref, agt_<ULID>, or exact name.
@@ -238,7 +241,7 @@ enum AgentsCommand {
         /// Agent a_N ref, agt_<ULID>, or exact name.
         #[arg(value_name = "AGENT", value_parser = parse_agent_id)]
         id: String,
-        /// New unique display name (4 through 40 characters).
+        /// Unique case-sensitive name; trimmed, 4–40 chars, control-free, and not a canonical ID/ref.
         name: String,
     },
     #[command(about = "Read transcript Event JSONL. Default: last 20 message events.")]
@@ -247,10 +250,6 @@ enum AgentsCommand {
     Context(ContextArgs),
     #[command(about = "Send input at the next safe boundary, or resume a non-working agent.")]
     Send(SendArgs),
-    #[command(
-        about = "Answer a question with a readonly side agent over a snapshot of the parent context."
-    )]
-    Side(AgentSideArgs),
     #[command(
         about = "Set a working agent deadline in minutes from now.",
         after_help = "JSONL output: one complete Agent object with the updated deadline.\n\nExample:\n  subagent agents time a_7 90"
@@ -328,7 +327,7 @@ struct SpawnArgs {
         help = "Read UTF-8 task input from PATH; use - for stdin"
     )]
     message_file: Option<String>,
-    /// Required unique tracking name, trimmed to 4 through 40 characters.
+    /// Unique case-sensitive name; trimmed, 4–40 chars, control-free, and not a canonical ID/ref.
     #[arg(long)]
     name: String,
     /// readonly omits structured write tools but Bash remains advisory.
@@ -467,29 +466,6 @@ struct SendArgs {
 #[derive(Args)]
 #[command(
     group(clap::ArgGroup::new("input").required(true).multiple(false).args(["message", "message_file"])),
-    after_help="JSONL output: one side_created receipt immediately. Inspect progress with `subagent sides status SIDE` or `subagent sides logs SIDE`. The Side trace never enters the parent transcript.\n\nExample:\n  subagent agents side a_7 --message \"Which database does this project use?\""
-)]
-struct AgentSideArgs {
-    /// Parent Agent a_N ref, agt_<ULID>, or exact name.
-    #[arg(value_name = "AGENT", value_parser = parse_agent_id)]
-    id: String,
-    /// Inline side question. Conflicts with --message-file.
-    #[arg(long)]
-    message: Option<String>,
-    /// Read UTF-8 input from PATH; use - for stdin.
-    #[arg(long, value_name = "PATH")]
-    message_file: Option<String>,
-    /// Override the parent agent's model for this Side run.
-    #[arg(long)]
-    model: Option<String>,
-    /// Optional side-agent deadline in integer minutes; 1 through 6000.
-    #[arg(long, value_name = "MINUTES", value_parser = parse_minutes)]
-    wall_time_minutes: Option<u64>,
-}
-
-#[derive(Args)]
-#[command(
-    group(clap::ArgGroup::new("input").required(true).multiple(false).args(["message", "message_file"])),
     after_help="JSONL output: one side_created receipt immediately. Inspect progress with `subagent sides status SIDE` or `subagent sides logs SIDE`. The Side trace never enters the parent transcript.\n\nExample:\n  subagent sides create a_7 --message \"Which database does this project use?\""
 )]
 struct CreateSideArgs {
@@ -511,10 +487,7 @@ struct CreateSideArgs {
 }
 
 #[derive(Args)]
-#[command(
-    after_help = "JSONL output: zero or more Notifications newest-first followed by one inbox_summary with nullable next_cursor. --priority N includes N and higher. Follow mode streams Notifications without a summary.\n\nExamples:\n  subagent inbox --priority 3 --limit 20\n  subagent inbox follow --after 42 --priority 2"
-)]
-struct InboxArgs {
+struct InboxListArgs {
     /// Maximum notifications to emit, from 1 through 100.
     #[arg(long, default_value_t = 20, value_parser = parse_inbox_limit)]
     limit: usize,
@@ -524,21 +497,24 @@ struct InboxArgs {
     /// Continue toward older notifications from a previous inbox_summary.
     #[arg(long)]
     after_cursor: Option<String>,
-    /// Minimum priority to include, from 1 through 5.
-    #[arg(long, global = true, default_value_t = 2, value_parser = parse_priority)]
+    /// Minimum priority to include, from 1 through 4.
+    #[arg(long, default_value_t = 2, value_parser = parse_priority)]
     priority: u8,
     /// Include notifications for only this Agent ref, durable ID, or exact name.
-    #[arg(long, global = true, value_name = "AGENT")]
+    #[arg(long, value_name = "AGENT")]
     agent: Option<String>,
     /// Include acknowledged notifications; plain inbox shows unread records only.
     #[arg(long)]
     all: bool,
-    #[command(subcommand)]
-    command: Option<InboxCommand>,
 }
 
 #[derive(Subcommand)]
 enum InboxCommand {
+    #[command(
+        about = "List durable notifications newest-first.",
+        after_help = "JSONL output: zero or more Notifications followed by one inbox_summary with nullable next_cursor. --priority N includes N and higher. --after-cursor may be combined only with omitted --offset or --offset 0.\n\nExample:\n  subagent inbox list --priority 3 --limit 20"
+    )]
+    List(InboxListArgs),
     /// Acknowledge one notification and everything older.
     Ack {
         /// Notification sequence number or durable ntf_<ULID>.
@@ -550,6 +526,12 @@ enum InboxCommand {
         /// Resume strictly after this notification sequence.
         #[arg(long)]
         after: Option<u64>,
+        /// Minimum priority to include, from 1 through 4.
+        #[arg(long, default_value_t = 2, value_parser = parse_priority)]
+        priority: u8,
+        /// Include notifications for only this Agent ref, durable ID, or exact name.
+        #[arg(long, value_name = "AGENT")]
+        agent: Option<String>,
     },
 }
 
@@ -586,15 +568,19 @@ async fn run_inner() -> Result<()> {
         TopCommand::Daemon(DaemonCommand::Status) => request_unchecked(Request::DaemonStatus).await,
         TopCommand::Daemon(DaemonCommand::Stop) => request_unchecked(Request::DaemonStop).await,
         TopCommand::Config(command) => config_command(command).await,
-        TopCommand::Inbox(args) => {
-            let request_value = match args.command {
-                Some(InboxCommand::Ack { identifier }) => Request::InboxAck { identifier },
-                Some(InboxCommand::Follow { after }) => Request::InboxFollow {
+        TopCommand::Inbox(command) => {
+            let request_value = match command {
+                InboxCommand::Ack { identifier } => Request::InboxAck { identifier },
+                InboxCommand::Follow {
+                    after,
+                    priority,
+                    agent,
+                } => Request::InboxFollow {
                     after_sequence: after,
-                    minimum_priority: args.priority,
-                    agent_id: args.agent,
+                    minimum_priority: priority,
+                    agent_id: agent,
                 },
-                None => Request::Inbox {
+                InboxCommand::List(args) => Request::Inbox {
                     limit: args.limit,
                     offset: args.offset,
                     after_cursor: args.after_cursor,
@@ -637,7 +623,7 @@ async fn run_inner() -> Result<()> {
         }
         TopCommand::Sides(command) => {
             let req = match command {
-                SidesCommand::Create(args) => Request::AgentSide {
+                SidesCommand::Create(args) => Request::SideCreate {
                     id: args.id,
                     message: read_message(args.message, args.message_file).await?,
                     model: args.model,
@@ -727,12 +713,6 @@ async fn run_inner() -> Result<()> {
                 AgentsCommand::Send(a) => Request::AgentSend {
                     id: a.id,
                     message: read_message(a.message, a.message_file).await?,
-                    wall_time_minutes: a.wall_time_minutes,
-                },
-                AgentsCommand::Side(a) => Request::AgentSide {
-                    id: a.id,
-                    message: read_message(a.message, a.message_file).await?,
-                    model: a.model,
                     wall_time_minutes: a.wall_time_minutes,
                 },
                 AgentsCommand::Time { id, minutes } => Request::AgentTime { id, minutes },
@@ -1084,9 +1064,9 @@ fn parse_inbox_limit(value: &str) -> std::result::Result<usize, String> {
 fn parse_priority(value: &str) -> std::result::Result<u8, String> {
     let priority = value
         .parse::<u8>()
-        .map_err(|_| "priority must be an integer from 1 through 5".to_string())?;
-    if !(1..=5).contains(&priority) {
-        return Err("priority must be an integer from 1 through 5".into());
+        .map_err(|_| "priority must be an integer from 1 through 4".to_string())?;
+    if !(1..=4).contains(&priority) {
+        return Err("priority must be an integer from 1 through 4".into());
     }
     Ok(priority)
 }

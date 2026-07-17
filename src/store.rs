@@ -287,6 +287,8 @@ pub struct MessageRecord {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventRecord {
+    #[serde(default)]
+    pub owner: String,
     pub event_id: String,
     #[serde(rename = "ref", default)]
     pub local_ref: String,
@@ -398,9 +400,79 @@ impl Store {
             sides_root: paths.sides_dir(),
             write_lock: Arc::new(Mutex::new(())),
         };
+        store.purge_corrupt_lifecycle_records()?;
         store.migrate_activity_metadata()?;
         store.migrate_local_references()?;
         Ok(store)
+    }
+
+    /// Remove records whose persisted lifecycle fields contradict their status.
+    /// This only touches daemon state under `state_root`; an Agent's project directory
+    /// is deliberately never inspected or modified.
+    fn purge_corrupt_lifecycle_records(&self) -> Result<()> {
+        let mut removed_agents = Vec::new();
+        for entry in fs::read_dir(&self.agents_root)? {
+            let dir = entry?.path();
+            let path = dir.join("metadata.json");
+            if !path.exists() {
+                continue;
+            }
+            let meta: AgentMetadata = serde_json::from_slice(&fs::read(&path)?)
+                .with_context(|| format!("parse {}", path.display()))?;
+            if !lifecycle_is_consistent(
+                &meta.status,
+                &meta.activity.current_phase,
+                [meta.finished_at, meta.stopped_at, meta.failed_at],
+                meta.deadline_at,
+                meta.activity.request_started_at,
+                meta.activity.provider_request_id.as_deref(),
+            ) {
+                removed_agents.push(meta.id);
+                fs::remove_dir_all(dir)?;
+            }
+        }
+
+        let mut removed_sides = Vec::new();
+        for entry in fs::read_dir(&self.sides_root)? {
+            let dir = entry?.path();
+            let path = dir.join("metadata.json");
+            if !path.exists() {
+                continue;
+            }
+            let meta: SideMetadata = serde_json::from_slice(&fs::read(&path)?)
+                .with_context(|| format!("parse {}", path.display()))?;
+            let parent_removed = removed_agents.iter().any(|id| id == &meta.agent_id);
+            if parent_removed
+                || !lifecycle_is_consistent(
+                    &meta.status,
+                    &meta.activity.current_phase,
+                    [meta.finished_at, meta.stopped_at, meta.failed_at],
+                    meta.deadline_at,
+                    meta.activity.request_started_at,
+                    meta.activity.provider_request_id.as_deref(),
+                )
+            {
+                removed_sides.push(meta.id);
+                fs::remove_dir_all(dir)?;
+            }
+        }
+
+        if (!removed_agents.is_empty() || !removed_sides.is_empty())
+            && self.notifications_path().exists()
+        {
+            let mut body = Vec::new();
+            for notification in self.read_all_notifications()? {
+                if removed_agents.iter().any(|id| id == &notification.agent_id)
+                    || removed_sides.iter().any(|id| id == &notification.agent_id)
+                {
+                    continue;
+                }
+                serde_json::to_writer(&mut body, &notification)?;
+                body.push(b'\n');
+            }
+            write_private_atomic(&self.notifications_path(), &body)?;
+        }
+        Ok(())
     }
 
     fn ref_sequence_path(&self, kind: &str) -> PathBuf {
@@ -509,6 +581,10 @@ impl Store {
                 continue;
             }
             let mut event: EventRecord = serde_json::from_str(&line)?;
+            if event.owner.is_empty() {
+                event.owner = if side_ref.is_some() { "side" } else { "agent" }.to_string();
+                changed = true;
+            }
             if event.local_ref.is_empty() {
                 event.local_ref = self.next_local_ref_locked("event", "e")?;
                 changed = true;
@@ -767,6 +843,18 @@ impl Store {
         )
     }
 
+    pub fn mutate_metadata<T>(
+        &self,
+        id: &str,
+        mutate: impl FnOnce(&mut AgentMetadata) -> Result<T>,
+    ) -> Result<T> {
+        let _guard = self.write_lock.lock().unwrap();
+        let mut meta = self.load_metadata(id)?;
+        let result = mutate(&mut meta)?;
+        self.save_metadata(&meta)?;
+        Ok(result)
+    }
+
     pub fn load_context(&self, id: &str) -> Result<ContextSnapshot> {
         let path = self.context_path(id);
         serde_json::from_slice(&fs::read(&path)?)
@@ -982,6 +1070,7 @@ impl Store {
         let sequence = self.next_sequence(&self.events_path(id), &self.event_sequence_path(id))?;
         let agent = self.load_metadata(id)?;
         let event = EventRecord {
+            owner: "agent".into(),
             event_id: format!("evt_{}", ulid::Ulid::new()),
             local_ref: self.next_local_ref_locked("event", "e")?,
             agent_id: id.to_string(),
@@ -1047,7 +1136,14 @@ impl Store {
         } else {
             0
         };
-        let next = current.saturating_add(1);
+        let next = current.checked_add(1).ok_or_else(|| {
+            coded_error(
+                "internal_error",
+                "sequence counter exhausted",
+                json!({"counter":counter}),
+                false,
+            )
+        })?;
         write_private_atomic(counter, next.to_string().as_bytes())?;
         Ok(next)
     }
@@ -1062,8 +1158,8 @@ impl Store {
     ) -> Result<NotificationRecord> {
         #[cfg(unix)]
         use std::os::unix::fs::OpenOptionsExt;
-        if !(1..=5).contains(&priority) {
-            bail!("notification priority must be from 1 through 5");
+        if !(1..=4).contains(&priority) {
+            bail!("notification priority must be from 1 through 4");
         }
         let _guard = self.write_lock.lock().unwrap();
         let (agent_id, agent_ref, agent_name, side_id, side_ref) = if owner_id.starts_with("side_")
@@ -1331,7 +1427,8 @@ impl Store {
             if line.trim().is_empty() {
                 continue;
             }
-            let event: EventRecord = serde_json::from_str(&line)?;
+            let mut event: EventRecord = serde_json::from_str(&line)?;
+            normalize_event_owner(&mut event, side);
             if before == Some(event.event_id.as_str()) {
                 before_found = true;
                 break;
@@ -1369,7 +1466,8 @@ impl Store {
             if line.trim().is_empty() {
                 continue;
             }
-            let event: EventRecord = serde_json::from_str(&line)?;
+            let mut event: EventRecord = serde_json::from_str(&line)?;
+            normalize_event_owner(&mut event, side);
             if event.event_id == event_id {
                 return Ok(event);
             }
@@ -1521,6 +1619,18 @@ impl Store {
         )
     }
 
+    pub fn mutate_side_metadata<T>(
+        &self,
+        id: &str,
+        mutate: impl FnOnce(&mut SideMetadata) -> Result<T>,
+    ) -> Result<T> {
+        let _guard = self.write_lock.lock().unwrap();
+        let mut meta = self.load_side_metadata(id)?;
+        let result = mutate(&mut meta)?;
+        self.save_side_metadata(&meta)?;
+        Ok(result)
+    }
+
     pub fn save_side_context(&self, id: &str, context: &ContextSnapshot) -> Result<()> {
         write_private_atomic(
             &self.side_dir(id).join("context.json"),
@@ -1541,6 +1651,7 @@ impl Store {
         let path = self.side_dir(id).join("events.jsonl");
         let sequence = self.next_sequence(&path, &self.event_sequence_path(id))?;
         let event = EventRecord {
+            owner: "side".into(),
             event_id: format!("evt_{}", ulid::Ulid::new()),
             local_ref: self.next_local_ref_locked("event", "e")?,
             agent_id: meta.agent_id.clone(),
@@ -1730,6 +1841,53 @@ impl Store {
     }
 }
 
+fn lifecycle_is_consistent(
+    status: &AgentStatus,
+    phase: &AgentPhase,
+    terminal_timestamps: [Option<DateTime<Utc>>; 3],
+    deadline_at: Option<DateTime<Utc>>,
+    request_started_at: Option<DateTime<Utc>>,
+    provider_request_id: Option<&str>,
+) -> bool {
+    let [finished_at, stopped_at, failed_at] = terminal_timestamps;
+    let terminal_count = usize::from(finished_at.is_some())
+        + usize::from(stopped_at.is_some())
+        + usize::from(failed_at.is_some());
+    match status {
+        AgentStatus::Working => {
+            terminal_count == 0
+                && !matches!(
+                    phase,
+                    AgentPhase::Finished | AgentPhase::Stopped | AgentPhase::Failed
+                )
+        }
+        AgentStatus::Finished => {
+            terminal_count == 1
+                && finished_at.is_some()
+                && matches!(phase, AgentPhase::Finished)
+                && deadline_at.is_none()
+                && request_started_at.is_none()
+                && provider_request_id.is_none()
+        }
+        AgentStatus::Stopped => {
+            terminal_count == 1
+                && stopped_at.is_some()
+                && matches!(phase, AgentPhase::Stopped)
+                && deadline_at.is_none()
+                && request_started_at.is_none()
+                && provider_request_id.is_none()
+        }
+        AgentStatus::Failed => {
+            terminal_count == 1
+                && failed_at.is_some()
+                && matches!(phase, AgentPhase::Failed)
+                && deadline_at.is_none()
+                && request_started_at.is_none()
+                && provider_request_id.is_none()
+        }
+    }
+}
+
 fn parse_time(v: &Option<String>) -> Result<Option<DateTime<Utc>>> {
     v.as_ref()
         .map(|s| {
@@ -1848,7 +2006,6 @@ fn list_filter_scope(filter: &ListFilter) -> Result<String> {
         "spawned_before": filter.spawned_before,
         "finished_after": filter.finished_after,
         "finished_before": filter.finished_before,
-        "verbose": filter.verbose,
     }))?)
 }
 
@@ -1952,6 +2109,12 @@ fn decode_list_cursor(value: &str) -> Result<ListCursor> {
 
 fn truncate_chars(value: &str, maximum: usize) -> String {
     value.chars().take(maximum).collect()
+}
+
+fn normalize_event_owner(event: &mut EventRecord, side: bool) {
+    if event.owner.is_empty() {
+        event.owner = if side { "side" } else { "agent" }.into();
+    }
 }
 
 pub fn normalize_agent_name(name: &str) -> Result<String> {
@@ -2078,6 +2241,9 @@ mod name_tests {
         };
         let store = Store::new(&paths).unwrap();
         let now = Utc::now();
+        let mut finished_activity = ActivityTelemetry::new(now);
+        finished_activity.current_phase = AgentPhase::Finished;
+        finished_activity.phase_started_at = Some(now);
         let agent = AgentMetadata {
             kind: "agent".into(),
             id: "agt_01ARZ3NDEKTSV4RRFFQ69G5FAV".into(),
@@ -2101,7 +2267,7 @@ mod name_tests {
             run_number: 1,
             stop_reason: None,
             last_error: None,
-            activity: ActivityTelemetry::new(now),
+            activity: finished_activity,
         };
         store.create(&agent, &ContextSnapshot::default()).unwrap();
         let mut colliding_name = agent.clone();
@@ -2256,6 +2422,74 @@ mod name_tests {
                 .unwrap()
                 .last_message_delivered_at,
             Some(agent.spawned_at)
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn startup_deletes_contradictory_lifecycle_records_only_from_daemon_state() {
+        let root =
+            std::env::temp_dir().join(format!("subagent-corrupt-store-{}", ulid::Ulid::new()));
+        let project = root.join("project");
+        fs::create_dir_all(&project).unwrap();
+        fs::write(project.join("keep.txt"), b"workspace survives").unwrap();
+        let paths = Paths {
+            config_dir: root.join("config"),
+            state_dir: root.join("state"),
+            runtime_dir: root.join("run"),
+        };
+        let store = Store::new(&paths).unwrap();
+        let now = Utc::now();
+        let mut activity = ActivityTelemetry::new(now);
+        activity.current_phase = AgentPhase::Finished;
+        let mut agent = AgentMetadata {
+            kind: "agent".into(),
+            id: format!("agt_{}", ulid::Ulid::new()),
+            local_ref: store.allocate_agent_ref().unwrap(),
+            name: "Corrupt record".into(),
+            dir: project.to_string_lossy().into_owned(),
+            mode: AgentMode::Write,
+            advisory_readonly: false,
+            model: "test".into(),
+            status: AgentStatus::Finished,
+            spawned_at: now,
+            last_message_at: now,
+            last_message_sent_at: Some(now),
+            last_message_delivered_at: Some(now),
+            run_started_at: now,
+            updated_at: now,
+            finished_at: Some(now),
+            stopped_at: None,
+            failed_at: None,
+            deadline_at: None,
+            run_number: 1,
+            stop_reason: None,
+            last_error: None,
+            activity,
+        };
+        store.create(&agent, &ContextSnapshot::default()).unwrap();
+        let notification = store
+            .append_notification(&agent.id, "finished", 2, AgentStatus::Finished, "done")
+            .unwrap();
+        agent.stopped_at = Some(now);
+        store.save_metadata(&agent).unwrap();
+        drop(store);
+
+        let reopened = Store::new(&paths).unwrap();
+        assert!(!reopened.agent_dir(&agent.id).exists());
+        assert!(project.join("keep.txt").exists());
+        assert!(
+            reopened
+                .read_all_notifications()
+                .unwrap()
+                .iter()
+                .all(|n| n.id != notification.id)
+        );
+        assert_eq!(
+            fs::read_to_string(reopened.notification_sequence_path())
+                .unwrap()
+                .trim(),
+            notification.sequence.to_string()
         );
         let _ = fs::remove_dir_all(root);
     }

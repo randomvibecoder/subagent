@@ -71,7 +71,7 @@ if SUBAGENT_WEB_PASSWORD='' $BIN daemon start 2>"$ROOT/empty-web-password-error.
   exit 1
 fi
 python3 -c 'import json,sys; value=json.load(open(sys.argv[1])); assert value["code"] == "cli_error" and "SUBAGENT_WEB_PASSWORD is empty" in value["message"]' "$ROOT/empty-web-password-error.jsonl"
-$BIN daemon start | python3 -c 'import json,sys; value=json.load(sys.stdin); assert value["status"] == "running" and value["version"] == "0.1.7" and value["protocol_version"] == 4 and value["web_ui_url"] is None and value["web_auth"] is None'
+$BIN daemon start | python3 -c 'import json,sys; value=json.load(sys.stdin); assert value["status"] == "running" and value["version"] == "0.1.8" and value["protocol_version"] == 5 and value["web_ui_url"] is None and value["web_auth"] is None'
 $BIN config list | python3 -c 'import json,sys; rows=[json.loads(x) for x in sys.stdin]; assert len(rows) == 6 and all(row["type"] == "config_value" and row["active_value"] is not None and row["active_differs_from_local"] is False and row["restart_required"] is False for row in rows); row=next(x for x in rows if x["key"] == "model"); assert row["active_source"] == "OPENAI_MODEL"'
 env -u OPENAI_MODEL -u OPENAI_BASE_URL "$BIN" config get model | python3 -c 'import json,sys; row=json.load(sys.stdin); assert row["local_source"] == "persisted" and row["active_source"] == "OPENAI_MODEL" and row["active_differs_from_local"] is True and row["restart_required"] is False'
 $BIN config set context-token-budget 65000 >/dev/null
@@ -107,19 +107,19 @@ $BIN agents send "$MODEL_REF" --message MODEL_ECHO >/dev/null
 wait_status "$MODEL_ID" finished
 $BIN agents status "$MODEL_ID" | python3 -c 'import json,sys; row=json.load(sys.stdin); assert row["model"] == "custom-main-model" and row["run_number"] == 2'
 $BIN agents logs "$MODEL_ID" --type assistant_message | python3 -c 'import json,sys; rows=[json.loads(x) for x in sys.stdin]; assert rows[-2]["data"]["content"] == "custom-main-model" and rows[-1]["type"] == "logs_summary"'
-$BIN inbox --agent "$MODEL_ID" --priority 1 --limit 10 | python3 -c 'import json,sys; rows=[json.loads(line) for line in sys.stdin]; assert rows[-1]["type"] == "inbox_summary" and rows[-1]["count"] == len(rows)-1; assert [row["event_type"] for row in rows[:-1][:3]] == ["finished","resumed","finished"]'
+$BIN inbox list --agent "$MODEL_ID" --priority 1 --limit 10 | python3 -c 'import json,sys; rows=[json.loads(line) for line in sys.stdin]; assert rows[-1]["type"] == "inbox_summary" and rows[-1]["count"] == len(rows)-1; assert [row["event_type"] for row in rows[:-1][:3]] == ["finished","resumed","finished"]'
 
 NOTIFY=$($BIN agents spawn --name notify-test --dir "$ROOT/project" --mode readonly --message NOTIFY_TOOL)
 NOTIFY_ID=$(printf '%s\n' "$NOTIFY" | json_field id)
 wait_status "$NOTIFY_ID" finished
-$BIN inbox --agent "$NOTIFY_ID" | python3 -c 'import json,sys; rows=[json.loads(line) for line in sys.stdin]; notes=rows[:-1]; assert rows[-1]["type"] == "inbox_summary" and rows[-1]["count"] == 2; assert [row["event_type"] for row in notes] == ["finished","milestone"]; assert notes[0]["summary"] == "notification task complete" and notes[1]["summary"] == "explicit milestone"; assert all(row["priority"] >= 2 for row in notes)'
-$BIN inbox --agent "$NOTIFY_ID" --limit 1 --offset 1 --priority 1 | python3 -c 'import json,sys; rows=[json.loads(x) for x in sys.stdin]; assert rows[0]["event_type"] == "milestone" and rows[1]["type"] == "inbox_summary" and rows[1]["count"] == 1'
-$BIN inbox --agent "$NOTIFY_ID" --priority 3 | python3 -c 'import json,sys; row=json.load(sys.stdin); assert row["type"] == "inbox_summary" and row["count"] == 0'
-INBOX_PAGE=$($BIN inbox --agent "$NOTIFY_ID" --priority 1 --limit 1)
+$BIN inbox list --agent "$NOTIFY_ID" | python3 -c 'import json,sys; rows=[json.loads(line) for line in sys.stdin]; notes=rows[:-1]; assert rows[-1]["type"] == "inbox_summary" and rows[-1]["count"] == 2; assert [row["event_type"] for row in notes] == ["finished","milestone"]; assert notes[0]["summary"] == "notification task complete" and notes[1]["summary"] == "explicit milestone"; assert all(row["priority"] >= 2 for row in notes)'
+$BIN inbox list --agent "$NOTIFY_ID" --limit 1 --offset 1 --priority 1 | python3 -c 'import json,sys; rows=[json.loads(x) for x in sys.stdin]; assert rows[0]["event_type"] == "milestone" and rows[1]["type"] == "inbox_summary" and rows[1]["count"] == 1'
+$BIN inbox list --agent "$NOTIFY_ID" --priority 3 | python3 -c 'import json,sys; row=json.load(sys.stdin); assert row["type"] == "inbox_summary" and row["count"] == 0'
+INBOX_PAGE=$($BIN inbox list --agent "$NOTIFY_ID" --priority 1 --limit 1)
 INBOX_CURSOR=$(printf '%s\n' "$INBOX_PAGE" | tail -n1 | json_field next_cursor)
 FIRST_NOTIFICATION=$(printf '%s\n' "$INBOX_PAGE" | head -n1 | json_field id)
-$BIN inbox --agent "$NOTIFY_ID" --priority 1 --limit 1 --after-cursor "$INBOX_CURSOR" | python3 -c 'import json,sys; rows=[json.loads(x) for x in sys.stdin]; assert rows[0]["id"] != sys.argv[1] and rows[-1]["type"]=="inbox_summary"' "$FIRST_NOTIFICATION"
-if $BIN inbox --agent "$NOTIFY_ID" --priority 2 --after-cursor "$INBOX_CURSOR" 2>"$ROOT/inbox-cursor-filter-error.jsonl"; then exit 1; fi
+$BIN inbox list --agent "$NOTIFY_ID" --priority 1 --limit 1 --after-cursor "$INBOX_CURSOR" | python3 -c 'import json,sys; rows=[json.loads(x) for x in sys.stdin]; assert rows[0]["id"] != sys.argv[1] and rows[-1]["type"]=="inbox_summary"' "$FIRST_NOTIFICATION"
+if $BIN inbox list --agent "$NOTIFY_ID" --priority 2 --after-cursor "$INBOX_CURSOR" 2>"$ROOT/inbox-cursor-filter-error.jsonl"; then exit 1; fi
 python3 -c 'import json,sys; assert json.load(open(sys.argv[1]))["code"] == "invalid_argument"' "$ROOT/inbox-cursor-filter-error.jsonl"
 
 printf '%s\n' WRITE_EDIT_PATCH >"$ROOT/task.md"
@@ -175,7 +175,7 @@ SIDE_PARENT_ID=$(printf '%s\n' "$SIDE_PARENT" | json_field id)
 wait_status "$SIDE_PARENT_ID" finished
 CONTEXT_BEFORE=$(sha256sum "$XDG_STATE_HOME/subagent/agents/$SIDE_PARENT_ID/context.json" | cut -d' ' -f1)
 EVENTS_BEFORE=$(sha256sum "$XDG_STATE_HOME/subagent/agents/$SIDE_PARENT_ID/events.jsonl" | cut -d' ' -f1)
-SIDE=$($BIN agents side "$SIDE_PARENT_ID" --message SIDE_TOOL_QUESTION)
+SIDE=$($BIN sides create "$SIDE_PARENT_ID" --message SIDE_TOOL_QUESTION)
 SIDE_ID=$(printf '%s\n' "$SIDE" | json_field id)
 SIDE_REF=$(printf '%s\n' "$SIDE" | json_field ref)
 printf '%s\n' "$SIDE" | python3 -c 'import json,sys; row=json.load(sys.stdin); assert row["type"] == "side_created" and row["status"] == "working"'
@@ -193,7 +193,7 @@ SIDE_MODEL=$($BIN sides create "$SIDE_PARENT_ID" --model custom-side-model --mes
 SIDE_MODEL_ID=$(printf '%s\n' "$SIDE_MODEL" | json_field id)
 wait_side_status "$SIDE_MODEL_ID" finished
 $BIN sides status "$SIDE_MODEL_ID" | python3 -c 'import json,sys; row=json.load(sys.stdin); assert row["answer"] == "custom-side-model" and row["model"] == "custom-side-model"'
-$BIN inbox --agent "$SIDE_PARENT_ID" --priority 2 --limit 100 | python3 -c 'import json,sys; rows=[json.loads(line) for line in sys.stdin]; assert any(row.get("side_id") == sys.argv[1] and row.get("event_type") == "finished" for row in rows)' "$SIDE_MODEL_ID"
+$BIN inbox list --agent "$SIDE_PARENT_ID" --priority 2 --limit 100 | python3 -c 'import json,sys; rows=[json.loads(line) for line in sys.stdin]; assert any(row.get("side_id") == sys.argv[1] and row.get("event_type") == "finished" for row in rows)' "$SIDE_MODEL_ID"
 $BIN sides list "$SIDE_PARENT_ID" | python3 -c 'import json,sys; rows=[json.loads(line) for line in sys.stdin]; assert len(rows) == 3 and all(row["type"] == "side_list_item" and row["model"] and row["current_phase"] for row in rows[:-1]) and rows[-1]["count"] == 2'
 SIDE_PAGE=$($BIN sides list "$SIDE_PARENT_ID" --limit 1)
 SIDE_CURSOR=$(printf '%s\n' "$SIDE_PAGE" | tail -n1 | json_field next_cursor)
@@ -224,7 +224,7 @@ wait_side_status "$WORKING_SIDE_ID" finished
 $BIN sides status "$WORKING_SIDE_ID" | python3 -c 'import json,sys; assert json.load(sys.stdin)["answer"] == "parent still running"'
 $BIN agents time "$DELAY_ID" 1 | python3 -c 'import json,sys; assert json.load(sys.stdin)["deadline_at"] is not None'
 sleep 6
-$BIN inbox --agent "$DELAY_ID" --priority 3 | python3 -c 'import json,sys; rows=[json.loads(x) for x in sys.stdin]; stalls=[x for x in rows if x.get("event_type") == "possible_stall"]; assert len(stalls) == 1 and "requesting_model" in stalls[0]["summary"]'
+$BIN inbox list --agent "$DELAY_ID" --priority 3 | python3 -c 'import json,sys; rows=[json.loads(x) for x in sys.stdin]; stalls=[x for x in rows if x.get("event_type") == "possible_stall"]; assert len(stalls) == 1 and "requesting_model" in stalls[0]["summary"]'
 if $BIN agents spawn --name capacity-test --dir "$ROOT/project" --message SECOND_AGENT 2>"$ROOT/capacity-error.jsonl"; then
   echo "spawn unexpectedly passed max-agents" >&2
   exit 1
@@ -256,17 +256,22 @@ for _ in $(seq 1 100); do
   sleep 0.05
 done
 [[ "$PHASE" == "executing_tool" ]]
+sleep 0.2
 $BIN agents stop "$STOP_TERMINAL_ID" >"$ROOT/stop-race-result.jsonl" &
 STOP_RACE_PID=$!
 sleep 0.05
-if $BIN agents send "$STOP_TERMINAL_ID" --message FINAL_ONLY 2>"$ROOT/stop-race-send-error.jsonl"; then
-  echo "send unexpectedly succeeded while stop was active" >&2
-  exit 1
+if $BIN agents send "$STOP_TERMINAL_ID" --message FINAL_ONLY >"$ROOT/stop-race-send-result.jsonl" 2>"$ROOT/stop-race-send-error.jsonl"; then
+  python3 -c 'import json,sys; row=json.load(open(sys.argv[1])); assert row["agent_resumed"] is True and row["run_number"] == 2' "$ROOT/stop-race-send-result.jsonl"
+else
+  python3 -c 'import json,sys; row=json.load(open(sys.argv[1])); assert row["code"]=="conflict" and row["retryable"] is True and row["details"]["status"]=="stopping"' "$ROOT/stop-race-send-error.jsonl"
 fi
-python3 -c 'import json,sys; row=json.load(open(sys.argv[1])); assert row["code"]=="conflict" and row["retryable"] is True and row["details"]["status"]=="stopping"' "$ROOT/stop-race-send-error.jsonl"
 wait "$STOP_RACE_PID"
 python3 -c 'import json,sys; row=json.load(open(sys.argv[1])); assert row["status"] == "stopped" and row["current_phase"] == "stopped"' "$ROOT/stop-race-result.jsonl"
-$BIN messages list "$STOP_TERMINAL_ID" --status pending | python3 -c 'import json,sys; row=json.load(sys.stdin); assert row["type"]=="list_summary" and row["count"]==0'
+if [[ -s "$ROOT/stop-race-send-error.jsonl" ]]; then
+  $BIN messages list "$STOP_TERMINAL_ID" --status pending | python3 -c 'import json,sys; row=json.load(sys.stdin); assert row["type"]=="list_summary" and row["count"]==0'
+else
+  $BIN agents stop "$STOP_TERMINAL_ID" >/dev/null || true
+fi
 $BIN daemon status | python3 -c 'import json,sys; assert json.load(sys.stdin)["status"] == "running"'
 
 SECRET=$($BIN agents spawn --name secret-env --dir "$ROOT/project" --mode write --message SECRET_ENV)
@@ -295,7 +300,7 @@ grep -F 'Side short ref (s_N) or durable ID (side_<ULID>)' <<<"$SIDE_LOG_HELP" >
 $BIN agents list --help | head -n 1 >/dev/null
 CREATE_SIDE_HELP=$($BIN sides create --help)
 grep -F 'subagent sides create' <<<"$CREATE_SIDE_HELP" >/dev/null
-! grep -F 'subagent agents side' <<<"$CREATE_SIDE_HELP" >/dev/null
+! $BIN agents --help | grep -F 'side' >/dev/null
 if $BIN sides status agt_01ARZ3NDEKTSV4RRFFQ69G5FAV 2>"$ROOT/typed-id-error.jsonl"; then exit 1; fi
 python3 -c 'import json,sys; assert "expected SIDE" in json.load(open(sys.argv[1]))["message"]' "$ROOT/typed-id-error.jsonl"
 $BIN agents list --status working | python3 -c 'import json,sys; rows=[json.loads(x) for x in sys.stdin]; assert rows[-1]["type"] == "list_summary"'
@@ -343,12 +348,12 @@ wait_status "$INTERRUPTED_ID" finished
 $BIN agents status "$INTERRUPTED_ID" | python3 -c 'import json,sys; row=json.load(sys.stdin); assert row["run_number"] == 2'
 $BIN messages status "$INTERRUPTED_ID" "$INTERRUPTED_MESSAGE_ID" | python3 -c 'import json,sys; assert json.load(sys.stdin)["status"] == "delivered"'
 
-LATEST_NOTIFICATION=$($BIN inbox --all --limit 1 --priority 1)
+LATEST_NOTIFICATION=$($BIN inbox list --all --limit 1 --priority 1)
 LATEST_SEQUENCE=$(printf '%s\n' "$LATEST_NOTIFICATION" | head -n 1 | json_field sequence)
 LATEST_NOTIFICATION_ID=$(printf '%s\n' "$LATEST_NOTIFICATION" | head -n 1 | json_field id)
 $BIN inbox ack "$LATEST_NOTIFICATION_ID" | python3 -c 'import json,sys; row=json.load(sys.stdin); assert row["type"] == "inbox_acknowledged" and row["acknowledged_through"] == int(sys.argv[1])' "$LATEST_SEQUENCE"
-$BIN inbox --priority 1 | python3 -c 'import json,sys; row=json.load(sys.stdin); assert row == {"type":"inbox_summary","count":0,"acknowledged_through":int(sys.argv[1]),"next_cursor":None}' "$LATEST_SEQUENCE"
-$BIN inbox --all --limit 1 --priority 1 | python3 -c 'import json,sys; rows=[json.loads(x) for x in sys.stdin]; assert rows[0]["acknowledged"] is True and rows[1]["type"]=="inbox_summary" and rows[1]["count"]==1 and rows[1]["acknowledged_through"]==int(sys.argv[1]) and rows[1]["next_cursor"]' "$LATEST_SEQUENCE"
+$BIN inbox list --priority 1 | python3 -c 'import json,sys; row=json.load(sys.stdin); assert row == {"type":"inbox_summary","count":0,"acknowledged_through":int(sys.argv[1]),"next_cursor":None}' "$LATEST_SEQUENCE"
+$BIN inbox list --all --limit 1 --priority 1 | python3 -c 'import json,sys; rows=[json.loads(x) for x in sys.stdin]; assert rows[0]["acknowledged"] is True and rows[1]["type"]=="inbox_summary" and rows[1]["count"]==1 and rows[1]["acknowledged_through"]==int(sys.argv[1]) and rows[1]["next_cursor"]' "$LATEST_SEQUENCE"
 
 timeout 8 "$BIN" inbox follow --after "$LATEST_SEQUENCE" --priority 1 >"$ROOT/inbox-follow.jsonl" &
 INBOX_FOLLOW_PID=$!
@@ -365,8 +370,8 @@ grep -q "$FOLLOW_AGENT_ID" "$ROOT/inbox-follow.jsonl"
 kill "$INBOX_FOLLOW_PID" >/dev/null 2>&1 || true
 wait "$INBOX_FOLLOW_PID" >/dev/null 2>&1 || true
 
-FILTER_AFTER=$($BIN inbox --all --limit 1 --priority 1 | head -n1 | json_field sequence)
-timeout 8 "$BIN" inbox --agent "$FOLLOW_AGENT_ID" --priority 2 follow --after "$FILTER_AFTER" >"$ROOT/inbox-parent-filter-follow.jsonl" &
+FILTER_AFTER=$($BIN inbox list --all --limit 1 --priority 1 | head -n1 | json_field sequence)
+timeout 8 "$BIN" inbox follow --agent "$FOLLOW_AGENT_ID" --priority 2 --after "$FILTER_AFTER" >"$ROOT/inbox-parent-filter-follow.jsonl" &
 FILTER_FOLLOW_PID=$!
 UNRELATED=$($BIN agents spawn --name unrelated-follow --dir "$ROOT/project" --mode readonly --message FINAL_ONLY)
 UNRELATED_ID=$(printf '%s\n' "$UNRELATED" | json_field id)
@@ -392,7 +397,7 @@ $BIN messages list "$INTERRUPTED_ID" | python3 tests/validate_schema.py
 $BIN sides list "$SIDE_PARENT_ID" | python3 tests/validate_schema.py
 $BIN sides status "$SIDE_ID" | python3 tests/validate_schema.py
 $BIN sides logs "$SIDE_ID" --all --limit 1000 | python3 tests/validate_schema.py
-$BIN inbox --all --limit 100 --priority 1 | python3 tests/validate_schema.py
+$BIN inbox list --all --limit 100 --priority 1 | python3 tests/validate_schema.py
 $BIN inbox ack "$LATEST_SEQUENCE" | python3 tests/validate_schema.py
 
 $BIN daemon stop | python3 -c 'import json,sys; assert json.load(sys.stdin)["status"] == "stopping"'

@@ -18,7 +18,7 @@ use std::{
 };
 use tokio::{
     io::AsyncWriteExt,
-    process::{ChildStdin, Command},
+    process::{Child, ChildStdin, Command},
     sync::Mutex as AsyncMutex,
 };
 
@@ -436,6 +436,7 @@ struct TerminalSession {
     command: String,
     cwd: PathBuf,
     pid: i32,
+    child: AsyncMutex<Child>,
     stdin: AsyncMutex<Option<ChildStdin>>,
     output_path: PathBuf,
     output_ref: String,
@@ -487,12 +488,14 @@ impl TerminalManager {
         }
         let mut child = cmd.spawn().with_context(|| format!("execute {command}"))?;
         let pid = child.id().context("child has no pid")? as i32;
+        let stdin = child.stdin.take();
         let session = Arc::new(TerminalSession {
             id: id.clone(),
             command,
             cwd,
             pid,
-            stdin: AsyncMutex::new(child.stdin.take()),
+            child: AsyncMutex::new(child),
+            stdin: AsyncMutex::new(stdin),
             output_path,
             output_ref: output_ref.clone(),
             cursor: Mutex::new(0),
@@ -506,8 +509,12 @@ impl TerminalManager {
             .insert(id.clone(), session.clone());
         let waiter_session = session.clone();
         tokio::spawn(async move {
-            let code = child.wait().await.ok().and_then(|s| s.code()).unwrap_or(-1);
-            *waiter_session.exit_code.lock().unwrap() = Some(code);
+            loop {
+                if refresh_exit_code(&waiter_session).await.is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
         });
         if !session.cancelled.load(Ordering::Acquire) {
             tokio::select! {
@@ -515,7 +522,7 @@ impl TerminalManager {
                 _ = session.cancellation.notified() => {}
             }
         }
-        let status = *session.exit_code.lock().unwrap();
+        let status = refresh_exit_code(&session).await;
         let cancelled = session.cancelled.load(Ordering::Acquire);
         let output = read_preview(&session.output_path, preview_bytes)?;
         if cancelled {
@@ -563,11 +570,14 @@ impl TerminalManager {
             stdin.flush().await?;
         }
         tokio::time::sleep(Duration::from_millis(yield_ms)).await;
-        let mut cursor = session.cursor.lock().unwrap();
-        let start = *cursor;
-        let (chunk, next, truncated) = read_chunk(&session.output_path, start, preview_bytes)?;
-        *cursor = next;
-        let exit_code = *session.exit_code.lock().unwrap();
+        let (chunk, next, truncated) = {
+            let mut cursor = session.cursor.lock().unwrap();
+            let start = *cursor;
+            let result = read_chunk(&session.output_path, start, preview_bytes)?;
+            *cursor = result.1;
+            result
+        };
+        let exit_code = refresh_exit_code(&session).await;
         if exit_code.is_some() {
             self.sessions.lock().unwrap().remove(id);
         }
@@ -587,7 +597,7 @@ impl TerminalManager {
         if let Some(s) = session {
             s.cancelled.store(true, Ordering::Release);
             s.cancellation.notify_waiters();
-            terminate_group(s.pid).await;
+            terminate_sessions(&[s]).await;
             true
         } else {
             false
@@ -602,11 +612,11 @@ impl TerminalManager {
             .drain()
             .map(|(_, s)| s)
             .collect();
-        for s in sessions {
+        for s in &sessions {
             s.cancelled.store(true, Ordering::Release);
             s.cancellation.notify_waiters();
-            terminate_group(s.pid).await;
         }
+        terminate_sessions(&sessions).await;
     }
 
     fn running_count(&self) -> usize {
@@ -684,13 +694,44 @@ fn read_chunk(path: &Path, offset: u64, max: usize) -> Result<(String, u64, bool
     Ok((String::from_utf8_lossy(&b).into(), next, truncated))
 }
 
-async fn terminate_group(pid: i32) {
+async fn refresh_exit_code(session: &TerminalSession) -> Option<i32> {
+    if let Some(code) = *session.exit_code.lock().unwrap() {
+        return Some(code);
+    }
+    let status = session.child.lock().await.try_wait().ok().flatten();
+    if let Some(status) = status {
+        let code = status.code().unwrap_or(-1);
+        *session.exit_code.lock().unwrap() = Some(code);
+        Some(code)
+    } else {
+        None
+    }
+}
+
+async fn signal_if_running(session: &TerminalSession, signal: i32) -> bool {
+    let mut child = session.child.lock().await;
+    if let Some(status) = child.try_wait().ok().flatten() {
+        *session.exit_code.lock().unwrap() = Some(status.code().unwrap_or(-1));
+        return false;
+    }
+    // The child cannot be reaped or have its PID reused while the Child lock is held.
     unsafe {
-        libc::kill(-pid, libc::SIGTERM);
+        libc::kill(-session.pid, signal);
+    }
+    true
+}
+
+async fn terminate_sessions(sessions: &[Arc<TerminalSession>]) {
+    let mut signalled = false;
+    for session in sessions {
+        signalled |= signal_if_running(session, libc::SIGTERM).await;
+    }
+    if !signalled {
+        return;
     }
     tokio::time::sleep(Duration::from_millis(500)).await;
-    unsafe {
-        libc::kill(-pid, libc::SIGKILL);
+    for session in sessions {
+        signal_if_running(session, libc::SIGKILL).await;
     }
 }
 

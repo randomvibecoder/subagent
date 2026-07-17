@@ -31,7 +31,7 @@ Type "subagent agents list --status working"
 Enter
 Sleep 9s
 
-Type "subagent inbox --priority 2"
+Type "subagent inbox list --priority 2"
 Enter
 Sleep 4s
 

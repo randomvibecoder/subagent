@@ -67,7 +67,7 @@ Coordinate several workers without importing their raw transcripts:
 
 ```sh
 subagent agents list --status working
-subagent inbox --priority 2
+subagent inbox list --priority 2
 subagent agents logs a_1
 subagent agents send a_1 --message "Also check token refresh behavior."
 ```
@@ -105,7 +105,7 @@ may work concurrently by default; configure another limit with `max-agents` or
 | `agents time\|stop\|delete ID` | Manage lifecycle and cleanup |
 | `sides create\|list\|status\|logs\|stop\|delete` | Run saved one-shot Side questions |
 | `messages list\|status\|cancel` | Inspect durable queued messages |
-| `inbox`, `inbox ack`, `inbox follow` | Read, acknowledge, or stream high-signal notifications |
+| `inbox list`, `inbox ack`, `inbox follow` | Read, acknowledge, or stream high-signal notifications |
 | `config list\|get\|set` | Manage non-secret configuration |
 
 Run any command with `--help` for exact flags. [`SKILL.md`](SKILL.md) is the compact
@@ -182,6 +182,10 @@ up obsolete agents.
 user's filesystem, process, credential, and network access. Readonly mode removes
 structured write tools and instructs the model not to mutate state, but Bash can still
 change the host.
+
+Graceful stop cleans up process groups still owned by the running daemon. A daemon
+SIGKILL, host crash, or a descendant that escapes its process group can leave work
+behind; this is host-native automation, not crash-proof process isolation.
 
 Run the daemon as a user that can access only the projects and credentials agents
 should reach. Treat repository content as untrusted instructions. See

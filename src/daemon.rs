@@ -29,7 +29,7 @@ pub async fn serve(cfg: RuntimeConfig, web_ui_port: Option<u16>) -> Result<()> {
     let recovered_sides = store.recover_interrupted_sides()?;
     let cfg = Arc::new(cfg);
     let manager = AgentManager::new(cfg.clone(), store.clone());
-    manager.schedule_pending()?;
+    manager.schedule_pending().await?;
     let (web_ui_url, web_auth) = if let Some(port) = web_ui_port {
         let runtime = crate::web::start(
             port,
@@ -68,7 +68,18 @@ pub async fn serve(cfg: RuntimeConfig, web_ui_port: Option<u16>) -> Result<()> {
             _=stall_tick.tick()=>{if let Err(error)=manager.check_stalls(){eprintln!("stall watchdog error: {error:#}");}}
         }
     }
-    manager.stop_all("daemon_shutdown").await;
+    manager.wait_for_mutations().await;
+    if let Err(error) = manager.stop_all("daemon_shutdown").await {
+        write_daemon_lifecycle(
+            &cfg.paths,
+            "shutdown_failed",
+            std::process::id(),
+            daemon_started_at,
+        )?;
+        let _ = std::fs::remove_file(&socket);
+        let _ = std::fs::remove_file(&lock_path);
+        return Err(error);
+    }
     write_daemon_lifecycle(&cfg.paths, "stopped", std::process::id(), daemon_started_at)?;
     let _ = std::fs::remove_file(socket);
     let _ = std::fs::remove_file(lock_path);
@@ -166,12 +177,18 @@ async fn dispatch(
     web_ui_url: &Option<String>,
     web_auth: &Option<String>,
 ) -> Result<Output> {
+    let _mutation = if request_is_mutating(&req) {
+        Some(manager.begin_mutation()?)
+    } else {
+        None
+    };
     let req = resolve_local_references(req, store)?;
     let lines = match req {
         Request::DaemonStatus => vec![
             json!({"type":"daemon","status":"running","version":env!("CARGO_PKG_VERSION"),"protocol_version":PROTOCOL_VERSION,"pid":std::process::id(),"socket":cfg.paths.socket(),"working_agents":manager.working_count(),"max_agents":cfg.file.max_agents,"model":cfg.file.model,"base_url":cfg.file.base_url,"web_ui_url":web_ui_url,"web_auth":web_auth}),
         ],
         Request::DaemonStop => {
+            manager.begin_shutdown();
             shutdown.send(true).ok();
             vec![
                 json!({"type":"daemon","status":"stopping","working_agents":manager.working_count()}),
@@ -262,7 +279,7 @@ async fn dispatch(
         } => vec![agent_value(
             wait_for_agent(store, &id, timeout_seconds).await?,
         )?],
-        Request::AgentRename { id, name } => vec![manager.rename(&id, name)?],
+        Request::AgentRename { id, name } => vec![manager.rename(&id, name).await?],
         Request::AgentLogs {
             id,
             mut types,
@@ -301,13 +318,17 @@ async fn dispatch(
             id,
             message,
             wall_time_minutes,
-        } => vec![manager.send(&id, message, wall_time_minutes)?],
-        Request::AgentSide {
+        } => vec![manager.send(&id, message, wall_time_minutes).await?],
+        Request::SideCreate {
             id,
             message,
             model,
             wall_time_minutes,
-        } => vec![manager.create_side(&id, message, model, wall_time_minutes)?],
+        } => vec![
+            manager
+                .create_side(&id, message, model, wall_time_minutes)
+                .await?,
+        ],
         Request::Inbox {
             limit,
             offset,
@@ -316,10 +337,10 @@ async fn dispatch(
             agent_id,
             include_acknowledged,
         } => {
-            if !(1..=100).contains(&limit) || !(1..=5).contains(&minimum_priority) {
+            if !(1..=100).contains(&limit) || !(1..=4).contains(&minimum_priority) {
                 return Err(coded_error(
                     "invalid_argument",
-                    "inbox limit must be 1..=100 and priority must be 1..=5",
+                    "inbox limit must be 1..=100 and priority must be 1..=4",
                     json!({"limit":limit,"priority":minimum_priority}),
                     false,
                 ));
@@ -356,10 +377,10 @@ async fn dispatch(
             minimum_priority,
             agent_id,
         } => {
-            if !(1..=5).contains(&minimum_priority) {
+            if !(1..=4).contains(&minimum_priority) {
                 return Err(coded_error(
                     "invalid_argument",
-                    "inbox priority must be 1..=5",
+                    "inbox priority must be 1..=4",
                     json!({"priority":minimum_priority}),
                     false,
                 ));
@@ -434,14 +455,10 @@ async fn dispatch(
             manager.stop_side(&id, "user_request").await?,
         )?],
         Request::SideDelete { id } => {
-            let side = store.load_side_metadata(&id)?;
-            store.delete_side(&id)?;
-            vec![
-                json!({"type":"side_deleted","id":id,"ref":side.local_ref,"agent_id":side.agent_id,"agent_ref":side.agent_ref}),
-            ]
+            vec![manager.delete_side(&id).await?]
         }
         Request::AgentTime { id, minutes } => {
-            vec![agent_value(manager.update_time(&id, minutes)?)?]
+            vec![agent_value(manager.update_time(&id, minutes).await?)?]
         }
         Request::AgentStop { id } => {
             vec![agent_value(manager.stop(&id, "user_request").await?)?]
@@ -492,6 +509,23 @@ async fn dispatch(
     Ok(Output::Lines(lines))
 }
 
+fn request_is_mutating(request: &Request) -> bool {
+    matches!(
+        request,
+        Request::AgentSpawn { .. }
+            | Request::AgentRename { .. }
+            | Request::AgentSend { .. }
+            | Request::SideCreate { .. }
+            | Request::InboxAck { .. }
+            | Request::SideStop { .. }
+            | Request::SideDelete { .. }
+            | Request::AgentTime { .. }
+            | Request::AgentStop { .. }
+            | Request::AgentDelete { .. }
+            | Request::MessageCancel { .. }
+    )
+}
+
 fn resolve_local_references(req: Request, store: &Store) -> Result<Request> {
     Ok(match req {
         Request::AgentStatus { id } => Request::AgentStatus {
@@ -520,12 +554,12 @@ fn resolve_local_references(req: Request, store: &Store) -> Result<Request> {
             message,
             wall_time_minutes,
         },
-        Request::AgentSide {
+        Request::SideCreate {
             id,
             message,
             model,
             wall_time_minutes,
-        } => Request::AgentSide {
+        } => Request::SideCreate {
             id: store.resolve_agent_id(&id)?,
             message,
             model,

@@ -120,8 +120,7 @@ lifecycle, and errors are excluded so they do not waste model context.
 Prefer the high-signal inbox when coordinating several agents:
 
 ~~~sh
-subagent inbox
-subagent inbox --agent a_1 --priority 3 --limit 50 --offset 0
+subagent inbox list --agent a_1 --priority 3 --limit 50 --offset 0
 ~~~
 
 Inbox emits unread durable Notifications newest-first, then one `inbox_summary`. The default is
@@ -160,7 +159,7 @@ subagent sides create a_1 --message "Which framework is it using?"
 ~~~
 
 Output is a side_created receipt with a stable `side_<ULID>` and local `s_` reference. It returns immediately.
-Inspect the saved answer and tool trace with sides status and sides logs. `agents side`
+Inspect the saved answer and tool trace with sides status and sides logs. `sides create`
 is the sole Agent-context Side creation command.
 
 ## Commands
@@ -203,7 +202,7 @@ subagent agents context AGENT
 subagent agents send AGENT
     (--message TEXT | --message-file PATH) [--wall-time-minutes MINUTES]
 
-subagent agents side AGENT
+subagent sides create AGENT
     (--message TEXT | --message-file PATH) [--model MODEL]
     [--wall-time-minutes MINUTES]
 
@@ -281,19 +280,19 @@ new Side.
 ### Inbox
 
 ~~~text
-subagent inbox [--limit N] [--offset N] [--priority 1|2|3|4|5]
+subagent inbox list [--limit N] [--offset N] [--priority 1|2|3|4]
     [--after-cursor CURSOR] [--agent AGENT] [--all]
 subagent inbox ack SEQUENCE_OR_NOTIFICATION_ID
-subagent inbox follow [--after SEQUENCE] [--priority 1|2|3|4|5]
+subagent inbox follow [--after SEQUENCE] [--priority 1|2|3|4]
     [--agent AGENT]
 ~~~
 
-Plain output is unread Notification JSONL, newest first, followed by exactly one
+List output is unread Notification JSONL, newest first, followed by exactly one
 `inbox_summary` containing the emitted count, global acknowledgement watermark, and
 nullable cursor toward older matches.
 limit defaults 20 and accepts 1–100;
 offset defaults zero. priority is a minimum threshold, defaults 2, and therefore
-`--priority 3` includes priorities 3, 4, and 5. agent accepts a ref, durable ID, or
+`--priority 3` includes priorities 3 and 4. agent accepts a ref, durable ID, or
 exact name and also includes its Side notifications. `--all` includes acknowledged
 history. ack durably marks the selected notification and every older sequence
 handled; the watermark never moves backward. follow emits matching unread history
@@ -301,7 +300,7 @@ oldest-first and then flushes new JSONL until disconnected. The journal exposes 
 newest 10,000 entries.
 
 Priority meanings are: 1 routine progress, 2 milestone/finish, 3 input required or
-stop, 4 blocker/failure, and 5 reserved critical severity. Natural finish summary is
+stop, and 4 blocker/failure. Natural finish summary is
 the final Agent message, capped at 5,000 Unicode scalar values.
 
 ### Log types
@@ -315,7 +314,7 @@ be selected explicitly.
 - Repeated --type: only those exact types.
 - --all: every type; conflicts with --type.
 - --limit: 1 through 10000; default 20.
-- --after: exclusive same-agent Event cursor.
+- --after: exclusive same-owner Event cursor.
 - --follow: flush new matches and exit after the agent becomes terminal.
 - Finite output always ends with logs_summary; follow emits Events only.
 
@@ -398,11 +397,24 @@ Deleting an agent stops its working Side runs and removes daemon metadata, conte
 Events, Messages, Side histories, and stored terminal output. It never deletes or
 reverts the working directory, project files, Git state, commits, or branches.
 
+Every Event has explicit `owner:"agent"|"side"`. Agent Events omit `side_id` and
+`side_ref`; Side Events include both, while `agent_id`/`agent_ref` identify their
+parent. Per-owner mutations are serialized. Exactly one terminal transition wins,
+and terminal metadata has exactly one matching finished/stopped/failed timestamp,
+null deadline/request fields, and the matching terminal phase. On upgrade, protocol 5
+deletes daemon-owned records that already contradict those invariants, including their
+dependent Side histories and notifications; it never touches the project directory.
+
+Graceful daemon shutdown stops accepting mutations, waits for accepted mutations,
+and reports cleanup failure instead of writing a clean-stop marker. Terminal process
+ownership is memory-only: daemon SIGKILL, host crash, or a descendant that escapes its
+process group can leave processes behind. Subagent is not crash-proof OS isolation.
+
 ## Choosing a command
 
 - New independent task: agents spawn.
 - List active work: agents list --status working.
-- Coordinate many agents without context rot: inbox, optionally filtered by agent or
+- Coordinate many agents without context rot: inbox list, optionally filtered by agent or
   priority.
 - Inspect normal conversation: agents logs.
 - Inspect tools/errors: agents logs with --type or --all.
@@ -412,7 +424,7 @@ reverts the working directory, project files, Git state, commits, or branches.
 - End active work: agents stop.
 - Remove daemon history: agents delete only with explicit authorization.
 
-The v0.1.7 contract uses `protocol_version:4`. The binary reports `version` and
+The v0.1.8 contract uses `protocol_version:5`. The binary reports `version` and
 `protocol_version` in daemon status. Operational CLI
 commands reject an incompatible running daemon with `protocol_mismatch`; restart the
 daemon after replacing the binary. The latest binary, this skill, the protocol
