@@ -71,7 +71,7 @@ if SUBAGENT_WEB_PASSWORD='' $BIN daemon start 2>"$ROOT/empty-web-password-error.
   exit 1
 fi
 python3 -c 'import json,sys; value=json.load(open(sys.argv[1])); assert value["code"] == "cli_error" and "SUBAGENT_WEB_PASSWORD is empty" in value["message"]' "$ROOT/empty-web-password-error.jsonl"
-$BIN daemon start | python3 -c 'import json,sys; value=json.load(sys.stdin); assert value["status"] == "running" and value["version"] == "0.2.1" and value["protocol_version"] == 6 and value["web_ui_url"] is None and value["web_auth"] is None'
+$BIN daemon start | python3 -c 'import json,sys; value=json.load(sys.stdin); assert value["status"] == "running" and value["version"] == "0.2.2" and value["protocol_version"] == 7 and value["web_ui_url"] is None and value["web_auth"] is None'
 $BIN config list | python3 -c 'import json,sys; rows=[json.loads(x) for x in sys.stdin]; assert len(rows) == 6 and all(row["type"] == "config_value" and row["active_value"] is not None and row["active_differs_from_local"] is False and row["restart_required"] is False for row in rows); row=next(x for x in rows if x["key"] == "model"); assert row["active_source"] == "OPENAI_MODEL"'
 env -u OPENAI_MODEL -u OPENAI_BASE_URL "$BIN" config get model | python3 -c 'import json,sys; row=json.load(sys.stdin); assert row["local_source"] == "persisted" and row["active_source"] == "OPENAI_MODEL" and row["active_differs_from_local"] is True and row["restart_required"] is False'
 $BIN config set context-token-budget 65000 >/dev/null
@@ -114,6 +114,7 @@ $BIN agents status "$MODEL_ID" | python3 -c 'import json,sys; row=json.load(sys.
 $BIN agents logs "$MODEL_ID" --type assistant_message | python3 -c 'import json,sys; rows=[json.loads(x) for x in sys.stdin]; assert rows[-2]["data"]["content"] == "custom-main-model" and rows[-1]["type"] == "logs_summary"'
 $BIN inbox list --agent "$MODEL_ID" --priority 1 --limit 10 | python3 -c 'import json,sys; rows=[json.loads(line) for line in sys.stdin]; notes=rows[:-1]; assert rows[-1]["type"] == "inbox_summary" and rows[-1]["count"] == len(notes); assert notes[0]["event_type"] == "finished" and notes[0]["envelope_type"] == "FINAL_ANSWER"; assert any(row["event_type"] == "resumed" for row in notes); assert any(row["envelope_type"] == "FOLLOWUP" for row in notes)'
 $BIN team list | python3 -c 'import json,sys; rows=[json.loads(x) for x in sys.stdin]; member=next(row for row in rows[:-1] if row.get("ref") == sys.argv[1]); assert member["type"] == "team_member" and member["resource"] == "agent" and member["final_answer"]["content"] == "custom-main-model"; assert rows[-1]["type"] == "team_summary" and rows[-1]["working_agents"] == 0 and rows[-1]["available_agent_slots"] == 1' "$MODEL_REF"
+$BIN team list --active | python3 -c 'import json,sys; rows=[json.loads(x) for x in sys.stdin]; assert rows == [{"type":"team_summary","working_agents":0,"max_agents":1,"available_agent_slots":1,"active_sides":0,"member_count":0}]'
 
 EMPTY_ONCE=$($BIN agents spawn --name empty-once --dir "$ROOT/project" --message EMPTY_ONCE)
 EMPTY_ONCE_ID=$(printf '%s\n' "$EMPTY_ONCE" | json_field id)
@@ -220,6 +221,7 @@ SIDE_DELAY_1=$($BIN sides create "$SIDE_PARENT_ID" --message SIDE_DELAY)
 SIDE_DELAY_ID_1=$(printf '%s\n' "$SIDE_DELAY_1" | json_field id)
 SIDE_DELAY_2=$($BIN sides create "$SIDE_PARENT_ID" --message SIDE_DELAY)
 SIDE_DELAY_ID_2=$(printf '%s\n' "$SIDE_DELAY_2" | json_field id)
+$BIN team list --active | python3 -c 'import json,sys; rows=[json.loads(line) for line in sys.stdin]; members=rows[:-1]; assert rows[-1]["member_count"] == 3; assert {row["resource"] for row in members} == {"agent","side"}; assert sum(row["resource"] == "side" for row in members) == 2; assert any(row["id"] == sys.argv[1] for row in members)' "$SIDE_PARENT_ID"
 $BIN agents list --limit 1000 | python3 -c 'import json,sys; rows=[json.loads(line) for line in sys.stdin]; row=next(row for row in rows if row["id"] == sys.argv[1]); assert row["working_sides"] == 2' "$SIDE_PARENT_ID"
 if $BIN sides create "$SIDE_PARENT_ID" --message SIDE_DELAY 2>"$ROOT/side-capacity-error.jsonl"; then
   echo "third Side unexpectedly passed per-Agent capacity" >&2

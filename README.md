@@ -66,7 +66,7 @@ subagent agents spawn \
 Coordinate several workers without importing their raw transcripts:
 
 ```sh
-subagent team list
+subagent team list --active
 subagent inbox wait --timeout-seconds 300
 subagent agents followup a_1 --message "Also check token refresh behavior."
 ```
@@ -99,7 +99,7 @@ may work concurrently by default; configure another limit with `max-agents` or
 | --- | --- |
 | `daemon start\|status\|stop` | Operate the per-user daemon |
 | `agents spawn\|list\|status\|rename` | Create and inspect persistent agents |
-| `team list` | Inspect every Agent and Side plus available capacity |
+| `team list --active` | Inspect the active team and available capacity without loading complete history |
 | `agents logs ID` | Read the newest 20 transcript events or select/follow other types |
 | `agents followup ID` | Durably assign work and wake or resume an Agent |
 | `messages send ID` | Add durable context without waking an inactive Agent |

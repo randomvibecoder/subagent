@@ -1,6 +1,7 @@
 ---
 name: subagent-cli
 description: Delegate, monitor, steer, interrupt, and collect final answers from persistent background coding Agents and readonly context-inheriting Sides through the Subagent JSONL CLI. Use for parallel or long-running coding work, keeping a coordinator's context small, supervising multiple models, or operating the subagent daemon, team, inbox, messages, Agents, and Sides.
+version: 0.2.2
 ---
 
 # Subagent CLI
@@ -53,10 +54,10 @@ Use `--model MODEL` to override the daemon model for one Agent. Normal Agents st
 ### 2. Supervise the team
 
 ~~~sh
-subagent team list
+subagent team list --active
 ~~~
 
-This is the preferred coordinator view. It emits one `team_member` per Agent and Side, then one `team_summary`. Members include model, task, lifecycle status, derived coordination state, elapsed time, pending-message count, latest progress, and the full authoritative final answer when available. The summary includes working and available Agent slots.
+This is the preferred coordinator view. `--active` emits working, interrupted, and capacity-waiting Agents plus active Sides and their parents, followed by one `team_summary`. Members include model, task, lifecycle status, derived coordination state, elapsed time, pending-message count, latest progress, and the full authoritative final answer when available. The summary includes working and available Agent slots. Omit `--active` only when complete persisted team history is intentionally needed; it can be very large on a long-lived daemon.
 
 Wait for the first future high-signal update without polling:
 
@@ -174,7 +175,7 @@ Sides remain a separate resource, not nested child Agents. At most two Sides may
 ### Agents and team
 
 ~~~text
-subagent team list
+subagent team list [--active]
 
 subagent agents spawn --name NAME --dir DIR (--message TEXT | --message-file PATH)
     [--mode readonly|write] [--model MODEL] [--wall-time-minutes MINUTES]
@@ -243,7 +244,7 @@ The Web UI is optional and only useful when a human is in the loop. Start it wit
 
 - Use `agents spawn` for independent new work.
 - Use `sides create` for a one-shot question requiring a parent Agent's context.
-- Use `team list` for a compact complete overview.
+- Use `team list --active` for a compact live overview; unfiltered `team list` emits complete history.
 - Use `inbox wait` to block for any high-signal update.
 - Use `messages send` to add context without waking.
 - Use `agents followup` to assign work and wake or resume.

@@ -2067,7 +2067,7 @@
           "type": "string"
         },
         "protocol_version": {
-          "const": 6
+          "const": 7
         },
         "pid": {
           "type": "integer",

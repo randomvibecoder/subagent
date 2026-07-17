@@ -568,7 +568,7 @@ impl AgentManager {
             .collect()
     }
 
-    pub fn team_values(&self) -> Result<Vec<Value>> {
+    pub fn team_values(&self, active_only: bool) -> Result<Vec<Value>> {
         let filter = crate::ipc::ListFilter {
             limit: usize::MAX,
             sort: "spawned_at".into(),
@@ -581,6 +581,20 @@ impl AgentManager {
             let pending = self.store.pending_messages(&agent.id)?;
             let waiting_for_capacity = agent.status != AgentStatus::Working
                 && pending.iter().any(|message| message.intent == "followup");
+            let sides = self.store.list_sides(&agent.id)?;
+            let has_active_side = sides
+                .iter()
+                .any(|side| matches!(side.status, AgentStatus::Working | AgentStatus::Interrupted));
+            if active_only
+                && !matches!(
+                    agent.status,
+                    AgentStatus::Working | AgentStatus::Interrupted
+                )
+                && !waiting_for_capacity
+                && !has_active_side
+            {
+                continue;
+            }
             let agent_coordination_state = coordination_state(&agent.status, waiting_for_capacity);
             let latest_progress = self
                 .store
@@ -612,7 +626,12 @@ impl AgentManager {
                 "run_number":agent.run_number,
                 "final_answer":agent.final_answer,
             }));
-            for side in self.store.list_sides(&agent.id)? {
+            for side in sides {
+                if active_only
+                    && !matches!(side.status, AgentStatus::Working | AgentStatus::Interrupted)
+                {
+                    continue;
+                }
                 let latest_progress = self
                     .store
                     .latest_notification_for_owner(&side.id)?

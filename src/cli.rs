@@ -586,8 +586,15 @@ enum InboxCommand {
 
 #[derive(Subcommand)]
 enum TeamCommand {
-    #[command(about = "List Agents and Sides, followed by one capacity summary.")]
-    List,
+    #[command(
+        about = "List Agents and Sides, followed by one capacity summary.",
+        after_help = "Use --active for a coordinator-safe view containing working, interrupted, and capacity-waiting Agents plus active Sides and their parents. Without --active, complete persisted history is emitted and may be large."
+    )]
+    List {
+        /// Emit only active coordination records instead of complete persisted history.
+        #[arg(long)]
+        active: bool,
+    },
 }
 
 pub async fn run() -> Result<()> {
@@ -659,7 +666,12 @@ async fn run_inner() -> Result<()> {
             };
             request(request_value).await
         }
-        TopCommand::Team(TeamCommand::List) => request(Request::TeamList).await,
+        TopCommand::Team(TeamCommand::List { active }) => {
+            request(Request::TeamList {
+                active_only: active,
+            })
+            .await
+        }
         TopCommand::Messages(command) => {
             let req = match command {
                 MessagesCommand::Send(args) => Request::MessageSend {

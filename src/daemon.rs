@@ -358,7 +358,7 @@ async fn dispatch(
         Request::AgentInterrupt { id } => {
             vec![agent_value(manager.interrupt(&id).await?)?]
         }
-        Request::TeamList => manager.team_values()?,
+        Request::TeamList { active_only } => manager.team_values(active_only)?,
         Request::SideCreate {
             id,
             message,

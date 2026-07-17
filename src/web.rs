@@ -662,7 +662,7 @@ async fn interrupt_agent(
 
 async fn team(State(state): State<WebState>, headers: HeaderMap) -> ApiResult<Response> {
     authorize(&state, &headers, false)?;
-    Ok(ndjson(state.manager.team_values()?))
+    Ok(ndjson(state.manager.team_values(false)?))
 }
 async fn side_question(
     State(state): State<WebState>,

@@ -1,4 +1,4 @@
-# Subagent v0.2.1 / Protocol 6 Reference
+# Subagent v0.2.2 / Protocol 7 Reference
 
 This file specifies the current binary. Backward compatibility is not promised. The
 release binary, SKILL.md, this reference, and cli.schema.json must change together.
@@ -326,12 +326,18 @@ Requires working. Cancels the active turn and Agent-owned terminals, preserves c
 and pending Messages, and transitions to interrupted without a terminal timestamp.
 Only follow-up or the send compatibility alias resumes it.
 
-### team list
+### team list [--active]
 
 Emits one team_member for every Agent and Side followed by one team_summary. Membership
 is flat; Side members include their parent Agent ID/ref only for provenance. Members
 contain task, model, coordination state, progress, pending count, and the complete
 current final_answer. The summary exposes working and available Agent capacity.
+
+Without `--active`, this is intentionally a complete persisted-history query and may
+emit a large stream on a long-lived daemon. `--active` is the coordinator-safe view: it
+includes working, interrupted, and capacity-waiting Agents, plus working/interrupted
+Sides and their parent Agents. Terminal Sides are omitted. A terminal parent is retained
+only when needed to provide provenance for an active Side.
 
 While stop or interrupt cleanup is active, input commands return retryable conflict and
 create no Message.

@@ -36,7 +36,7 @@ assert "active_differs_from_local" in schema["$defs"]["ConfigValue"]["required"]
 assert {"$ref": "#/$defs/InboxSummary"} in schema["oneOf"]
 assert {"$ref": "#/$defs/LogsSummary"} in schema["oneOf"]
 assert schema["$defs"]["DaemonRunning"]["properties"]["protocol_version"] == {
-    "const": 6
+    "const": 7
 }
 codes = set(schema["$defs"]["Error"]["properties"]["code"]["enum"])
 assert {"side_not_found", "protocol_mismatch"} <= codes
